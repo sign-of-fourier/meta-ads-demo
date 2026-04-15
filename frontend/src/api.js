@@ -20,6 +20,11 @@ async function request(path, opts = {}) {
   });
 
   if (!res.ok) {
+    if (res.status === 401) {
+      localStorage.removeItem("token");
+      window.location.href = "/app/auth";
+      return;
+    }
     const body = await res.json().catch(() => ({}));
     throw new Error(body.detail || `API error ${res.status}`);
   }
@@ -105,4 +110,27 @@ export async function getExplore() {
 
 export async function getCampaignHistory(campaignId, days = 30) {
   return request(`/api/campaigns/${campaignId}/history?days=${days}`);
+}
+
+// ── Structural ingest ────────────────────────────────────────────────────────
+
+export async function ingestCampaignStructure(campaignId) {
+  return request(`/api/ingest/structure/${campaignId}`, { method: "POST" });
+}
+
+export async function getCampaignStructure(campaignId) {
+  return request(`/api/structure/${campaignId}`);
+}
+
+// ── Suggestions ──────────────────────────────────────────────────────────────
+
+export async function getCampaignSuggestions(campaignId) {
+  return request(`/api/suggestions?campaign_id=${campaignId}`);
+}
+
+export async function confirmSuggestion(id, action) {
+  return request(`/api/suggestions/${id}/confirm`, {
+    method: "POST",
+    body: JSON.stringify({ action }),
+  });
 }

@@ -430,6 +430,252 @@ body {
   text-overflow: ellipsis;
 }
 
+/* ── Actions cell ───────────────────────────────────────────────────────── */
+.actions-cell {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.btn-creatives {
+  padding: 0.3rem 0.65rem;
+  background: #e7f5ff;
+  color: #1971c2;
+  border: 1px solid #74c0fc;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+
+.btn-creatives:hover {
+  background: #d0ebff;
+}
+
+.btn-creatives:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* ── Structure panel ─────────────────────────────────────────────────────── */
+.structure-panel {
+  padding: 0.75rem 0.25rem;
+}
+
+.structure-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.85rem;
+  color: #495057;
+  margin-bottom: 0.75rem;
+}
+
+.structure-dismiss {
+  font-size: 1rem;
+  color: #868e96;
+  text-decoration: none;
+  padding: 0 0.25rem;
+}
+
+.structure-ads {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.structure-ad {
+  background: #fff;
+  border: 1px solid #dee2e6;
+  border-radius: 6px;
+  padding: 0.65rem 0.9rem;
+}
+
+.structure-ad-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.structure-ad-id {
+  font-size: 0.78rem;
+  color: #495057;
+  background: #f1f3f5;
+  padding: 0.1rem 0.35rem;
+  border-radius: 3px;
+}
+
+.creative-type-badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.creative-type-badge.static {
+  background: #fff3bf;
+  color: #7c4d00;
+}
+
+.creative-type-badge.dynamic {
+  background: #e3fafc;
+  color: #0c7a92;
+}
+
+.lifecycle-badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.lifecycle-badge.active {
+  background: #d3f9d8;
+  color: #1b6b2f;
+}
+
+.lifecycle-badge.inactive {
+  background: #f1f3f5;
+  color: #6b7280;
+}
+
+.lifecycle-badge.missing {
+  background: #fff3bf;
+  color: #7c4d00;
+  text-transform: none;
+  font-style: italic;
+}
+
+.slot-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.82rem;
+}
+
+.slot-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.slot-row dt {
+  width: 90px;
+  flex-shrink: 0;
+  font-weight: 600;
+  color: #868e96;
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  padding-top: 0.1rem;
+}
+
+.slot-row dd {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin: 0;
+}
+
+.slot-value {
+  background: #f8f9fa;
+  border: 1px solid #e9ecef;
+  border-radius: 4px;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.82rem;
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Suggestions section ────────────────────────────────────────────────── */
+.suggestions-section {
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid #dee2e6;
+}
+
+.suggestions-heading {
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #868e96;
+  margin-bottom: 0.6rem;
+}
+
+.suggestion-item {
+  background: #fff;
+  border: 1px solid #dee2e6;
+  border-radius: 6px;
+  padding: 0.65rem 0.9rem;
+  margin-bottom: 0.5rem;
+}
+
+.suggestion-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.suggestion-label {
+  font-size: 0.75rem;
+  color: #868e96;
+}
+
+.deployment-badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.deployment-badge.status-suggested {
+  background: #e7f5ff;
+  color: #1864ab;
+}
+
+.deployment-badge.status-pending_confirmation {
+  background: #fff3bf;
+  color: #7c4d00;
+}
+
+.deployment-badge.status-created_static {
+  background: #d3f9d8;
+  color: #1b6b2f;
+}
+
+.deployment-badge.status-active_static {
+  background: #b2f2bb;
+  color: #145523;
+}
+
+.deployment-badge.status-replaced_static,
+.deployment-badge.status-rejected {
+  background: #f1f3f5;
+  color: #6b7280;
+}
+
+.suggestion-confirm-btn {
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+  padding: 0.25rem 0.75rem;
+}
+
+.suggestion-static-id {
+  font-size: 0.78rem;
+  color: #495057;
+  margin-top: 0.35rem;
+}
+
 /* ── Explorer page ──────────────────────────────────────────────────────── */
 .explorer-toolbar {
   display: flex;
