@@ -58,7 +58,7 @@ business logic live here. Key sections in reading order:
 | `init_db()` | Creates all 6 SQLite tables; runs ALTER TABLE migrations for columns added after initial schema |
 | `get_current_user_id()` | FastAPI dependency; decodes Bearer JWT |
 | `_meta_creds(user_id)` | Loads `(access_token, ad_account_id)` from `meta_connections` for authenticated user |
-| `_fetch_campaigns_and_insights()` | Shared async helper for campaigns + 7d insights from Meta |
+| `_fetch_campaigns_and_insights()` | Shared async helper for campaigns + 7d insights from Meta; returns `(campaigns_raw, metrics_by_campaign, insights_error_count)` — callers use `insights_error_count` to distinguish API failure from genuine zero delivery |
 | `_fetch_campaign_structure()` | Fetches adsets + ads with expanded creative fields for one campaign; includes `effective_status` |
 | `_normalize_creative(ad)` | Pure function; detects dynamic (presence of `asset_feed_spec`) vs static; extracts slots |
 | `_clone_dynamic_to_static_ad()` | Creates a new static Meta ad from chosen components; used by confirm-create flow |
@@ -112,7 +112,7 @@ created_static → active_static  (future: user activates in Meta)
 ## Key constraints and known gaps
 
 - The Meta access token stored is a **short-lived user token** — no refresh logic exists
-- `GET /api/campaigns` swallows insights errors silently (best-effort metrics)
+- `GET /api/campaigns` swallows insights errors silently (best-effort metrics); `POST /api/ingest` logs and surfaces them via `insights_errors` in the response
 - `ad_insights` accumulates one row per campaign per `POST /api/ingest` call — no date deduplication
 - Structural ingest is idempotent via `ON CONFLICT DO UPDATE`; running it twice does not grow row count
 - `_clone_dynamic_to_static_ad` requires the source ad's creative to have a `page_id` and a `link` URL in `object_story_spec.link_data`; image-hash-only creatives will fail at Meta creative creation

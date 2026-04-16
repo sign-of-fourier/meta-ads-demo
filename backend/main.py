@@ -13,6 +13,7 @@ Minimal SaaS control-plane that:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -33,6 +34,10 @@ from pydantic import BaseModel
 # ── Load .env ──────────────────────────────────────────────────────────────────
 load_dotenv()
 
+from providers.factory import get_meta_provider  # noqa: E402 – must follow load_dotenv
+meta_provider = get_meta_provider()
+APP_MODE = os.getenv("APP_MODE", "live").lower()
+
 META_APP_ID = os.environ["META_APP_ID"]
 META_APP_SECRET = os.environ["META_APP_SECRET"]
 META_REDIRECT_URI = os.environ["META_REDIRECT_URI"]
@@ -45,6 +50,8 @@ JWT_EXPIRE_HOURS = 24
 META_GRAPH = f"https://graph.facebook.com/{META_API_VERSION}"
 
 DB_PATH = Path(__file__).parent / "app.db"
+
+logger = logging.getLogger(__name__)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -257,6 +264,10 @@ class IngestPreview(BaseModel):
 class IngestResult(BaseModel):
     campaigns_saved: int
     ad_account_id: str
+    campaigns_seen: int = 0
+    campaigns_with_metrics: int = 0
+    insights_errors: int = 0
+    message: str = ""
 
 
 class StructureIngestResult(BaseModel):
@@ -465,6 +476,8 @@ async def meta_callback(
 # ── Helper: load user's Meta creds ────────────────────────────────────────────
 def _meta_creds(user_id: int) -> tuple[str, str]:
     """Return (access_token, ad_account_id) or raise 400."""
+    if APP_MODE == "demo":
+        return "demo-token", "demo-account"
     db = get_db()
     row = db.execute(
         "SELECT access_token, ad_account_id FROM meta_connections WHERE user_id = ?",
@@ -482,7 +495,7 @@ async def list_campaigns(user_id: int = Depends(get_current_user_id)):
     access_token, ad_account_id = _meta_creds(user_id)
 
     async with httpx.AsyncClient(timeout=30) as client:
-        campaigns_raw, metrics_by_campaign = await _fetch_campaigns_and_insights(
+        campaigns_raw, metrics_by_campaign, _ = await _fetch_campaigns_and_insights(
             client, access_token, ad_account_id
         )
 
@@ -506,71 +519,14 @@ async def list_campaigns(user_id: int = Depends(get_current_user_id)):
 
 async def _fetch_campaigns_and_insights(
     client: httpx.AsyncClient, access_token: str, ad_account_id: str
-) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Shared helper: fetch campaigns + 7d insights from Meta. Returns (campaigns_raw, metrics_by_campaign)."""
-    camp_resp = await client.get(
-        f"{META_GRAPH}/{ad_account_id}/campaigns",
-        params={
-            "access_token": access_token,
-            "fields": "id,name,status,daily_budget",
-            "limit": 100,
-        },
-    )
-    if camp_resp.status_code != 200:
-        raise HTTPException(502, f"Meta API error: {camp_resp.text}")
-    campaigns_raw = camp_resp.json().get("data", [])
-
-    metrics_by_campaign: dict[str, dict[str, Any]] = {}
-    try:
-        insights_resp = await client.get(
-            f"{META_GRAPH}/{ad_account_id}/insights",
-            params={
-                "access_token": access_token,
-                "level": "campaign",
-                "date_preset": "last_7d",
-                "fields": "campaign_id,impressions,clicks,spend,ctr,cpm,cpc",
-                "limit": 5000,
-            },
-        )
-        if insights_resp.status_code == 200:
-            for row in insights_resp.json().get("data", []):
-                cid = row.get("campaign_id")
-                if not cid:
-                    continue
-                m = metrics_by_campaign.setdefault(
-                    cid, {"impressions": 0, "clicks": 0, "spend": 0.0}
-                )
-                m["impressions"] += int(row.get("impressions", 0))
-                m["clicks"] += int(row.get("clicks", 0))
-                m["spend"] += float(row.get("spend", 0.0))
-    except Exception:
-        pass
-
-    for m in metrics_by_campaign.values():
-        imp = m["impressions"] or 0
-        clk = m["clicks"] or 0
-        spend = m["spend"] or 0.0
-        m["ctr"] = (clk / imp * 100.0) if imp > 0 else None
-        m["cpm"] = (spend / imp * 1000.0) if imp > 0 else None
-        m["cpc"] = (spend / clk) if clk > 0 else None
-
-    return campaigns_raw, metrics_by_campaign
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], int]:
+    return await meta_provider.fetch_campaigns_and_insights(client, access_token, ad_account_id)
 
 
 async def _fetch_ads(
     client: httpx.AsyncClient, access_token: str, ad_account_id: str
 ) -> list[dict[str, Any]]:
-    resp = await client.get(
-        f"{META_GRAPH}/{ad_account_id}/ads",
-        params={
-            "access_token": access_token,
-            "fields": "id,name,status,campaign_id,adset_id,creative{body,image_url,thumbnail_url}",
-            "limit": 200,
-        },
-    )
-    if resp.status_code != 200:
-        raise HTTPException(502, f"Failed to fetch ads: {resp.text}")
-    return resp.json().get("data", [])
+    return await meta_provider.fetch_ads(client, access_token, ad_account_id)
 
 
 @app.get("/api/ingest/preview", response_model=IngestPreview)
@@ -579,7 +535,7 @@ async def ingest_preview(user_id: int = Depends(get_current_user_id)):
     access_token, ad_account_id = _meta_creds(user_id)
 
     async with httpx.AsyncClient(timeout=30) as client:
-        campaigns_raw, metrics_by_campaign = await _fetch_campaigns_and_insights(
+        campaigns_raw, metrics_by_campaign, _ = await _fetch_campaigns_and_insights(
             client, access_token, ad_account_id
         )
         ads_raw = await _fetch_ads(client, access_token, ad_account_id)
@@ -632,9 +588,12 @@ async def run_ingest(user_id: int = Depends(get_current_user_id)):
     access_token, ad_account_id = _meta_creds(user_id)
 
     async with httpx.AsyncClient(timeout=30) as client:
-        campaigns_raw, metrics_by_campaign = await _fetch_campaigns_and_insights(
+        campaigns_raw, metrics_by_campaign, insights_errors = await _fetch_campaigns_and_insights(
             client, access_token, ad_account_id
         )
+
+    campaigns_seen = len(campaigns_raw)
+    campaigns_with_metrics = len(metrics_by_campaign)
 
     db = get_db()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -661,7 +620,43 @@ async def run_ingest(user_id: int = Depends(get_current_user_id)):
 
     db.commit()
     db.close()
-    return IngestResult(campaigns_saved=saved, ad_account_id=ad_account_id)
+
+    if insights_errors:
+        message = (
+            f"Insights fetch failed for {insights_errors} request(s); "
+            f"{saved} of {campaigns_seen} campaign snapshots saved."
+        )
+        logger.warning(
+            "Ingest completed with insights errors: account=%s seen=%d with_metrics=%d "
+            "saved=%d insights_errors=%d",
+            ad_account_id, campaigns_seen, campaigns_with_metrics, saved, insights_errors,
+        )
+    elif saved == 0:
+        message = (
+            f"No campaign metrics found in the last 7 days "
+            f"({campaigns_seen} campaigns seen, none had delivery data)."
+        )
+        logger.info(
+            "Ingest completed, no metrics data: account=%s seen=%d",
+            ad_account_id, campaigns_seen,
+        )
+    else:
+        message = (
+            f"Ingested {saved} campaign snapshot(s) for account {ad_account_id}."
+        )
+        logger.info(
+            "Ingest completed: account=%s seen=%d with_metrics=%d saved=%d",
+            ad_account_id, campaigns_seen, campaigns_with_metrics, saved,
+        )
+
+    return IngestResult(
+        campaigns_saved=saved,
+        ad_account_id=ad_account_id,
+        campaigns_seen=campaigns_seen,
+        campaigns_with_metrics=campaigns_with_metrics,
+        insights_errors=insights_errors,
+        message=message,
+    )
 
 
 # ── Structural ingest ─────────────────────────────────────────────────────────
@@ -1051,16 +1046,8 @@ async def pause_campaign(
     campaign_id: str, user_id: int = Depends(get_current_user_id)
 ):
     access_token, _ = _meta_creds(user_id)
-
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{META_GRAPH}/{campaign_id}",
-            params={"access_token": access_token},
-            data={"status": "PAUSED"},
-        )
-        if resp.status_code != 200:
-            raise HTTPException(502, f"Failed to pause campaign: {resp.text}")
-
+        await meta_provider.pause_campaign(client, access_token, campaign_id)
     return CampaignActionResponse(id=campaign_id, status="PAUSED")
 
 
@@ -1069,16 +1056,8 @@ async def resume_campaign(
     campaign_id: str, user_id: int = Depends(get_current_user_id)
 ):
     access_token, _ = _meta_creds(user_id)
-
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{META_GRAPH}/{campaign_id}",
-            params={"access_token": access_token},
-            data={"status": "ACTIVE"},
-        )
-        if resp.status_code != 200:
-            raise HTTPException(502, f"Failed to resume campaign: {resp.text}")
-
+        await meta_provider.resume_campaign(client, access_token, campaign_id)
     return CampaignActionResponse(id=campaign_id, status="ACTIVE")
 
 
