@@ -45,8 +45,19 @@ cp .env.example .env    # VITE_API_URL defaults to http://localhost:8000
 ```
 frontend/ (React + Vite, port 5173)
   └── calls ──▶ backend/ (FastAPI, port 8000)
-                   └── calls ──▶ Meta Marketing API (graph.facebook.com)
+                   └── providers/ (MetaProvider interface)
+                         ├── LiveMetaProvider   → Meta Marketing API (graph.facebook.com)
+                         ├── MaskingMetaProvider → wraps Live; selectively overrides fields
+                         └── DemoMetaProvider   → fully synthetic fixtures (APP_MODE=demo)
 ```
+
+### Provider selection (`providers/factory.py`)
+
+| Condition | Provider returned |
+|---|---|
+| `APP_MODE=demo` | `DemoMetaProvider` |
+| `MASK_MODE=selective\|full` | `MaskingMetaProvider(LiveMetaProvider(), policy)` |
+| default | `LiveMetaProvider` |
 
 ## Backend (`backend/main.py`)
 
@@ -108,6 +119,38 @@ created_static → active_static  (future: user activates in Meta)
 | `META_API_VERSION` | Defaults to `v19.0` |
 | `JWT_SECRET` | Any random string |
 | `FRONTEND_URL` | Defaults to `http://localhost:5173` |
+
+### Masking layer env vars (`MASK_MODE != off`)
+
+Rule of thumb: **fake what costs money, keep everything else real.**
+
+| Variable | Values | Description |
+|---|---|---|
+| `MASK_MODE` | `off` \| `selective` \| `full` | Master switch. `full` enables all masks by default. |
+| `MASK_STATUS` | `true\|false` | Force campaign status → `ACTIVE` |
+| `MASK_BUDGETS` | `true\|false` | Replace `daily_budget` with a deterministic demo value |
+| `MASK_METRICS` | `true\|false` | Replace insights (impressions/clicks/spend/ctr/cpm/cpc) with synthetic values |
+| `MASK_PAUSE_RESUME` | `true\|false` | pause/resume calls → no-op (return success without hitting Meta) |
+| `MASK_AD_STATUSES` | `true\|false` | Force ad status → `ACTIVE` (also implied by `MASK_STATUS`) |
+| `REAL_ASSET_CREATION` | `true\|false` | Default `true`; reserved for future use |
+| `METRIC_PROFILE` | `healthy` \| `stable` \| `weak` | Synthetic metric profile; affects magnitude of impressions/CTR/CPC |
+
+Synthetic metrics are **deterministic per campaign ID** — the same campaign always gets the same numbers across restarts. Values are internally consistent (`ctr = clicks/impressions`, `cpm = spend/impressions*1000`, `cpc = spend/clicks`).
+
+Routes that always hit Meta directly (not masked): `/auth/meta/callback`, `/api/explore`, structural ingest (`_fetch_campaign_structure`), and static ad creation (`_clone_dynamic_to_static_ad`).
+
+## Provider layer (`backend/providers/`)
+
+| File | Role |
+|---|---|
+| `meta_provider.py` | Abstract base class; defines interface for all providers |
+| `meta_live.py` | Calls real Meta Graph API |
+| `meta_masking.py` | Wraps `LiveMetaProvider`; overrides selected fields per `MaskPolicy` |
+| `mask_policy.py` | Reads `MASK_*` env vars into a `MaskPolicy` config object |
+| `meta_demo.py` | Fully synthetic fixtures; used when `APP_MODE=demo` |
+| `factory.py` | `get_meta_provider()` — selects provider based on `APP_MODE` + `MASK_MODE` |
+
+`main.py` calls `meta_provider.fetch_campaigns_and_insights(...)`, `fetch_ads(...)`, `pause_campaign(...)`, and `resume_campaign(...)` through the interface — it has no knowledge of which provider is active.
 
 ## Key constraints and known gaps
 
