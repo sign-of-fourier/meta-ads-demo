@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
@@ -35,6 +36,7 @@ from pydantic import BaseModel
 load_dotenv()
 
 from providers.factory import get_meta_provider  # noqa: E402 – must follow load_dotenv
+from providers.mask_policy import MaskPolicy  # noqa: E402 – must follow load_dotenv
 meta_provider = get_meta_provider()
 APP_MODE = os.getenv("APP_MODE", "live").lower()
 
@@ -99,6 +101,8 @@ def init_db() -> None:
             ctr             REAL,
             cpm             REAL,
             cpc             REAL,
+            data_source     TEXT NOT NULL DEFAULT 'real',  -- 'real' | 'masked' | 'demo'
+            mask_profile    TEXT,                          -- 'healthy' | 'stable' | 'weak' | NULL
             created_at      TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE TABLE IF NOT EXISTS ad_creative_structures (
@@ -114,6 +118,8 @@ def init_db() -> None:
             value           TEXT,
             ingested_at     TEXT NOT NULL DEFAULT (datetime('now')),
             lifecycle_status TEXT NOT NULL DEFAULT 'active',  -- 'active' | 'inactive' | 'missing'
+            data_source     TEXT NOT NULL DEFAULT 'real',     -- 'real' | 'masked' | 'demo'
+            mask_profile    TEXT,                             -- 'healthy' | 'stable' | 'weak' | NULL
             UNIQUE (user_id, ad_id, slot, slot_index)
         );
         CREATE TABLE IF NOT EXISTS suggested_configurations (
@@ -141,6 +147,34 @@ def init_db() -> None:
         conn.commit()
     except Exception:
         pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE ad_insights ADD COLUMN data_source TEXT NOT NULL DEFAULT 'real'"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE ad_insights ADD COLUMN mask_profile TEXT"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE ad_creative_structures ADD COLUMN data_source TEXT NOT NULL DEFAULT 'real'"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE ad_creative_structures ADD COLUMN mask_profile TEXT"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
     conn.commit()
     conn.close()
 
@@ -161,6 +195,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_GENERATED_IMAGES_DIR = Path(__file__).parent / "generated_images"
+_GENERATED_IMAGES_DIR.mkdir(exist_ok=True)
+app.mount("/images", StaticFiles(directory=str(_GENERATED_IMAGES_DIR)), name="generated_images")
 
 
 # ── JWT auth helpers ───────────────────────────────────────────────────────────
@@ -489,6 +527,31 @@ def _meta_creds(user_id: int) -> tuple[str, str]:
     return row["access_token"], row["ad_account_id"]
 
 
+def _current_data_provenance() -> tuple[str, str | None]:
+    """
+    Returns (data_source, mask_profile)
+
+    data_source:
+      - 'demo'   when APP_MODE=demo
+      - 'masked' when live mode uses masking
+      - 'real'   otherwise
+    """
+    if APP_MODE == "demo":
+        return "demo", None
+
+    policy = MaskPolicy()
+    if policy.enabled and (
+        policy.mask_status
+        or policy.mask_budgets
+        or policy.mask_metrics
+        or policy.mask_pause_resume
+        or policy.mask_ad_statuses
+    ):
+        return "masked", policy.metric_profile
+
+    return "real", None
+
+
 # ── Campaign routes ────────────────────────────────────────────────────────────
 @app.get("/api/campaigns", response_model=list[Campaign])
 async def list_campaigns(user_id: int = Depends(get_current_user_id)):
@@ -592,6 +655,7 @@ async def run_ingest(user_id: int = Depends(get_current_user_id)):
             client, access_token, ad_account_id
         )
 
+    data_source, mask_profile = _current_data_provenance()
     campaigns_seen = len(campaigns_raw)
     campaigns_with_metrics = len(metrics_by_campaign)
 
@@ -607,13 +671,15 @@ async def run_ingest(user_id: int = Depends(get_current_user_id)):
                 """
                 INSERT INTO ad_insights
                     (user_id, ad_account_id, level, object_id, date,
-                     impressions, clicks, spend, ctr, cpm, cpc)
-                VALUES (?, ?, 'campaign', ?, ?, ?, ?, ?, ?, ?, ?)
+                     impressions, clicks, spend, ctr, cpm, cpc,
+                     data_source, mask_profile)
+                VALUES (?, ?, 'campaign', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id, ad_account_id, cid, today,
                     mm.get("impressions"), mm.get("clicks"), mm.get("spend"),
                     mm.get("ctr"), mm.get("cpm"), mm.get("cpc"),
+                    data_source, mask_profile,
                 ),
             )
             saved += 1
@@ -783,6 +849,7 @@ async def ingest_campaign_structure(
             client, access_token, ad_account_id, campaign_id
         )
 
+    data_source, mask_profile = _current_data_provenance()
     db = get_db()
 
     # Collect ad_ids previously ingested for this campaign so we can detect missing ones
@@ -798,6 +865,7 @@ async def ingest_campaign_structure(
     ads_processed = 0
     components_saved = 0
     current_ad_ids: set[str] = set()
+    ad_components_map: dict[str, list[dict]] = {}  # ad_id → components for embedding hook
 
     for ad in ads:
         ad_id = ad["id"]
@@ -809,25 +877,30 @@ async def ingest_campaign_structure(
         lifecycle_status = "active" if raw_status == "ACTIVE" else "inactive"
 
         creative_type, components = _normalize_creative(ad)
+        ad_components_map[ad_id] = components
 
         for comp in components:
             db.execute(
                 """
                 INSERT INTO ad_creative_structures
                     (user_id, ad_account_id, campaign_id, adset_id, ad_id,
-                     creative_type, slot, slot_index, value, ingested_at, lifecycle_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     creative_type, slot, slot_index, value, ingested_at,
+                     lifecycle_status, data_source, mask_profile)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (user_id, ad_id, slot, slot_index)
                 DO UPDATE SET
                     creative_type    = excluded.creative_type,
                     value            = excluded.value,
                     ingested_at      = excluded.ingested_at,
-                    lifecycle_status = excluded.lifecycle_status
+                    lifecycle_status = excluded.lifecycle_status,
+                    data_source      = excluded.data_source,
+                    mask_profile     = excluded.mask_profile
                 """,
                 (
                     user_id, ad_account_id, campaign_id, adset_id, ad_id,
                     creative_type, comp["slot"], comp["slot_index"],
                     comp["value"], ingested_at, lifecycle_status,
+                    data_source, mask_profile,
                 ),
             )
             components_saved += 1
@@ -846,6 +919,17 @@ async def ingest_campaign_structure(
 
     db.commit()
     db.close()
+
+    # ── Embedding hook (fire-and-forget) ──────────────────────────────────────
+    # Failures here are logged and swallowed; ingest result is already committed.
+    try:
+        import asyncio as _asyncio
+        from embeddings.pipeline import embed_ad
+        for _ad_id, _comps in ad_components_map.items():
+            _asyncio.create_task(embed_ad(user_id, _ad_id, campaign_id, _comps))
+    except Exception:
+        logger.warning("embedding hook unavailable — skipping", exc_info=True)
+
     return StructureIngestResult(
         campaign_id=campaign_id,
         ads_processed=ads_processed,

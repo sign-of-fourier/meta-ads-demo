@@ -1,148 +1,149 @@
-Setup vars
-Set a base URL and token first:
+# AdStac.kr — Test Catalog
 
-bash
+All pytest tests live in `backend/`. Run them from there with the venv active:
+
+```bash
+cd backend && source .venv/bin/activate
+```
+
+---
+
+## Pytest test files
+
+### No API keys required
+
+| File | Classes | Tests | What it covers |
+|---|---|---|---|
+| `test_structural_ingest.py` | — | ~10 | Structural ingest normalization, lifecycle status logic |
+| `test_suggestions.py` | — | ~10 | Suggestion storage and retrieval |
+| `test_combination_embeddings.py` | `TestBuildCombinations`, `TestCombinationKey` | 16 | Cartesian combination logic, key determinism |
+| `test_bo_pipeline.py` | `TestCombineEmbeddings`, `TestGPR`, `TestSelector`, `TestBOPipeline` | 34 | Embedding combiner, GPR functions, DB selector, full BO run |
+
+Run all pure tests in one shot:
+
+```bash
+python -m pytest test_structural_ingest.py test_suggestions.py \
+    test_combination_embeddings.py -k "TestBuildCombinations or TestCombinationKey" \
+    test_bo_pipeline.py -v
+```
+
+### API keys required
+
+| File | Classes | Tests | Keys needed | What it covers |
+|---|---|---|---|---|
+| `test_combination_embeddings.py` | `TestEmbedAllCombinations`, `TestRetrieval` | 15 | `AZURE_INFERENCE_KEY` | Embed real text combos, store/retrieve vectors |
+| `test_text_pipeline.py` | `TestAssembleDynamicAd`, `TestGenerateSlots`, `TestRunTextPipeline`, `TestRetrieval` | ~20 | `AZURE_OPENAI_KEY`, `AZURE_OPENAI_ENDPOINT` | GPT-4o text generation, assembler, DB storage |
+| `test_generation_pipeline.py` | `TestSeedEmbedding`, `TestGenerationPipeline`, `TestGeneratedVariantEmbedding`, `TestMetadataChain` | ~20 | `AZURE_INFERENCE_KEY`, `AZURE_OPENAI_KEY`, `AZURE_OPENAI_ENDPOINT`, `DEAPI_API_KEY` | Full 7-step image pipeline end-to-end |
+
+---
+
+## Notable individual tests
+
+### `test_bo_pipeline.py::TestBOPipeline::test_full_bo_report`
+
+The most informative single test to run. Executes the full BO pipeline and prints a
+human-readable report: scored observations, GPR fit, EI ranking over all candidates,
+pick 1 (EI), pick 2 (fantasy), and a summary row.
+
+```bash
+python -m pytest test_bo_pipeline.py::TestBOPipeline::test_full_bo_report -v -s
+```
+
+Example output:
+```
+============================================================
+  AdStac.kr BO Run — Full Report
+============================================================
+
+Training set  : 5 scored observation(s)
+Candidate pool: 7 unscored combination(s)
+
+Scored observations:
+  [1] score=3.50  combo={'headline': 'Wool Socks', 'primary_text': 'Hand made in Switzerland.'}
+  ...
+
+GPR fit on 5 point(s)  |  best observed score: 5.10
+Optimized kernel: 0.949**2 * RBF(length_scale=1) + WhiteKernel(noise_level=0.099)
+
+PICK 1  [EI]
+  Combination : {'headline': 'Wool Socks', 'primary_text': 'Premium wool since 1952.'}
+  GPR mean    : 4.0600  |  GPR std: 0.8261  |  EI: 0.039983
+
+PICK 2  [FANTASY]
+  Combination : {'headline': 'Warm Feet Forever', 'primary_text': 'Hand made in Switzerland.'}
+  GPR mean    : 4.0600  |  GPR std: 0.7541  |  EI: 0.028118
+
+Summary
+  n_scored=5  n_fit=5  n_candidates=7  best_obs=5.10
+```
+
+**Note on uniform EI:** the test seeds all embeddings as random vectors, so all
+candidates sit equidistant from the training set in embedding space and share
+identical EI. With real Azure embeddings, semantically similar candidates will
+differentiate. The fantasy step is still exercised correctly — σ drops from
+0.826 → 0.754 on pick 2.
+
+---
+
+## Module-level test docs
+
+Each AI module has its own README with test-specific instructions and env var
+requirements:
+
+| Module | README |
+|---|---|
+| Embeddings | `backend/embeddings/README.md` |
+| Image generation | `backend/ad_generation/README.md` |
+| Text generation | `backend/ad_text_generation/README.md` |
+| Combination embeddings | `backend/ad_combination_embeddings/README.md` |
+
+---
+
+## Manual / curl tests — Masking layer
+
+For verifying the masking layer behaviour against a live Meta account.
+
+```bash
 export API="http://localhost:8000"
-export TOKEN="PASTE_YOUR_JWT_HERE"
-If you need a token first, sign up or log in:
+export TOKEN="<paste JWT here>"   # from POST /auth/login
+```
 
-bash
-curl -s -X POST "$API/auth/login" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"you@example.com","password":"your-password"}'
-Then copy the token value into TOKEN.
+### Campaigns
 
-Campaigns
-Check campaign read behavior first, because this is the easiest place to verify masked status, budgets, and metrics.
+```bash
+curl -s "$API/api/campaigns" -H "Authorization: Bearer $TOKEN" | jq
+```
 
-bash
-curl -s "$API/api/campaigns" \
-  -H "Authorization: Bearer $TOKEN" | jq
-What to expect:
+Run twice and diff to verify determinism when masking is on:
 
-With masking off: real Meta-looking status, budget, and metrics.
-
-With selective masking on: campaign status should be "ACTIVE", daily_budget should look synthetic/plausible, and 7-day metrics should be populated from the synthetic profile.
-
-To verify determinism, run it twice:
-
-bash
+```bash
 curl -s "$API/api/campaigns" -H "Authorization: Bearer $TOKEN" | jq > /tmp/c1.json
 curl -s "$API/api/campaigns" -H "Authorization: Bearer $TOKEN" | jq > /tmp/c2.json
-diff /tmp/c1.json /tmp/c2.json
-If masking is deterministic, the output should be identical for unchanged campaign IDs.
+diff /tmp/c1.json /tmp/c2.json   # should be empty
+```
 
-Ingest preview
-This shows what the ingest pipeline is about to consume without writing to the DB.
+### Ingest
 
-bash
-curl -s "$API/api/ingest/preview" \
-  -H "Authorization: Bearer $TOKEN" | jq
-What to expect:
+```bash
+curl -s "$API/api/ingest/preview" -H "Authorization: Bearer $TOKEN" | jq
+curl -s -X POST "$API/api/ingest" -H "Authorization: Bearer $TOKEN" | jq
+```
 
-Campaigns should reflect the same masked campaign read behavior if masking is enabled.
+### Pause / Resume
 
-Ads should retain real creative fields but can have status forced to "ACTIVE" if ad-status masking is on.
+```bash
+export CAMPAIGN_ID="<id from /api/campaigns>"
+curl -s -X POST "$API/api/campaigns/$CAMPAIGN_ID/pause"  -H "Authorization: Bearer $TOKEN" | jq
+curl -s -X POST "$API/api/campaigns/$CAMPAIGN_ID/resume" -H "Authorization: Bearer $TOKEN" | jq
+```
 
-Ingest write
-This is the key check for your selective masking idea, because it proves the app is writing real DB rows from masked source data.
+With `MASK_PAUSE_RESUME=true` both return success without hitting Meta.
 
-bash
-curl -s -X POST "$API/api/ingest" \
-  -H "Authorization: Bearer $TOKEN" | jq
-What to expect:
+### Reference env configs
 
-campaigns_seen should reflect real fetched campaigns.
-
-campaigns_saved should be nonzero if synthetic metrics are being injected for campaigns.
-
-message should look normal, because the route does not know the values were masked.
-
-Campaign history
-After ingest, inspect one campaign’s stored metrics using a real campaign ID returned from /api/campaigns.
-
-bash
-export CAMPAIGN_ID="PASTE_CAMPAIGN_ID_HERE"
-
-curl -s "$API/api/campaigns/$CAMPAIGN_ID/history?days=30" \
-  -H "Authorization: Bearer $TOKEN" | jq
-What to expect:
-
-You should see persisted rows in ad_insights based on whatever the provider returned during ingest.
-
-If masking was active, those history values should match the synthetic metrics you saw during the ingest period.
-
-Ads
-Check whether ad statuses are being masked while creative payloads remain real.
-
-bash
-curl -s "$API/api/ads" \
-  -H "Authorization: Bearer $TOKEN" | jq
-What to expect:
-
-status may be forced to "ACTIVE" when status masking is enabled.
-
-body, image_url, thumbnail_url, campaign_id, and adset_id should still look like real underlying payload data.
-
-Pause / resume
-These verify whether pause/resume is being no-op masked or truly passed through.
-
-bash
-curl -s -X POST "$API/api/campaigns/$CAMPAIGN_ID/pause" \
-  -H "Authorization: Bearer $TOKEN" | jq
-bash
-curl -s -X POST "$API/api/campaigns/$CAMPAIGN_ID/resume" \
-  -H "Authorization: Bearer $TOKEN" | jq
-What to expect:
-
-With MASK_PAUSE_RESUME=true, both should return success from your API while not actually changing Meta state.
-
-With masking off, these should pass through to real Meta and actually affect the campaign if the account and campaign allow it.
-
-Good env combos
-Here are the most useful configurations to test:
-
-
-
-1. Real baseline
-
-text
-APP_MODE=live
-MASK_MODE=off
-
-Expected: everything is real pass-through.
-
-2. Selective lie layer
-
-APP_MODE=live
-MASK_MODE=selective
-MASK_STATUS=true
-MASK_BUDGETS=true
-MASK_METRICS=true
-MASK_PAUSE_RESUME=true
-MASK_AD_STATUSES=true
-METRIC_PROFILE=healthy
-
-Expected: reads look healthy and active, writes to DB are real, pause/resume is fake success.
-
-3. Weaker story
-
-APP_MODE=live
-MASK_MODE=selective
-MASK_STATUS=true
-MASK_BUDGETS=true
-MASK_METRICS=true
-METRIC_PROFILE=weak
-
-Expected: still active, but much weaker delivery numbers.
-
-4. Existing demo mode
-
-APP_MODE=demo
-
-Expected: factory returns DemoMetaProvider() and masking layer is skipped entirely.
-
-
-
-
-
+| Scenario | Env vars |
+|---|---|
+| Real baseline | `APP_MODE=live MASK_MODE=off` |
+| Full selective mask | `MASK_MODE=selective MASK_STATUS=true MASK_BUDGETS=true MASK_METRICS=true MASK_PAUSE_RESUME=true MASK_AD_STATUSES=true METRIC_PROFILE=healthy` |
+| Weak delivery story | `MASK_MODE=selective MASK_STATUS=true MASK_METRICS=true METRIC_PROFILE=weak` |
+| Full demo (no Meta) | `APP_MODE=demo` |

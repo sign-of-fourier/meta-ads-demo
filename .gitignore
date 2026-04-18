@@ -1,0 +1,29 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+backend/.venv/
+backend/__pycache__/
+**/__pycache__/
+**/*.py[cod]
+
+# ── Database ──────────────────────────────────────────────────────────────────
+backend/app.db
+backend/app.db-shm
+backend/app.db-wal
+backend/embeddings/embedding_cache/
+backend/generated_images/
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+backend/.env
+frontend/.env
+
+# ── Node ──────────────────────────────────────────────────────────────────────
+frontend/node_modules/
+
+# ── Build output ──────────────────────────────────────────────────────────────
+frontend/dist/
+
+# ── OS / editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
