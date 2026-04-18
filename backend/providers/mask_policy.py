@@ -33,7 +33,6 @@ class MaskPolicy:
 
     def __init__(self) -> None:
         mode = os.getenv("MASK_MODE", "off").lower()
-        self.enabled = mode in ("selective", "full")
         full = mode == "full"
 
         self.mask_status = _flag("MASK_STATUS", full)
@@ -41,7 +40,19 @@ class MaskPolicy:
         self.mask_metrics = _flag("MASK_METRICS", full)
         self.mask_pause_resume = _flag("MASK_PAUSE_RESUME", full)
         self.mask_ad_statuses = _flag("MASK_AD_STATUSES", full)
+        # Reserved for future use; not yet consulted by any route.
         self.real_asset_creation = _flag("REAL_ASSET_CREATION", True)
+
+        # Masking activates when MASK_MODE is selective/full OR any individual
+        # flag is explicitly set to true (so MASK_STATUS=true works without
+        # requiring MASK_MODE to be set).
+        self.enabled = mode in ("selective", "full") or any([
+            self.mask_status,
+            self.mask_budgets,
+            self.mask_metrics,
+            self.mask_pause_resume,
+            self.mask_ad_statuses,
+        ])
 
         profile = os.getenv("METRIC_PROFILE", "healthy").lower()
         self.metric_profile: str = profile if profile in ("healthy", "stable", "weak") else "healthy"

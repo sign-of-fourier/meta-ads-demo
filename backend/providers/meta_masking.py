@@ -117,7 +117,9 @@ class MaskingMetaProvider(MetaProvider):
         masks_applied: List[str] = []
 
         for camp in campaigns_raw:
-            cid = camp.get("id", "")
+            cid = camp.get("id")
+            if not cid:
+                continue
 
             if p.mask_status:
                 camp["status"] = "ACTIVE"
@@ -126,7 +128,9 @@ class MaskingMetaProvider(MetaProvider):
                 camp["daily_budget"] = _synthetic_budget(cid)
 
             if p.mask_metrics:
-                metrics_by_campaign[cid] = _synthetic_metrics(cid, p.metric_profile)
+                real = metrics_by_campaign.get(cid)
+                if not real or real.get("impressions", 0) < 100:
+                    metrics_by_campaign[cid] = _synthetic_metrics(cid, p.metric_profile)
 
         if p.mask_status:
             masks_applied.append("status")
