@@ -131,11 +131,8 @@ def get_scored_combinations(
             "SELECT image_vector FROM ad_embeddings WHERE ad_id = ? AND user_id = ?",
             (emb_ad_id, user_id),
         ).fetchone()
-        if emb_row is None:
-            continue
-        image_vec = _vec(emb_row["image_vector"])
-        if image_vec is None:
-            continue
+        image_vec = _vec(emb_row["image_vector"]) if emb_row else None
+        # None image_vec is allowed — combiner will zero-pad that slot
 
         # Text vector — prefer exact combination match in ad_text_combination_embeddings
         job_row = c.execute(
@@ -206,15 +203,12 @@ def get_candidate_combinations(
     """
     c = _conn(db_path)
 
-    # Seed ad image vector
+    # Seed ad image vector (None = no image embedding yet; combiner uses zeros)
     seed_row = c.execute(
         "SELECT image_vector FROM ad_embeddings WHERE ad_id = ? AND user_id = ?",
         (seed_ad_id, user_id),
     ).fetchone()
-    if seed_row is None or seed_row["image_vector"] is None:
-        c.close()
-        return []
-    seed_image_vec = _vec(seed_row["image_vector"])
+    seed_image_vec = _vec(seed_row["image_vector"]) if seed_row else None
 
     # All text combinations for this source
     rows = c.execute(

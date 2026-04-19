@@ -88,7 +88,15 @@ See `SCHEMAS.md` for full table definitions and `README.md` for the API route ta
 
 Standalone async module. Called fire-and-forget from structural ingest; also runnable standalone. Not wired into any HTTP route. See **`backend/embeddings/README.md`** for full documentation, env vars, and test instructions.
 
-Public entry point: `embed_ad(user_id, ad_id, campaign_id, components, db_path)` in `embeddings/pipeline.py`.
+Structural ingest fires **three** embedding tasks per ad (all fire-and-forget):
+1. `embed_ad(...)` — seed embedding: slot[0] text + image[0] → `ad_embeddings` (one row per ad)
+2. `embed_images(...)` — per-image embeddings for each URL image slot → `ad_image_embeddings` (one row per image)
+3. `embed_all_combinations(...)` — N×M×K text combinations → `ad_text_combination_embeddings`
+
+`embed_all_combinations` skips already-embedded combinations (idempotent, no repeated API calls).
+Image slots stored as Meta hashes (not URLs) are resolved to CDN URLs via the Meta `adimages` API during `fetch_campaign_structure` before normalization.
+
+Public entry points in `embeddings/pipeline.py`: `embed_ad(...)`, `embed_images(...)`.
 
 ## Ad generation pipeline (`backend/ad_generation/`)
 
@@ -123,7 +131,14 @@ Public entry points: `run_bo(seed_ad_id, text_source_id, user_id, db_path)` → 
 Key design: `selector.py` is the only file that knows the DB schema; `gpr.py` is pure numpy/sklearn; `pipeline.py` orchestrates. Falls back to random selection when fewer than 2 scored observations exist.
 
 Scored combinations: `ad_generation_variants` (score IS NOT NULL, status != defunct) joined via `ad_embeddings` using convention `ad_id = gen_{job_id}_{variant_id}`.
-Candidate combinations: all rows in `ad_text_combination_embeddings` for `text_source_id`, each paired with the seed ad's image embedding.
+Candidate combinations: all rows in `ad_text_combination_embeddings` for `text_source_id`, each paired with the seed ad's image embedding (None image_vec is allowed — combiner zero-pads that slot).
+
+**HTTP endpoints (wired):** `POST /api/bo/run` runs BO and saves picks; `GET /api/bo/results/{ad_id}` returns the latest picks.
+
+**Seeding scored observations for testing:** `backend/seed_bo.py` inserts synthetic scored variants into `ad_generation_jobs`, `ad_generation_variants`, and `ad_embeddings`. Run with:
+```bash
+python seed_bo.py --ad-id <ad_id> --user-id <user_id> --campaign-id <campaign_id> --n 5
+```
 
 ## Frontend (`frontend/src/`)
 
@@ -168,27 +183,47 @@ created_static → active_static  (future: user activates in Meta)
 | `JWT_SECRET` | Any random string |
 | `FRONTEND_URL` | Defaults to `http://localhost:5173` |
 
-### Embeddings env vars
+### API keys and endpoints — full reference
 
+There are **four separate external services**, each with its own key and endpoint. Do not mix them up.
+
+#### 1. OpenAI — text embeddings
 | Variable | Description |
 |---|---|
-| `AZURE_INFERENCE_KEY` | Azure AI Inference API key (required for embeddings) |
-| `AZURE_ENDPOINT` | Azure AI Inference endpoint (defaults to project resource URL) |
-| `AZURE_IMAGE_MODEL` | Embedding model for images (default `embed-v-4-0`) |
-| `AZURE_TEXT_MODEL` | Embedding model for text (default `embed-v-4-0`) |
+| `OPENAI_KEY` | OpenAI API key (sk-...) |
+| `OPENAI_TEXT_MODEL` | Embedding model (default `text-embedding-3-small`) |
 
-### Ad generation env vars
+Used by: `embeddings/embedder.py` → `embed_text()`, `ad_combination_embeddings/pipeline.py`
 
+#### 2. Azure AI Inference — image embeddings
+| Variable | Description |
+|---|---|
+| `AZURE_INFERENCE_KEY` | Azure AI Inference key for the multimodal embedding resource |
+| `AZURE_EMBEDDING_ENDPOINT` | Resource endpoint (default `https://markpshipman-2243-resource.services.ai.azure.com/models`) |
+| `AZURE_IMAGE_MODEL` | Image embedding model (default `embed-v-4-0`) |
+
+Used by: `embeddings/embedder.py` → `embed_image_url()`
+**This is a different resource and key from the Azure OpenAI used for ad generation.**
+
+#### 3. Azure OpenAI — ad generation, analysis, scoring, text generation
 | Variable | Description |
 |---|---|
 | `AZURE_OPENAI_KEY` | Azure OpenAI API key |
 | `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource endpoint (e.g. `https://your-resource.openai.azure.com/`) |
 | `AZURE_OPENAI_API_VERSION` | Defaults to `2024-12-01-preview` |
-| `AZURE_ANALYSIS_DEPLOYMENT` | GPT-4o deployment name for image analysis (default `gpt-4o`) |
-| `AZURE_SCORING_DEPLOYMENT` | Fine-tuned model deployment for ad scoring (default `gpt-4-04-14`) |
-| `AZURE_TEXT_GEN_DEPLOYMENT` | GPT-4o deployment name for text variant generation (default `gpt-4o`) |
-| `DEAPI_API_KEY` | deAPI key for FLUX img2img generation |
-| `IMAGES_SERVE_BASE_URL` | Base URL where `backend/generated_images/` is served (default `http://localhost:8000/images`) |
+| `AZURE_ANALYSIS_DEPLOYMENT` | GPT-4o deployment for image analysis (default `gpt-4o`) |
+| `AZURE_SCORING_DEPLOYMENT` | Fine-tuned scorer deployment (default `gpt-4-04-14`) |
+| `AZURE_TEXT_GEN_DEPLOYMENT` | GPT-4o deployment for text generation (default `gpt-4o`) |
+
+Used by: `ad_generation/` pipeline (analyze, score, QA, text gen steps)
+
+#### 4. deAPI — FLUX image generation
+| Variable | Description |
+|---|---|
+| `DEAPI_API_KEY` | deAPI key for FLUX img2img image generation |
+| `IMAGES_SERVE_BASE_URL` | Base URL for serving generated images (default `http://localhost:8000/images`) |
+
+Used by: `ad_generation/` pipeline (generate + poll steps)
 
 ### Masking layer env vars
 
@@ -210,6 +245,86 @@ Masking activates when `MASK_MODE=selective|full` **or** when any individual `MA
 Synthetic metrics are **deterministic per campaign ID** — the same campaign always gets the same numbers across restarts. Values are internally consistent (`ctr = clicks/impressions`, `cpm = spend/impressions*1000`, `cpc = spend/clicks`). Campaigns without a valid `id` field are skipped entirely by the masking layer.
 
 Routes that always hit Meta directly (not masked): `/auth/meta/callback`, `/api/explore`, structural ingest (`_fetch_campaign_structure`), and static ad creation (`_clone_dynamic_to_static_ad`).
+
+## Manual API testing (curl)
+
+All routes require a JWT. Get one first:
+
+```bash
+curl -s -X POST http://localhost:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "you@example.com", "password": "yourpassword"}'
+# → {"token": "eyJ..."}
+```
+
+Set it for reuse:
+```bash
+TOKEN=eyJ...
+```
+
+### Ingest campaign metrics
+```bash
+curl -s -X POST http://localhost:8000/api/ingest \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+# → {"campaigns_saved": 1, "ad_account_id": "act_...", "message": "Ingested 1 campaign snapshot(s)..."}
+# campaigns_saved=0 means campaign exists but had no delivery in last 7 days (NULL metrics saved, still OK)
+```
+
+### Ingest creative structure (triggers embeddings)
+```bash
+curl -s -X POST http://localhost:8000/api/ingest/structure/<campaign_id> \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+# → {"campaign_id": "...", "ads_processed": 1, "components_saved": 16}
+# Embedding jobs fire in background — check DB after a few seconds
+```
+
+### Verify embeddings
+```bash
+# Seed ad embedding (1 per ad)
+sqlite3 backend/app.db "SELECT ad_id, CASE WHEN image_vector IS NULL THEN 'no' ELSE 'yes' END AS has_image FROM ad_embeddings;"
+
+# Per-image embeddings (one per image slot)
+sqlite3 backend/app.db "SELECT ad_id, slot_index, CASE WHEN vector IS NULL THEN 'no' ELSE 'yes' END AS embedded FROM ad_image_embeddings;"
+
+# Text combination embeddings (N×M×K per ad)
+sqlite3 backend/app.db "SELECT source_id, COUNT(*) AS combinations FROM ad_text_combination_embeddings GROUP BY source_id;"
+# A 4×4×4 dynamic ad → 64 rows
+```
+
+### Seed synthetic BO training data (first time only)
+```bash
+# Find your ad_id and user_id first
+sqlite3 backend/app.db "SELECT DISTINCT ad_id FROM ad_creative_structures;"
+sqlite3 backend/app.db "SELECT id, email FROM users;"
+
+python seed_bo.py --ad-id <ad_id> --user-id <user_id> --campaign-id <campaign_id> --n 5
+# → Seeding 5 scored observations...
+# → [1] job=1 variant=1 score=5.87 headline='...'
+```
+
+### Run Bayesian Optimisation
+```bash
+curl -s -X POST http://localhost:8000/api/bo/run \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"seed_ad_id": "<ad_id>", "text_source_id": "<ad_id>"}' | python3 -m json.tool
+# → {
+#     "seed_ad_id": "...",
+#     "scored_count": 5,       ← training observations used
+#     "candidate_count": 64,   ← unscored combinations evaluated
+#     "picks": [
+#       {"selection_type": "ei",      "combination": {...}, "gpr_mean": 5.6, "ei_score": 0.109},
+#       {"selection_type": "fantasy", "combination": {...}, "gpr_mean": 5.6, "ei_score": 0.085}
+#     ]
+#   }
+# With <2 scored observations → falls back to random selection_type
+```
+
+### Get latest BO results
+```bash
+curl -s http://localhost:8000/api/bo/results/<ad_id> \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
 
 ## Provider layer (`backend/providers/`)
 
@@ -242,8 +357,8 @@ Routes that always hit Meta directly (not masked): `/auth/meta/callback`, `/api/
 - Login-time reconciliation of ingested structure against live Meta state
 - Sync classification (new / updated / unchanged) on structural ingest
 - HTTP routes to trigger / inspect `ad_generation` jobs — module exists but is not yet wired into `main.py`
-- HTTP routes to trigger `ad_text_generation`, `ad_combination_embeddings`, or `bo_pipeline` — all standalone, none wired into `main.py`
-- HTTP routes to query `ad_embeddings` or `bo_selections` — results not exposed via API
+- HTTP routes to trigger `ad_text_generation` — standalone, not wired into `main.py`
 - Frontend visibility into generated images, text variants, or BO recommendations
-- Wiring `bo_pipeline` output into the existing `suggested_configurations` / Suggestions panel flow
+- Wiring `bo_pipeline` output into the Suggestions panel UI (BO runs via API, not surfaced in UI yet)
 - Auto-activation of new static ads (always created PAUSED, user activates manually in Meta)
+- Per-image BO: currently all text combinations are paired with the seed ad's single image vector; pairing each text combo with each of the 4 image embeddings (4×64=256 candidates) is not yet implemented

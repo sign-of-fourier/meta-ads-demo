@@ -28,15 +28,17 @@ def truncate_pad(vec: np.ndarray, dim: int) -> np.ndarray:
 
 def combine(
     text_vec: np.ndarray,
-    image_vec: np.ndarray,
+    image_vec: np.ndarray | None,
     text_dim: int = TEXT_DIM,
     image_dim: int = IMAGE_DIM,
 ) -> np.ndarray:
     """
     Concatenate truncated/padded text and image embeddings.
     Returns a float32 array of shape (text_dim + image_dim,).
+    image_vec may be None — zeros are used in that slot.
     """
-    return np.concatenate([truncate_pad(text_vec, text_dim), truncate_pad(image_vec, image_dim)])
+    img = np.zeros(image_dim, dtype=np.float32) if image_vec is None else truncate_pad(image_vec, image_dim)
+    return np.concatenate([truncate_pad(text_vec, text_dim), img])
 
 
 def output_dim(text_dim: int = TEXT_DIM, image_dim: int = IMAGE_DIM) -> int:

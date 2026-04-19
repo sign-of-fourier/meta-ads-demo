@@ -666,23 +666,22 @@ async def run_ingest(user_id: int = Depends(get_current_user_id)):
     for c in campaigns_raw:
         cid = c["id"]
         mm = metrics_by_campaign.get(cid, {})
-        if mm:
-            db.execute(
-                """
-                INSERT INTO ad_insights
-                    (user_id, ad_account_id, level, object_id, date,
-                     impressions, clicks, spend, ctr, cpm, cpc,
-                     data_source, mask_profile)
-                VALUES (?, ?, 'campaign', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id, ad_account_id, cid, today,
-                    mm.get("impressions"), mm.get("clicks"), mm.get("spend"),
-                    mm.get("ctr"), mm.get("cpm"), mm.get("cpc"),
-                    data_source, mask_profile,
-                ),
-            )
-            saved += 1
+        db.execute(
+            """
+            INSERT INTO ad_insights
+                (user_id, ad_account_id, level, object_id, date,
+                 impressions, clicks, spend, ctr, cpm, cpc,
+                 data_source, mask_profile)
+            VALUES (?, ?, 'campaign', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id, ad_account_id, cid, today,
+                mm.get("impressions"), mm.get("clicks"), mm.get("spend"),
+                mm.get("ctr"), mm.get("cpm"), mm.get("cpc"),
+                data_source, mask_profile,
+            ),
+        )
+        saved += 1
 
     db.commit()
     db.close()
@@ -760,6 +759,16 @@ def _normalize_creative(ad: dict) -> tuple[str, list[dict]]:
             value = item.get("url") or item.get("hash")
             components.append({"slot": "image", "slot_index": i, "value": value})
 
+        # If all image values are hashes (no URLs), use thumbnail_url as a real URL fallback
+        has_url_image = any(
+            c["slot"] == "image" and c["value"] and c["value"].startswith("http")
+            for c in components
+        )
+        if not has_url_image:
+            thumbnail = creative.get("thumbnail_url") or creative.get("image_url")
+            if thumbnail:
+                components.append({"slot": "image", "slot_index": 9999, "value": thumbnail})
+
         return creative_type, components
 
     # Static: pull from top-level creative fields or object_story_spec
@@ -802,6 +811,7 @@ async def _fetch_campaign_structure(
         params={
             "access_token": access_token,
             "fields": "id,name,status,campaign_id",
+            "effective_status": '["ACTIVE","PAUSED","ARCHIVED","WITH_ISSUES"]',
             "filtering": f'[{{"field":"campaign.id","operator":"EQUAL","value":"{campaign_id}"}}]',
             "limit": 500,
         },
@@ -821,6 +831,7 @@ async def _fetch_campaign_structure(
                 "asset_feed_spec,object_story_spec"
                 "}"
             ),
+            "effective_status": '["ACTIVE","PAUSED","ARCHIVED","WITH_ISSUES"]',
             "filtering": f'[{{"field":"campaign.id","operator":"EQUAL","value":"{campaign_id}"}}]',
             "limit": 500,
         },
@@ -845,7 +856,7 @@ async def ingest_campaign_structure(
     access_token, ad_account_id = _meta_creds(user_id)
 
     async with httpx.AsyncClient(timeout=30) as client:
-        _adsets, ads = await _fetch_campaign_structure(
+        _adsets, ads = await meta_provider.fetch_campaign_structure(
             client, access_token, ad_account_id, campaign_id
         )
 
@@ -921,12 +932,18 @@ async def ingest_campaign_structure(
     db.close()
 
     # ── Embedding hook (fire-and-forget) ──────────────────────────────────────
-    # Failures here are logged and swallowed; ingest result is already committed.
+    # embed_ad       → 1 seed embedding per ad (slot[0] text + image[0]) → ad_embeddings
+    # embed_all_combinations → N×M×K text combos per ad → ad_text_combination_embeddings
+    # source_id = ad_id links both tables back to the ad and its campaign.
+    # Failures are logged and swallowed; ingest result is already committed.
     try:
         import asyncio as _asyncio
-        from embeddings.pipeline import embed_ad
+        from embeddings.pipeline import embed_ad, embed_images
+        from ad_combination_embeddings.pipeline import embed_all_combinations
         for _ad_id, _comps in ad_components_map.items():
             _asyncio.create_task(embed_ad(user_id, _ad_id, campaign_id, _comps))
+            _asyncio.create_task(embed_images(user_id, _ad_id, campaign_id, _comps))
+            _asyncio.create_task(embed_all_combinations(source_id=_ad_id, components=_comps))
     except Exception:
         logger.warning("embedding hook unavailable — skipping", exc_info=True)
 
@@ -1394,6 +1411,63 @@ async def confirm_suggestion(
     ).fetchone()
     db.close()
     return _suggestion_from_row(row)
+
+
+# ── Bayesian Optimisation routes ──────────────────────────────────────────────
+
+class BOPick(BaseModel):
+    combination_key: str
+    combination: dict
+    selection_type: str
+    ei_score: float | None = None
+    gpr_mean: float | None = None
+    gpr_std: float | None = None
+
+
+class BORunRequest(BaseModel):
+    seed_ad_id: str
+    text_source_id: str  # usually same as seed_ad_id
+
+
+class BORunResponse(BaseModel):
+    seed_ad_id: str
+    text_source_id: str
+    picks: list[BOPick]
+    scored_count: int
+    candidate_count: int
+
+
+@app.post("/api/bo/run", response_model=BORunResponse)
+def run_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_current_user_id)):
+    """
+    Run Bayesian Optimisation for an ad and return up to 2 recommended combinations.
+    seed_ad_id and text_source_id are normally the same (both = the ingested ad_id).
+    """
+    from bo_pipeline.pipeline import run_bo
+    from bo_pipeline.selector import get_candidate_combinations, get_scored_combinations
+    from bo_pipeline.storage import DB_PATH as BO_DB_PATH, save_bo_run
+
+    scored = get_scored_combinations(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
+    candidates = get_candidate_combinations(body.text_source_id, body.seed_ad_id, user_id, db_path=BO_DB_PATH)
+    picks = run_bo(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
+
+    if picks:
+        save_bo_run(body.seed_ad_id, body.text_source_id, picks, BO_DB_PATH)
+
+    return BORunResponse(
+        seed_ad_id=body.seed_ad_id,
+        text_source_id=body.text_source_id,
+        picks=[BOPick(**p) for p in picks],
+        scored_count=len(scored),
+        candidate_count=len(candidates),
+    )
+
+
+@app.get("/api/bo/results/{ad_id}", response_model=list[BOPick])
+def get_bo_results(ad_id: str, user_id: int = Depends(get_current_user_id)):
+    """Return the most recent BO picks for an ad."""
+    from bo_pipeline.storage import DB_PATH as BO_DB_PATH, get_latest_bo_run
+    return [BOPick(**p) for p in get_latest_bo_run(ad_id, ad_id, BO_DB_PATH)]
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

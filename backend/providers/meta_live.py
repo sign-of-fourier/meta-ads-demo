@@ -1,4 +1,5 @@
 # providers/meta_live.py
+import json
 import logging
 import os
 from typing import Any, Dict, List, Tuple
@@ -26,6 +27,7 @@ class LiveMetaProvider(MetaProvider):
             params={
                 "access_token": access_token,
                 "fields": "id,name,status,daily_budget",
+                "effective_status": '["ACTIVE","PAUSED","ARCHIVED","WITH_ISSUES"]',
                 "limit": 100,
             },
         )
@@ -101,6 +103,80 @@ class LiveMetaProvider(MetaProvider):
         if resp.status_code != 200:
             raise HTTPException(502, f"Failed to fetch ads: {resp.text}")
         return resp.json().get("data", [])
+
+    async def fetch_campaign_structure(
+        self,
+        client: httpx.AsyncClient,
+        access_token: str,
+        ad_account_id: str,
+        campaign_id: str,
+    ):
+        from fastapi import HTTPException
+        adsets_resp = await client.get(
+            f"{META_GRAPH}/{ad_account_id}/adsets",
+            params={
+                "access_token": access_token,
+                "fields": "id,name,status,campaign_id",
+                "filtering": f'[{{"field":"campaign.id","operator":"EQUAL","value":"{campaign_id}"}}]',
+                "limit": 500,
+            },
+        )
+        if adsets_resp.status_code != 200:
+            raise HTTPException(502, f"Failed to fetch adsets: {adsets_resp.text}")
+        adsets = adsets_resp.json().get("data", [])
+
+        ads_resp = await client.get(
+            f"{META_GRAPH}/{ad_account_id}/ads",
+            params={
+                "access_token": access_token,
+                "fields": (
+                    "id,name,status,effective_status,campaign_id,adset_id,"
+                    "creative{"
+                    "id,name,body,title,image_url,thumbnail_url,"
+                    "asset_feed_spec,object_story_spec"
+                    "}"
+                ),
+                "filtering": f'[{{"field":"campaign.id","operator":"EQUAL","value":"{campaign_id}"}}]',
+                "limit": 500,
+            },
+        )
+        if ads_resp.status_code != 200:
+            raise HTTPException(502, f"Failed to fetch ads: {ads_resp.text}")
+        ads = ads_resp.json().get("data", [])
+
+        # Resolve image hashes → URLs via adimages endpoint
+        hashes = []
+        for ad in ads:
+            feed = (ad.get("creative") or {}).get("asset_feed_spec") or {}
+            for img in feed.get("images", []):
+                h = img.get("hash")
+                if h and not img.get("url"):
+                    hashes.append(h)
+
+        hash_to_url: dict[str, str] = {}
+        if hashes:
+            img_resp = await client.get(
+                f"{META_GRAPH}/{ad_account_id}/adimages",
+                params={
+                    "access_token": access_token,
+                    "hashes": json.dumps(hashes),
+                    "fields": "hash,url",
+                },
+            )
+            if img_resp.status_code == 200:
+                for row in img_resp.json().get("data", []):
+                    if row.get("hash") and row.get("url"):
+                        hash_to_url[row["hash"]] = row["url"]
+
+        # Patch image URLs back into each ad's asset_feed_spec
+        for ad in ads:
+            feed = (ad.get("creative") or {}).get("asset_feed_spec") or {}
+            for img in feed.get("images", []):
+                h = img.get("hash")
+                if h and h in hash_to_url:
+                    img["url"] = hash_to_url[h]
+
+        return adsets, ads
 
     async def pause_campaign(
         self,

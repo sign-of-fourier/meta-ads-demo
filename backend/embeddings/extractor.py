@@ -25,8 +25,11 @@ def extract_fields(components: list[dict]) -> dict:
 
         if slot in text_slots and slot not in fields:
             fields[slot] = value
-        elif slot == "image" and "image_url" not in fields:
-            fields["image_url"] = value
+        elif slot == "image":
+            is_url = value.startswith("http")
+            existing_is_url = fields.get("image_url", "").startswith("http")
+            if "image_url" not in fields or (is_url and not existing_is_url):
+                fields["image_url"] = value
 
     return fields
 

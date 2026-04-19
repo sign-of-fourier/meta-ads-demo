@@ -185,6 +185,15 @@ class MaskingMetaProvider(MetaProvider):
     # ------------------------------------------------------------------
     # pause_campaign / resume_campaign
     # ------------------------------------------------------------------
+    async def fetch_campaign_structure(
+        self,
+        client: httpx.AsyncClient,
+        access_token: str,
+        ad_account_id: str,
+        campaign_id: str,
+    ):
+        return await self._live.fetch_campaign_structure(client, access_token, ad_account_id, campaign_id)
+
     async def pause_campaign(
         self,
         client: httpx.AsyncClient,

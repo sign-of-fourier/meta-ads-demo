@@ -64,10 +64,17 @@ async def embed_all_combinations(
         logger.warning("embed_all_combinations: no combinations found for source_id=%s", source_id)
         return 0
 
-    model_name = os.getenv("AZURE_TEXT_MODEL", "embed-v-4-0")
+    # Skip combinations already embedded — key IS the content, so existence = no change
+    existing_keys = {row["combination_key"] for row in get_embeddings_for_source(source_id, db_path)}
+    new_combos = [c for c in combos if combination_key(c) not in existing_keys]
+    if not new_combos:
+        logger.info("embed_all_combinations: all %d combinations already embedded for source_id=%s", len(combos), source_id)
+        return 0
+
+    model_name = os.getenv("OPENAI_TEXT_MODEL", "text-embedding-3-small")
     logger.info(
-        "embed_all_combinations: source_id=%s combinations=%d slots=%s",
-        source_id, len(combos), list(slots),
+        "embed_all_combinations: source_id=%s new=%d/%d slots=%s",
+        source_id, len(new_combos), len(combos), list(slots),
     )
 
     semaphore = asyncio.Semaphore(max_concurrency)
@@ -75,13 +82,13 @@ async def embed_all_combinations(
     async def _embed_one(combo: dict) -> tuple[str, object, str | None] | None:
         key = combination_key(combo)
         async with semaphore:
-            vec = await embed_text(key)   # embed the JSON key string directly
+            vec = await embed_text(key)
         if vec is None:
             logger.warning("embed_all_combinations: embedding failed for combo %s", key)
             return None
         return (key, vec, model_name)
 
-    tasks = [_embed_one(c) for c in combos]
+    tasks = [_embed_one(c) for c in new_combos]
     results = await asyncio.gather(*tasks)
 
     rows = [r for r in results if r is not None]

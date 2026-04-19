@@ -99,6 +99,96 @@ def _save(
 
 
 # ---------------------------------------------------------------------------
+# Per-image embedding table
+# ---------------------------------------------------------------------------
+
+_CREATE_IMAGE_TABLE = """
+CREATE TABLE IF NOT EXISTS ad_image_embeddings (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    ad_id       TEXT NOT NULL,
+    campaign_id TEXT NOT NULL,
+    slot_index  INTEGER NOT NULL,
+    image_ref   TEXT NOT NULL,
+    vector      BLOB NOT NULL,
+    model       TEXT,
+    embedded_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (user_id, ad_id, slot_index)
+)
+"""
+
+_UPSERT_IMAGE = """
+INSERT INTO ad_image_embeddings
+    (user_id, ad_id, campaign_id, slot_index, image_ref, vector, model)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (user_id, ad_id, slot_index) DO UPDATE SET
+    image_ref   = excluded.image_ref,
+    vector      = excluded.vector,
+    model       = excluded.model,
+    embedded_at = datetime('now')
+"""
+
+
+async def embed_images(
+    user_id: int,
+    ad_id: str,
+    campaign_id: str,
+    components: list[dict],
+    db_path: Path = DB_PATH,
+) -> int:
+    """
+    Embed each image slot separately and store in ad_image_embeddings.
+    Only embeds images whose image_ref is a URL (skips hashes).
+    Returns count of images successfully embedded.
+    """
+    image_comps = sorted(
+        [c for c in components if c.get("slot") == "image" and c.get("value")],
+        key=lambda c: c.get("slot_index", 0),
+    )
+    if not image_comps:
+        return 0
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(_CREATE_IMAGE_TABLE)
+    conn.commit()
+
+    # Check which slot_indexes already have embeddings
+    existing = {
+        row[0] for row in conn.execute(
+            "SELECT slot_index FROM ad_image_embeddings WHERE user_id = ? AND ad_id = ?",
+            (user_id, ad_id),
+        ).fetchall()
+    }
+    conn.close()
+
+    model_name = os.getenv("AZURE_IMAGE_MODEL", "embed-v-4-0")
+    saved = 0
+
+    async def _embed_one(comp: dict) -> None:
+        nonlocal saved
+        idx = comp.get("slot_index", 0)
+        ref = comp["value"]
+        if idx in existing:
+            return
+        if not ref.startswith("http"):
+            logger.info("embed_images: skipping hash-only image at slot %d for ad %s", idx, ad_id)
+            return
+        vec = await embed_image_url(ref)
+        if vec is None:
+            return
+        c = sqlite3.connect(str(db_path))
+        c.execute(_CREATE_IMAGE_TABLE)
+        c.execute(_UPSERT_IMAGE, (user_id, ad_id, campaign_id, idx, ref, vec.tobytes(), model_name))
+        c.commit()
+        c.close()
+        saved += 1
+        logger.info("embed_images: saved image slot=%d ad=%s", idx, ad_id)
+
+    await asyncio.gather(*[_embed_one(c) for c in image_comps])
+    return saved
+
+
+# ---------------------------------------------------------------------------
 # Main entry point (called from ingest hook or standalone)
 # ---------------------------------------------------------------------------
 

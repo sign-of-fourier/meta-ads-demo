@@ -34,9 +34,17 @@ no metadata coupling between modules.
 
 ### 1. Ad embeddings (`backend/embeddings/`)
 
-Embeds ingested ads (one image + all text slots concatenated) into `ad_embeddings`.
-Called fire-and-forget from structural ingest. Also runnable standalone:
+Structural ingest fires three embedding tasks per ad (fire-and-forget):
 
+| Task | Output table | What it stores |
+|---|---|---|
+| `embed_ad` | `ad_embeddings` | Seed embedding: slot[0] text + image[0] combined |
+| `embed_images` | `ad_image_embeddings` | One vector per image slot (URL images only) |
+| `embed_all_combinations` | `ad_text_combination_embeddings` | N×M×K text combo vectors |
+
+Image hashes from Meta's `asset_feed_spec` are resolved to CDN URLs via the Meta `adimages` API before embedding. Already-embedded combinations are skipped (no repeated API calls).
+
+Standalone re-embed:
 ```bash
 python -m embeddings.pipeline          # embed all un-embedded ads
 python -m embeddings.pipeline --ad-id <id>
@@ -110,6 +118,13 @@ save_bo_run(seed_ad_id, text_source_id, picks)
 
 Falls back to random selection when fewer than 2 scored observations exist.
 
+**HTTP endpoints:** `POST /api/bo/run` runs BO and persists picks; `GET /api/bo/results/{ad_id}` returns latest picks.
+
+**Seeding test data:** `backend/seed_bo.py` inserts synthetic scored observations for local testing.
+```bash
+python seed_bo.py --ad-id <ad_id> --user-id <user_id> --campaign-id <id> --n 5
+```
+
 ---
 
 ## Prerequisites
@@ -117,9 +132,22 @@ Falls back to random selection when fewer than 2 scored observations exist.
 - Python 3.11+
 - Node.js 18+
 - A Meta Developer App with **Marketing API** enabled and an OAuth redirect URI registered
-- Azure AI Inference credentials (for embeddings)
-- Azure OpenAI credentials (for image analysis, text generation, and QA)
-- deAPI credentials (for FLUX image generation)
+- OpenAI API key (text embeddings)
+- Azure AI Inference credentials (image embeddings — separate resource from Azure OpenAI)
+- Azure OpenAI credentials (image analysis, text generation, scoring, QA)
+- deAPI credentials (FLUX image generation)
+
+### API keys at a glance
+
+| Service | Key var | Endpoint var | Used for |
+|---|---|---|---|
+| OpenAI | `OPENAI_KEY` | — (openai.com) | Text embeddings |
+| Azure AI Inference | `AZURE_INFERENCE_KEY` | `AZURE_EMBEDDING_ENDPOINT` | Image embeddings (`embed-v-4-0`) |
+| Azure OpenAI | `AZURE_OPENAI_KEY` | `AZURE_OPENAI_ENDPOINT` | Ad analysis, text gen, scoring |
+| deAPI | `DEAPI_API_KEY` | — | FLUX img2img generation |
+| Meta | `META_APP_ID` + `META_APP_SECRET` | — | Marketing API |
+
+These are **four separate accounts/resources**. Azure AI Inference and Azure OpenAI use different endpoints and keys even if they share an Azure subscription.
 
 ---
 
@@ -232,6 +260,13 @@ All routes except auth require `Authorization: Bearer <jwt>`.
 | POST | `/api/suggestions` | Store a suggested configuration |
 | POST | `/api/suggestions/{id}/confirm` | Confirm create or replace |
 
+### Bayesian Optimisation
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/bo/run` | Run BO, return and persist up to 2 picks |
+| GET | `/api/bo/results/{ad_id}` | Latest BO picks for an ad |
+
 ### Other
 
 | Method | Path | Description |
@@ -264,7 +299,7 @@ See `CLAUDE.md` for the full masking variable reference.
 - **Auth:** Minimal JWT, 24h expiry. No email verification or rate limiting.
 - **Meta token:** Short-lived user token, no refresh logic.
 - **SQLite:** `backend/app.db` is gitignored. Delete it to reset all data.
-- **AI modules:** All six AI modules are implemented and tested but not yet wired into HTTP routes. They are runnable standalone or callable from Python directly.
+- **AI modules:** Embedding pipeline and BO are wired into HTTP routes. Ad generation, text generation, and combination embedding modules are standalone — runnable directly or callable from Python.
 - **Static ad images:** The clone flow passes image values as hosted URLs. Creatives stored only as image hashes (not URLs) will fail at Meta creative creation.
 
 For schema details see [`SCHEMAS.md`](SCHEMAS.md).

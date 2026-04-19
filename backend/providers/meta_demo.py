@@ -73,6 +73,55 @@ class DemoMetaProvider(MetaProvider):
             # add a couple more
         ]
 
+    async def fetch_campaign_structure(
+        self,
+        client: httpx.AsyncClient,
+        access_token: str,
+        ad_account_id: str,
+        campaign_id: str,
+    ):
+        demo_structure = {
+            "demo_camp_1": (
+                [{"id": "demo_adset_1", "name": "Demo Adset 1", "status": "ACTIVE", "campaign_id": "demo_camp_1"}],
+                [
+                    {
+                        "id": "demo_ad_1",
+                        "name": "Demo Ad 1",
+                        "status": "ACTIVE",
+                        "effective_status": "ACTIVE",
+                        "campaign_id": "demo_camp_1",
+                        "adset_id": "demo_adset_1",
+                        "creative": {
+                            "title": "Try AdStac.kr",
+                            "body": "Try AdStac.kr demo now.",
+                            "image_url": "https://via.placeholder.com/600x315?text=Demo+Ad",
+                            "thumbnail_url": "https://via.placeholder.com/120x120?text=Demo",
+                        },
+                    }
+                ],
+            ),
+            "demo_camp_2": (
+                [{"id": "demo_adset_2", "name": "Demo Adset 2", "status": "ACTIVE", "campaign_id": "demo_camp_2"}],
+                [
+                    {
+                        "id": "demo_ad_2",
+                        "name": "Demo Retargeting Ad",
+                        "status": "ACTIVE",
+                        "effective_status": "ACTIVE",
+                        "campaign_id": "demo_camp_2",
+                        "adset_id": "demo_adset_2",
+                        "creative": {
+                            "title": "Come Back",
+                            "body": "You left something behind — finish what you started.",
+                            "image_url": "https://via.placeholder.com/600x315?text=Retargeting+Ad",
+                            "thumbnail_url": "https://via.placeholder.com/120x120?text=RT",
+                        },
+                    }
+                ],
+            ),
+        }
+        return demo_structure.get(campaign_id, ([], []))
+
     async def pause_campaign(
         self,
         client: httpx.AsyncClient,
