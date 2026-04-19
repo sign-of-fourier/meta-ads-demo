@@ -50,3 +50,19 @@ class MetaProvider(ABC):
     ) -> None:
         """Resume a paused campaign."""
         ...
+
+    @abstractmethod
+    async def fetch_campaign_structure(
+        self,
+        client: httpx.AsyncClient,
+        access_token: str,
+        ad_account_id: str,
+        campaign_id: str,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Fetch adsets and ads with creative fields for a single campaign.
+
+        Returns:
+            adsets: list of adset dicts
+            ads: list of ad dicts with expanded creative fields
+        """
+        ...
