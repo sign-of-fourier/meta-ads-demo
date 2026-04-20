@@ -1,8 +1,33 @@
-# AdStac.kr — Meta Ads AI Optimisation Platform
+# AdStac.kr — AI-Powered Ad Experimentation for Performance Marketers
 
-AdStac.kr connects to the Meta Marketing API to ingest campaign and creative
-structure, then runs a suite of AI modules to generate, score, and select
-optimised ad combinations for testing.
+Welcome to **AdStac.kr** — an experimentation layer built for performance-focused media buyers.
+
+We take the best practices in A/B testing and automate them, freeing you up to focus on the
+important stuff: strategy, creative direction, and scale. Connect your Meta Ads account,
+and AdStac.kr handles the rest — ingesting your campaigns, generating image and copy variants,
+scoring them with AI, and surfacing the next best combination to test via Bayesian Optimisation.
+No more spreadsheet-driven split tests. Just signal.
+
+---
+
+## Table of Contents
+
+### Getting Started
+- [Quick Start](QUICK_START.md) — fastest path to a running demo
+- [Dev Quickstart](DEV_QUICKSTART.md) — local dev setup from scratch
+- [Ngrok / EC2 Setup](NGROK_SETUP.md) — expose local backend to Meta's OAuth redirect
+
+### Reference
+- [Schemas](SCHEMAS.md) — full SQLite table definitions
+- [Tests](TEST.md) — test catalog, individual test descriptions, manual curl tests
+- [Staging Policy](STAGING_POLICY.md) — what is and isn't safe to run against live Meta accounts
+- [Claude Code Instructions](CLAUDE.md) — instructions for AI-assisted development in this repo
+
+### AI Module Docs
+- [Embeddings pipeline](backend/embeddings/README.md) — embed ingested ads (image + text)
+- [Image generation pipeline](backend/ad_generation/README.md) — generate FLUX image variants
+- [Text generation pipeline](backend/ad_text_generation/README.md) — generate copy variants via GPT-4o
+- [Combination embeddings](backend/ad_combination_embeddings/README.md) — embed all text slot combinations for BO
 
 ---
 
@@ -12,13 +37,13 @@ optimised ad combinations for testing.
 frontend/ (React + Vite, port 5173)
   └── calls ──▶ backend/ (FastAPI, port 8000)
                    ├── providers/          Meta API abstraction (live / masking / demo)
-                   └── AI module suite (standalone, not yet wired into HTTP routes)
-                         ├── embeddings/               Embed ingested ads (image + text)
-                         ├── ad_generation/            Generate image variants via FLUX
-                         ├── ad_text_generation/       Generate text variants via GPT-4o
+                   └── AI module suite (standalone, independently testable)
+                         ├── embeddings/                Embed ingested ads (image + text)
+                         ├── ad_generation/             Generate image variants via FLUX
+                         ├── ad_text_generation/        Generate text variants via GPT-4o
                          ├── ad_combination_embeddings/ Embed all text slot combinations
-                         ├── ad_embedding_combiner/    Fuse text + image vectors for GPR
-                         └── bo_pipeline/              GPR-based Bayesian Optimisation
+                         ├── ad_embedding_combiner/     Fuse text + image vectors for GPR
+                         └── bo_pipeline/               GPR-based Bayesian Optimisation
 ```
 
 All backend logic lives in `backend/main.py` (single-file FastAPI app). The database is
@@ -50,6 +75,8 @@ python -m embeddings.pipeline          # embed all un-embedded ads
 python -m embeddings.pipeline --ad-id <id>
 ```
 
+See [`backend/embeddings/README.md`](backend/embeddings/README.md) for full documentation.
+
 ### 2. Image generation pipeline (`backend/ad_generation/`)
 
 7-step async pipeline for a single seed image:
@@ -69,6 +96,8 @@ job_id = create_job(user_id, campaign_id, adset_id, seed_image_url, headline, sh
 await run_generation_job(job_id)
 ```
 
+See [`backend/ad_generation/README.md`](backend/ad_generation/README.md) for full documentation.
+
 ### 3. Text generation pipeline (`backend/ad_text_generation/`)
 
 Generates N new copy variants per text slot (headline, primary_text, description) from
@@ -79,6 +108,8 @@ component list and stores the result.
 from ad_text_generation.pipeline import run_text_pipeline
 generated_ad_id = await run_text_pipeline(seed_components, n_per_slot=5)
 ```
+
+See [`backend/ad_text_generation/README.md`](backend/ad_text_generation/README.md) for full documentation.
 
 ### 4. Combination embeddings (`backend/ad_combination_embeddings/`)
 
@@ -91,6 +122,8 @@ from ad_combination_embeddings import embed_all_combinations, combination_count
 n = combination_count(components)   # dry-run
 await embed_all_combinations(source_id="gen_ad_001", components=components)
 ```
+
+See [`backend/ad_combination_embeddings/README.md`](backend/ad_combination_embeddings/README.md) for full documentation.
 
 ### 5. Embedding combiner (`backend/ad_embedding_combiner/`)
 
@@ -290,7 +323,7 @@ For staging demos without spending real budget:
 | `MASK_PAUSE_RESUME=true` | pause/resume → no-op (returns success) |
 | `METRIC_PROFILE=healthy\|stable\|weak` | Controls synthetic metric magnitude |
 
-See `CLAUDE.md` for the full masking variable reference.
+See [`STAGING_POLICY.md`](STAGING_POLICY.md) for what is and isn't safe to run against live accounts, and `CLAUDE.md` for the full masking variable reference.
 
 ---
 
@@ -303,4 +336,4 @@ See `CLAUDE.md` for the full masking variable reference.
 - **Static ad images:** The clone flow passes image values as hosted URLs. Creatives stored only as image hashes (not URLs) will fail at Meta creative creation.
 
 For schema details see [`SCHEMAS.md`](SCHEMAS.md).
-For running on EC2/ngrok see [`NGROK_SETUP.md`](NGROK_SETUP.md) if present.
+For running on EC2/ngrok see [`NGROK_SETUP.md`](NGROK_SETUP.md).
