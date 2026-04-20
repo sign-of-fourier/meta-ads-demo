@@ -6,7 +6,144 @@ import {
   getCampaignHistory,
   getIngestPreview,
   runIngest,
+  ingestCampaignStructure,
+  getCampaignStructure,
+  getCampaignSuggestions,
+  confirmSuggestion,
 } from "../api.js";
+
+const SLOT_LABELS = {
+  headline: "Headline",
+  description: "Description",
+  primary_text: "Primary text",
+  image: "Image",
+};
+
+const DEPLOYMENT_LABELS = {
+  suggested: "Suggested",
+  pending_confirmation: "Pending",
+  created_static: "Created",
+  active_static: "Active",
+  replaced_static: "Replaced",
+  rejected: "Rejected",
+};
+
+function SuggestionsSection({ suggestions, onConfirm, confirmingId }) {
+  if (!suggestions || suggestions.length === 0) return null;
+
+  return (
+    <div className="suggestions-section">
+      <h4 className="suggestions-heading">Suggestions</h4>
+      {suggestions.map((s) => (
+        <div key={s.id} className="suggestion-item">
+          <div className="suggestion-header">
+            <span className="suggestion-label">From dynamic ad</span>
+            <code className="structure-ad-id">{s.source_ad_id}</code>
+            <span className={`deployment-badge status-${s.deployment_status}`}>
+              {DEPLOYMENT_LABELS[s.deployment_status] ?? s.deployment_status}
+            </span>
+          </div>
+          <dl className="slot-list">
+            {Object.entries(s.components).map(([slot, value]) => (
+              <div key={slot} className="slot-row">
+                <dt>{SLOT_LABELS[slot] ?? slot}</dt>
+                <dd>
+                  <span className="slot-value">{value || <em>—</em>}</span>
+                </dd>
+              </div>
+            ))}
+          </dl>
+          {s.deployment_status === "suggested" && (
+            <button
+              className="btn-success suggestion-confirm-btn"
+              onClick={() => onConfirm(s.id)}
+              disabled={confirmingId === s.id}
+            >
+              {confirmingId === s.id ? "Creating…" : "Confirm Create"}
+            </button>
+          )}
+          {s.static_ad_id && (
+            <p className="suggestion-static-id">
+              Static ad: <code>{s.static_ad_id}</code>
+            </p>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function StructurePanel({ data, onDismiss, onConfirmSuggestion, confirmingId }) {
+  if (data.error) {
+    return (
+      <div className="structure-panel">
+        <p className="error">{data.error}</p>
+        <button className="btn-secondary structure-dismiss" onClick={onDismiss}>
+          Dismiss
+        </button>
+      </div>
+    );
+  }
+
+  const { summary, ads, suggestions } = data;
+  return (
+    <div className="structure-panel">
+      <div className="structure-summary">
+        <span>
+          Ingested <strong>{summary.ads_processed}</strong> ad
+          {summary.ads_processed !== 1 ? "s" : ""},{" "}
+          <strong>{summary.components_saved}</strong> component
+          {summary.components_saved !== 1 ? "s" : ""}
+        </span>
+        <button className="btn-link structure-dismiss" onClick={onDismiss}>
+          ×
+        </button>
+      </div>
+
+      {ads.length === 0 ? (
+        <p className="history-empty">No creative components found for this campaign.</p>
+      ) : (
+        <div className="structure-ads">
+          {ads.map((ad) => (
+            <div key={ad.ad_id} className="structure-ad">
+              <div className="structure-ad-header">
+                <code className="structure-ad-id">{ad.ad_id}</code>
+                <span className={`creative-type-badge ${ad.creative_type}`}>
+                  {ad.creative_type}
+                </span>
+                {ad.lifecycle_status && (
+                  <span className={`lifecycle-badge ${ad.lifecycle_status}`}>
+                    {ad.lifecycle_status === "missing" ? "no longer in Meta" : ad.lifecycle_status}
+                  </span>
+                )}
+              </div>
+              <dl className="slot-list">
+                {Object.entries(ad.components).map(([slot, values]) => (
+                  <div key={slot} className="slot-row">
+                    <dt>{SLOT_LABELS[slot] ?? slot}</dt>
+                    <dd>
+                      {values.map((v, i) => (
+                        <span key={i} className="slot-value">
+                          {v ?? <em>—</em>}
+                        </span>
+                      ))}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <SuggestionsSection
+        suggestions={suggestions}
+        onConfirm={onConfirmSuggestion}
+        confirmingId={confirmingId}
+      />
+    </div>
+  );
+}
 
 export default function CampaignsPage() {
   const [campaigns, setCampaigns] = useState([]);
@@ -20,6 +157,12 @@ export default function CampaignsPage() {
   // Ingest state
   const [ingestPanel, setIngestPanel] = useState(null); // null | "loading" | { preview } | "ingesting" | { result }
   const [ingestError, setIngestError] = useState(null);
+
+  // Per-campaign structural ingest state
+  // structureById[campaignId] = null | "loading" | { summary, ads, suggestions } | { error }
+  const [structureById, setStructureById] = useState({});
+  // Which suggestion id is currently being confirmed (for loading state)
+  const [confirmingId, setConfirmingId] = useState(null);
 
   useEffect(() => {
     getCampaigns()
@@ -86,6 +229,44 @@ export default function CampaignsPage() {
     } catch (err) {
       setIngestError(err.message);
       setIngestPanel(null);
+    }
+  }
+
+  async function handleIngestStructure(campaignId) {
+    setStructureById((prev) => ({ ...prev, [campaignId]: "loading" }));
+    try {
+      const summary = await ingestCampaignStructure(campaignId);
+      const [ads, suggestions] = await Promise.all([
+        getCampaignStructure(campaignId),
+        getCampaignSuggestions(campaignId),
+      ]);
+      setStructureById((prev) => ({ ...prev, [campaignId]: { summary, ads, suggestions } }));
+    } catch (err) {
+      setStructureById((prev) => ({ ...prev, [campaignId]: { error: err.message } }));
+    }
+  }
+
+  async function handleConfirmSuggestion(campaignId, suggestionId) {
+    setConfirmingId(suggestionId);
+    try {
+      const updated = await confirmSuggestion(suggestionId, "create");
+      setStructureById((prev) => {
+        const current = prev[campaignId];
+        if (!current || current === "loading" || !current.suggestions) return prev;
+        return {
+          ...prev,
+          [campaignId]: {
+            ...current,
+            suggestions: current.suggestions.map((s) =>
+              s.id === suggestionId ? updated : s
+            ),
+          },
+        };
+      });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setConfirmingId(null);
     }
   }
 
@@ -272,7 +453,7 @@ export default function CampaignsPage() {
                   <td>{fmtInt(c.clicks_7d)}</td>
                   <td>{fmt(c.ctr_7d, "", "%")}</td>
                   <td>{fmt(c.cpm_7d, "$")}</td>
-                  <td>
+                  <td className="actions-cell">
                     {(c.status === "ACTIVE" || c.status === "PAUSED") && (
                       <button
                         onClick={() => handleToggle(c)}
@@ -288,8 +469,33 @@ export default function CampaignsPage() {
                             : "Resume"}
                       </button>
                     )}
+                    <button
+                      className="btn-creatives"
+                      onClick={() => handleIngestStructure(c.id)}
+                      disabled={structureById[c.id] === "loading"}
+                      title="Ingest and view creative structure"
+                    >
+                      {structureById[c.id] === "loading" ? "..." : "Creatives"}
+                    </button>
                   </td>
                 </tr>
+
+                {structureById[c.id] && structureById[c.id] !== "loading" && (
+                  <tr key={`${c.id}-structure`} className="history-row">
+                    <td colSpan={9}>
+                      <StructurePanel
+                        data={structureById[c.id]}
+                        onDismiss={() =>
+                          setStructureById((prev) => ({ ...prev, [c.id]: null }))
+                        }
+                        onConfirmSuggestion={(suggestionId) =>
+                          handleConfirmSuggestion(c.id, suggestionId)
+                        }
+                        confirmingId={confirmingId}
+                      />
+                    </td>
+                  </tr>
+                )}
 
                 {expandedId === c.id && (
                   <tr key={`${c.id}-history`} className="history-row">

@@ -12,6 +12,8 @@ Minimal SaaS control-plane that:
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -25,12 +27,18 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
 
 # ── Load .env ──────────────────────────────────────────────────────────────────
 load_dotenv()
+
+from providers.factory import get_meta_provider  # noqa: E402 – must follow load_dotenv
+from providers.mask_policy import MaskPolicy  # noqa: E402 – must follow load_dotenv
+meta_provider = get_meta_provider()
+APP_MODE = os.getenv("APP_MODE", "live").lower()
 
 META_APP_ID = os.environ["META_APP_ID"]
 META_APP_SECRET = os.environ["META_APP_SECRET"]
@@ -44,6 +52,8 @@ JWT_EXPIRE_HOURS = 24
 META_GRAPH = f"https://graph.facebook.com/{META_API_VERSION}"
 
 DB_PATH = Path(__file__).parent / "app.db"
+
+logger = logging.getLogger(__name__)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -91,10 +101,80 @@ def init_db() -> None:
             ctr             REAL,
             cpm             REAL,
             cpc             REAL,
+            data_source     TEXT NOT NULL DEFAULT 'real',  -- 'real' | 'masked' | 'demo'
+            mask_profile    TEXT,                          -- 'healthy' | 'stable' | 'weak' | NULL
             created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS ad_creative_structures (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id         INTEGER NOT NULL REFERENCES users(id),
+            ad_account_id   TEXT NOT NULL,
+            campaign_id     TEXT NOT NULL,
+            adset_id        TEXT NOT NULL,
+            ad_id           TEXT NOT NULL,
+            creative_type   TEXT NOT NULL,  -- 'static' or 'dynamic'
+            slot            TEXT NOT NULL,  -- 'headline', 'description', 'primary_text', 'image'
+            slot_index      INTEGER NOT NULL DEFAULT 0,
+            value           TEXT,
+            ingested_at     TEXT NOT NULL DEFAULT (datetime('now')),
+            lifecycle_status TEXT NOT NULL DEFAULT 'active',  -- 'active' | 'inactive' | 'missing'
+            data_source     TEXT NOT NULL DEFAULT 'real',     -- 'real' | 'masked' | 'demo'
+            mask_profile    TEXT,                             -- 'healthy' | 'stable' | 'weak' | NULL
+            UNIQUE (user_id, ad_id, slot, slot_index)
+        );
+        CREATE TABLE IF NOT EXISTS suggested_configurations (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id           INTEGER NOT NULL REFERENCES users(id),
+            ad_account_id     TEXT NOT NULL,
+            campaign_id       TEXT NOT NULL,
+            adset_id          TEXT NOT NULL,
+            source_ad_id      TEXT NOT NULL,   -- the dynamic template ad_id
+            components        TEXT NOT NULL,   -- JSON: {slot: chosen_value, ...}
+            deployment_status TEXT NOT NULL DEFAULT 'suggested',
+            -- 'suggested' | 'pending_confirmation' | 'created_static' |
+            -- 'active_static' | 'replaced_static' | 'rejected'
+            static_ad_id      TEXT,            -- nullable; set after Meta deployment
+            created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
         );
         """
     )
+    # Migration: add lifecycle_status column to existing databases that predate this column
+    try:
+        conn.execute(
+            "ALTER TABLE ad_creative_structures ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'active'"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE ad_insights ADD COLUMN data_source TEXT NOT NULL DEFAULT 'real'"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE ad_insights ADD COLUMN mask_profile TEXT"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE ad_creative_structures ADD COLUMN data_source TEXT NOT NULL DEFAULT 'real'"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE ad_creative_structures ADD COLUMN mask_profile TEXT"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
     conn.commit()
     conn.close()
 
@@ -115,6 +195,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_GENERATED_IMAGES_DIR = Path(__file__).parent / "generated_images"
+_GENERATED_IMAGES_DIR.mkdir(exist_ok=True)
+app.mount("/images", StaticFiles(directory=str(_GENERATED_IMAGES_DIR)), name="generated_images")
 
 
 # ── JWT auth helpers ───────────────────────────────────────────────────────────
@@ -218,6 +302,61 @@ class IngestPreview(BaseModel):
 class IngestResult(BaseModel):
     campaigns_saved: int
     ad_account_id: str
+    campaigns_seen: int = 0
+    campaigns_with_metrics: int = 0
+    insights_errors: int = 0
+    message: str = ""
+
+
+class StructureIngestResult(BaseModel):
+    campaign_id: str
+    ads_processed: int
+    components_saved: int
+
+
+class AdStructure(BaseModel):
+    ad_id: str
+    adset_id: str
+    campaign_id: str
+    creative_type: str
+    lifecycle_status: str | None = None  # 'active' | 'inactive' | 'missing'
+    components: dict[str, list[str | None]]  # slot → values ordered by slot_index
+
+
+# ── Suggestion domain models ───────────────────────────────────────────────────
+
+DEPLOYMENT_STATUSES = frozenset({
+    "suggested",
+    "pending_confirmation",
+    "created_static",
+    "active_static",
+    "replaced_static",
+    "rejected",
+})
+
+
+class StoreSuggestionRequest(BaseModel):
+    source_ad_id: str           # the dynamic template ad_id
+    campaign_id: str
+    adset_id: str
+    components: dict[str, str]  # slot → single chosen value
+
+
+class ConfirmSuggestionRequest(BaseModel):
+    action: str                         # "create" | "replace"
+    target_static_ad_id: str | None = None  # for "replace": which existing ad to target
+    static_ad_id: str | None = None    # optionally pre-link the new Meta ad id
+
+
+class SuggestionResponse(BaseModel):
+    id: int
+    source_ad_id: str
+    campaign_id: str
+    adset_id: str
+    components: dict[str, str]
+    deployment_status: str
+    static_ad_id: str | None = None
+    created_at: str
 
 
 # ── Auth routes (local) ───────────────────────────────────────────────────────
@@ -375,6 +514,8 @@ async def meta_callback(
 # ── Helper: load user's Meta creds ────────────────────────────────────────────
 def _meta_creds(user_id: int) -> tuple[str, str]:
     """Return (access_token, ad_account_id) or raise 400."""
+    if APP_MODE == "demo":
+        return "demo-token", "demo-account"
     db = get_db()
     row = db.execute(
         "SELECT access_token, ad_account_id FROM meta_connections WHERE user_id = ?",
@@ -386,13 +527,38 @@ def _meta_creds(user_id: int) -> tuple[str, str]:
     return row["access_token"], row["ad_account_id"]
 
 
+def _current_data_provenance() -> tuple[str, str | None]:
+    """
+    Returns (data_source, mask_profile)
+
+    data_source:
+      - 'demo'   when APP_MODE=demo
+      - 'masked' when live mode uses masking
+      - 'real'   otherwise
+    """
+    if APP_MODE == "demo":
+        return "demo", None
+
+    policy = MaskPolicy()
+    if policy.enabled and (
+        policy.mask_status
+        or policy.mask_budgets
+        or policy.mask_metrics
+        or policy.mask_pause_resume
+        or policy.mask_ad_statuses
+    ):
+        return "masked", policy.metric_profile
+
+    return "real", None
+
+
 # ── Campaign routes ────────────────────────────────────────────────────────────
 @app.get("/api/campaigns", response_model=list[Campaign])
 async def list_campaigns(user_id: int = Depends(get_current_user_id)):
     access_token, ad_account_id = _meta_creds(user_id)
 
     async with httpx.AsyncClient(timeout=30) as client:
-        campaigns_raw, metrics_by_campaign = await _fetch_campaigns_and_insights(
+        campaigns_raw, metrics_by_campaign, _ = await _fetch_campaigns_and_insights(
             client, access_token, ad_account_id
         )
 
@@ -416,71 +582,14 @@ async def list_campaigns(user_id: int = Depends(get_current_user_id)):
 
 async def _fetch_campaigns_and_insights(
     client: httpx.AsyncClient, access_token: str, ad_account_id: str
-) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Shared helper: fetch campaigns + 7d insights from Meta. Returns (campaigns_raw, metrics_by_campaign)."""
-    camp_resp = await client.get(
-        f"{META_GRAPH}/{ad_account_id}/campaigns",
-        params={
-            "access_token": access_token,
-            "fields": "id,name,status,daily_budget",
-            "limit": 100,
-        },
-    )
-    if camp_resp.status_code != 200:
-        raise HTTPException(502, f"Meta API error: {camp_resp.text}")
-    campaigns_raw = camp_resp.json().get("data", [])
-
-    metrics_by_campaign: dict[str, dict[str, Any]] = {}
-    try:
-        insights_resp = await client.get(
-            f"{META_GRAPH}/{ad_account_id}/insights",
-            params={
-                "access_token": access_token,
-                "level": "campaign",
-                "date_preset": "last_7d",
-                "fields": "campaign_id,impressions,clicks,spend,ctr,cpm,cpc",
-                "limit": 5000,
-            },
-        )
-        if insights_resp.status_code == 200:
-            for row in insights_resp.json().get("data", []):
-                cid = row.get("campaign_id")
-                if not cid:
-                    continue
-                m = metrics_by_campaign.setdefault(
-                    cid, {"impressions": 0, "clicks": 0, "spend": 0.0}
-                )
-                m["impressions"] += int(row.get("impressions", 0))
-                m["clicks"] += int(row.get("clicks", 0))
-                m["spend"] += float(row.get("spend", 0.0))
-    except Exception:
-        pass
-
-    for m in metrics_by_campaign.values():
-        imp = m["impressions"] or 0
-        clk = m["clicks"] or 0
-        spend = m["spend"] or 0.0
-        m["ctr"] = (clk / imp * 100.0) if imp > 0 else None
-        m["cpm"] = (spend / imp * 1000.0) if imp > 0 else None
-        m["cpc"] = (spend / clk) if clk > 0 else None
-
-    return campaigns_raw, metrics_by_campaign
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], int]:
+    return await meta_provider.fetch_campaigns_and_insights(client, access_token, ad_account_id)
 
 
 async def _fetch_ads(
     client: httpx.AsyncClient, access_token: str, ad_account_id: str
 ) -> list[dict[str, Any]]:
-    resp = await client.get(
-        f"{META_GRAPH}/{ad_account_id}/ads",
-        params={
-            "access_token": access_token,
-            "fields": "id,name,status,campaign_id,adset_id,creative{body,image_url,thumbnail_url}",
-            "limit": 200,
-        },
-    )
-    if resp.status_code != 200:
-        raise HTTPException(502, f"Failed to fetch ads: {resp.text}")
-    return resp.json().get("data", [])
+    return await meta_provider.fetch_ads(client, access_token, ad_account_id)
 
 
 @app.get("/api/ingest/preview", response_model=IngestPreview)
@@ -489,7 +598,7 @@ async def ingest_preview(user_id: int = Depends(get_current_user_id)):
     access_token, ad_account_id = _meta_creds(user_id)
 
     async with httpx.AsyncClient(timeout=30) as client:
-        campaigns_raw, metrics_by_campaign = await _fetch_campaigns_and_insights(
+        campaigns_raw, metrics_by_campaign, _ = await _fetch_campaigns_and_insights(
             client, access_token, ad_account_id
         )
         ads_raw = await _fetch_ads(client, access_token, ad_account_id)
@@ -542,9 +651,13 @@ async def run_ingest(user_id: int = Depends(get_current_user_id)):
     access_token, ad_account_id = _meta_creds(user_id)
 
     async with httpx.AsyncClient(timeout=30) as client:
-        campaigns_raw, metrics_by_campaign = await _fetch_campaigns_and_insights(
+        campaigns_raw, metrics_by_campaign, insights_errors = await _fetch_campaigns_and_insights(
             client, access_token, ad_account_id
         )
+
+    data_source, mask_profile = _current_data_provenance()
+    campaigns_seen = len(campaigns_raw)
+    campaigns_with_metrics = len(metrics_by_campaign)
 
     db = get_db()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -553,25 +666,328 @@ async def run_ingest(user_id: int = Depends(get_current_user_id)):
     for c in campaigns_raw:
         cid = c["id"]
         mm = metrics_by_campaign.get(cid, {})
-        if mm:
-            db.execute(
-                """
-                INSERT INTO ad_insights
-                    (user_id, ad_account_id, level, object_id, date,
-                     impressions, clicks, spend, ctr, cpm, cpc)
-                VALUES (?, ?, 'campaign', ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id, ad_account_id, cid, today,
-                    mm.get("impressions"), mm.get("clicks"), mm.get("spend"),
-                    mm.get("ctr"), mm.get("cpm"), mm.get("cpc"),
-                ),
-            )
-            saved += 1
+        db.execute(
+            """
+            INSERT INTO ad_insights
+                (user_id, ad_account_id, level, object_id, date,
+                 impressions, clicks, spend, ctr, cpm, cpc,
+                 data_source, mask_profile)
+            VALUES (?, ?, 'campaign', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id, ad_account_id, cid, today,
+                mm.get("impressions"), mm.get("clicks"), mm.get("spend"),
+                mm.get("ctr"), mm.get("cpm"), mm.get("cpc"),
+                data_source, mask_profile,
+            ),
+        )
+        saved += 1
 
     db.commit()
     db.close()
-    return IngestResult(campaigns_saved=saved, ad_account_id=ad_account_id)
+
+    if insights_errors:
+        message = (
+            f"Insights fetch failed for {insights_errors} request(s); "
+            f"{saved} of {campaigns_seen} campaign snapshots saved."
+        )
+        logger.warning(
+            "Ingest completed with insights errors: account=%s seen=%d with_metrics=%d "
+            "saved=%d insights_errors=%d",
+            ad_account_id, campaigns_seen, campaigns_with_metrics, saved, insights_errors,
+        )
+    elif saved == 0:
+        message = (
+            f"No campaign metrics found in the last 7 days "
+            f"({campaigns_seen} campaigns seen, none had delivery data)."
+        )
+        logger.info(
+            "Ingest completed, no metrics data: account=%s seen=%d",
+            ad_account_id, campaigns_seen,
+        )
+    else:
+        message = (
+            f"Ingested {saved} campaign snapshot(s) for account {ad_account_id}."
+        )
+        logger.info(
+            "Ingest completed: account=%s seen=%d with_metrics=%d saved=%d",
+            ad_account_id, campaigns_seen, campaigns_with_metrics, saved,
+        )
+
+    return IngestResult(
+        campaigns_saved=saved,
+        ad_account_id=ad_account_id,
+        campaigns_seen=campaigns_seen,
+        campaigns_with_metrics=campaigns_with_metrics,
+        insights_errors=insights_errors,
+        message=message,
+    )
+
+
+# ── Structural ingest ─────────────────────────────────────────────────────────
+
+_SUPPORTED_SLOTS = ("headline", "description", "primary_text", "image")
+
+
+def _normalize_creative(ad: dict) -> tuple[str, list[dict]]:
+    """
+    Derive creative_type and component list from a raw Meta ad dict.
+
+    Returns (creative_type, components) where each component is:
+        {"slot": str, "slot_index": int, "value": str | None}
+
+    Dynamic detection: presence of "asset_feed_spec" in the creative.
+    Supported slots: headline, description, primary_text, image.
+    """
+    creative = ad.get("creative") or {}
+    asset_feed = creative.get("asset_feed_spec")
+
+    if asset_feed:
+        creative_type = "dynamic"
+        components: list[dict] = []
+
+        for i, item in enumerate(asset_feed.get("titles", [])):
+            components.append({"slot": "headline", "slot_index": i, "value": item.get("text")})
+
+        for i, item in enumerate(asset_feed.get("descriptions", [])):
+            components.append({"slot": "description", "slot_index": i, "value": item.get("text")})
+
+        for i, item in enumerate(asset_feed.get("bodies", [])):
+            components.append({"slot": "primary_text", "slot_index": i, "value": item.get("text")})
+
+        for i, item in enumerate(asset_feed.get("images", [])):
+            value = item.get("url") or item.get("hash")
+            components.append({"slot": "image", "slot_index": i, "value": value})
+
+        # If all image values are hashes (no URLs), use thumbnail_url as a real URL fallback
+        has_url_image = any(
+            c["slot"] == "image" and c["value"] and c["value"].startswith("http")
+            for c in components
+        )
+        if not has_url_image:
+            thumbnail = creative.get("thumbnail_url") or creative.get("image_url")
+            if thumbnail:
+                components.append({"slot": "image", "slot_index": 9999, "value": thumbnail})
+
+        return creative_type, components
+
+    # Static: pull from top-level creative fields or object_story_spec
+    creative_type = "static"
+    components = []
+
+    link_data = (creative.get("object_story_spec") or {}).get("link_data") or {}
+
+    headline = creative.get("title") or link_data.get("name")
+    if headline:
+        components.append({"slot": "headline", "slot_index": 0, "value": headline})
+
+    description = link_data.get("description")
+    if description:
+        components.append({"slot": "description", "slot_index": 0, "value": description})
+
+    primary_text = creative.get("body") or link_data.get("message")
+    if primary_text:
+        components.append({"slot": "primary_text", "slot_index": 0, "value": primary_text})
+
+    image = creative.get("image_url") or creative.get("thumbnail_url")
+    if image:
+        components.append({"slot": "image", "slot_index": 0, "value": image})
+
+    return creative_type, components
+
+
+async def _fetch_campaign_structure(
+    client: httpx.AsyncClient,
+    access_token: str,
+    ad_account_id: str,
+    campaign_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Fetch adsets and ads (with expanded creative fields) for a single campaign.
+    Returns (adsets, ads).
+    """
+    adsets_resp = await client.get(
+        f"{META_GRAPH}/{ad_account_id}/adsets",
+        params={
+            "access_token": access_token,
+            "fields": "id,name,status,campaign_id",
+            "effective_status": '["ACTIVE","PAUSED","ARCHIVED","WITH_ISSUES"]',
+            "filtering": f'[{{"field":"campaign.id","operator":"EQUAL","value":"{campaign_id}"}}]',
+            "limit": 500,
+        },
+    )
+    if adsets_resp.status_code != 200:
+        raise HTTPException(502, f"Failed to fetch adsets: {adsets_resp.text}")
+    adsets = adsets_resp.json().get("data", [])
+
+    ads_resp = await client.get(
+        f"{META_GRAPH}/{ad_account_id}/ads",
+        params={
+            "access_token": access_token,
+            "fields": (
+                "id,name,status,effective_status,campaign_id,adset_id,"
+                "creative{"
+                "id,name,body,title,image_url,thumbnail_url,"
+                "asset_feed_spec,object_story_spec"
+                "}"
+            ),
+            "effective_status": '["ACTIVE","PAUSED","ARCHIVED","WITH_ISSUES"]',
+            "filtering": f'[{{"field":"campaign.id","operator":"EQUAL","value":"{campaign_id}"}}]',
+            "limit": 500,
+        },
+    )
+    if ads_resp.status_code != 200:
+        raise HTTPException(502, f"Failed to fetch ads: {ads_resp.text}")
+    ads = ads_resp.json().get("data", [])
+
+    return adsets, ads
+
+
+@app.post("/api/ingest/structure/{campaign_id}", response_model=StructureIngestResult)
+async def ingest_campaign_structure(
+    campaign_id: str,
+    user_id: int = Depends(get_current_user_id),
+):
+    """
+    Fetch campaign → adset → ad → creative structure from Meta and persist to
+    ad_creative_structures. Idempotent: existing rows for the same (user_id, ad_id,
+    slot, slot_index) are replaced.
+    """
+    access_token, ad_account_id = _meta_creds(user_id)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        _adsets, ads = await meta_provider.fetch_campaign_structure(
+            client, access_token, ad_account_id, campaign_id
+        )
+
+    data_source, mask_profile = _current_data_provenance()
+    db = get_db()
+
+    # Collect ad_ids previously ingested for this campaign so we can detect missing ones
+    existing_ad_ids: set[str] = set(
+        row[0]
+        for row in db.execute(
+            "SELECT DISTINCT ad_id FROM ad_creative_structures WHERE user_id = ? AND campaign_id = ?",
+            (user_id, campaign_id),
+        ).fetchall()
+    )
+
+    ingested_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ads_processed = 0
+    components_saved = 0
+    current_ad_ids: set[str] = set()
+    ad_components_map: dict[str, list[dict]] = {}  # ad_id → components for embedding hook
+
+    for ad in ads:
+        ad_id = ad["id"]
+        current_ad_ids.add(ad_id)
+        adset_id = ad.get("adset_id", "")
+
+        # Lifecycle: prefer effective_status; fall back to status
+        raw_status = ad.get("effective_status") or ad.get("status", "")
+        lifecycle_status = "active" if raw_status == "ACTIVE" else "inactive"
+
+        creative_type, components = _normalize_creative(ad)
+        ad_components_map[ad_id] = components
+
+        for comp in components:
+            db.execute(
+                """
+                INSERT INTO ad_creative_structures
+                    (user_id, ad_account_id, campaign_id, adset_id, ad_id,
+                     creative_type, slot, slot_index, value, ingested_at,
+                     lifecycle_status, data_source, mask_profile)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (user_id, ad_id, slot, slot_index)
+                DO UPDATE SET
+                    creative_type    = excluded.creative_type,
+                    value            = excluded.value,
+                    ingested_at      = excluded.ingested_at,
+                    lifecycle_status = excluded.lifecycle_status,
+                    data_source      = excluded.data_source,
+                    mask_profile     = excluded.mask_profile
+                """,
+                (
+                    user_id, ad_account_id, campaign_id, adset_id, ad_id,
+                    creative_type, comp["slot"], comp["slot_index"],
+                    comp["value"], ingested_at, lifecycle_status,
+                    data_source, mask_profile,
+                ),
+            )
+            components_saved += 1
+
+        ads_processed += 1
+
+    # Mark previously ingested ads that are no longer in this fetch as "missing"
+    missing_ad_ids = existing_ad_ids - current_ad_ids
+    if missing_ad_ids:
+        placeholders = ",".join("?" * len(missing_ad_ids))
+        db.execute(
+            f"UPDATE ad_creative_structures SET lifecycle_status = 'missing' "
+            f"WHERE user_id = ? AND campaign_id = ? AND ad_id IN ({placeholders})",
+            (user_id, campaign_id, *missing_ad_ids),
+        )
+
+    db.commit()
+    db.close()
+
+    # ── Embedding hook (fire-and-forget) ──────────────────────────────────────
+    # embed_ad       → 1 seed embedding per ad (slot[0] text + image[0]) → ad_embeddings
+    # embed_all_combinations → N×M×K text combos per ad → ad_text_combination_embeddings
+    # source_id = ad_id links both tables back to the ad and its campaign.
+    # Failures are logged and swallowed; ingest result is already committed.
+    try:
+        import asyncio as _asyncio
+        from embeddings.pipeline import embed_ad, embed_images
+        from ad_combination_embeddings.pipeline import embed_all_combinations
+        for _ad_id, _comps in ad_components_map.items():
+            _asyncio.create_task(embed_ad(user_id, _ad_id, campaign_id, _comps))
+            _asyncio.create_task(embed_images(user_id, _ad_id, campaign_id, _comps))
+            _asyncio.create_task(embed_all_combinations(source_id=_ad_id, components=_comps))
+    except Exception:
+        logger.warning("embedding hook unavailable — skipping", exc_info=True)
+
+    return StructureIngestResult(
+        campaign_id=campaign_id,
+        ads_processed=ads_processed,
+        components_saved=components_saved,
+    )
+
+
+@app.get("/api/structure/{campaign_id}", response_model=list[AdStructure])
+def get_campaign_structure(
+    campaign_id: str,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Return persisted creative structures for a campaign, grouped by ad."""
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT ad_id, adset_id, creative_type, slot, slot_index, value, lifecycle_status
+        FROM ad_creative_structures
+        WHERE user_id = ? AND campaign_id = ?
+        ORDER BY ad_id, slot, slot_index
+        """,
+        (user_id, campaign_id),
+    ).fetchall()
+    db.close()
+
+    ads_map: dict[str, dict] = {}
+    for row in rows:
+        ad_id = row["ad_id"]
+        if ad_id not in ads_map:
+            ads_map[ad_id] = {
+                "ad_id": ad_id,
+                "adset_id": row["adset_id"],
+                "campaign_id": campaign_id,
+                "creative_type": row["creative_type"],
+                "lifecycle_status": row["lifecycle_status"],
+                "components": {},
+            }
+        slot = row["slot"]
+        ads_map[ad_id]["components"].setdefault(slot, []).append(row["value"])
+
+    return list(ads_map.values())
 
 
 # ── Ads / creatives (ingestion) ────────────────────────────────────────────────
@@ -731,16 +1147,8 @@ async def pause_campaign(
     campaign_id: str, user_id: int = Depends(get_current_user_id)
 ):
     access_token, _ = _meta_creds(user_id)
-
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{META_GRAPH}/{campaign_id}",
-            params={"access_token": access_token},
-            data={"status": "PAUSED"},
-        )
-        if resp.status_code != 200:
-            raise HTTPException(502, f"Failed to pause campaign: {resp.text}")
-
+        await meta_provider.pause_campaign(client, access_token, campaign_id)
     return CampaignActionResponse(id=campaign_id, status="PAUSED")
 
 
@@ -749,17 +1157,317 @@ async def resume_campaign(
     campaign_id: str, user_id: int = Depends(get_current_user_id)
 ):
     access_token, _ = _meta_creds(user_id)
-
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{META_GRAPH}/{campaign_id}",
-            params={"access_token": access_token},
-            data={"status": "ACTIVE"},
-        )
-        if resp.status_code != 200:
-            raise HTTPException(502, f"Failed to resume campaign: {resp.text}")
-
+        await meta_provider.resume_campaign(client, access_token, campaign_id)
     return CampaignActionResponse(id=campaign_id, status="ACTIVE")
+
+
+# ── Suggestion routes ─────────────────────────────────────────────────────────
+
+async def _clone_dynamic_to_static_ad(
+    client: httpx.AsyncClient,
+    access_token: str,
+    ad_account_id: str,
+    adset_id: str,
+    source_ad_id: str,
+    components: dict[str, str],
+    suggestion_id: int,
+) -> str:
+    """
+    Create a new static ad in Meta from a chosen set of component values.
+
+    Steps:
+      1. Fetch the source dynamic ad to inherit page_id and destination link URL.
+      2. Build an object_story_spec.link_data creative from the chosen components.
+      3. POST to /{ad_account_id}/adcreatives to create the creative.
+      4. POST to /{ad_account_id}/ads to create the ad in the target adset (PAUSED).
+
+    Returns the new Meta ad id.
+    Raises HTTPException(502) on any Meta API failure — never swallows errors.
+    """
+    # 1. Fetch source ad to get page_id and the destination link URL
+    src_resp = await client.get(
+        f"{META_GRAPH}/{source_ad_id}",
+        params={
+            "access_token": access_token,
+            "fields": "creative{page_id,object_story_spec}",
+        },
+    )
+    if src_resp.status_code != 200:
+        raise HTTPException(502, f"Failed to fetch source ad {source_ad_id}: {src_resp.text}")
+
+    src_creative = (src_resp.json().get("creative") or {})
+    oss = src_creative.get("object_story_spec") or {}
+    page_id = src_creative.get("page_id") or oss.get("page_id")
+    if not page_id:
+        raise HTTPException(502, "Could not determine page_id from source ad creative")
+
+    # Inherit the destination link URL from the source so the static ad is valid
+    src_link_data = oss.get("link_data") or {}
+    link_url = (
+        src_link_data.get("link")
+        or (src_link_data.get("call_to_action") or {}).get("value", {}).get("link")
+    )
+
+    # 2. Build static link_data from chosen components
+    link_data: dict[str, Any] = {}
+    if link_url:
+        link_data["link"] = link_url
+    if components.get("primary_text"):
+        link_data["message"] = components["primary_text"]
+    if components.get("headline"):
+        link_data["name"] = components["headline"]
+    if components.get("description"):
+        link_data["description"] = components["description"]
+    if components.get("image"):
+        link_data["picture"] = components["image"]
+
+    # 3. Create the ad creative
+    creative_resp = await client.post(
+        f"{META_GRAPH}/{ad_account_id}/adcreatives",
+        data={
+            "name": f"Static clone – suggestion {suggestion_id}",
+            "object_story_spec": json.dumps({"page_id": page_id, "link_data": link_data}),
+            "access_token": access_token,
+        },
+    )
+    if creative_resp.status_code != 200:
+        raise HTTPException(502, f"Meta creative creation failed: {creative_resp.text}")
+
+    new_creative_id = creative_resp.json().get("id")
+    if not new_creative_id:
+        raise HTTPException(502, "Meta did not return a creative id")
+
+    # 4. Create the static ad in the adset (starts PAUSED — user activates manually)
+    ad_resp = await client.post(
+        f"{META_GRAPH}/{ad_account_id}/ads",
+        data={
+            "name": f"Static ad – suggestion {suggestion_id}",
+            "adset_id": adset_id,
+            "creative": json.dumps({"creative_id": new_creative_id}),
+            "status": "PAUSED",
+            "access_token": access_token,
+        },
+    )
+    if ad_resp.status_code != 200:
+        raise HTTPException(502, f"Meta ad creation failed: {ad_resp.text}")
+
+    new_ad_id = ad_resp.json().get("id")
+    if not new_ad_id:
+        raise HTTPException(502, "Meta did not return an ad id")
+
+    return new_ad_id
+
+
+def _suggestion_from_row(row: sqlite3.Row) -> SuggestionResponse:
+    return SuggestionResponse(
+        id=row["id"],
+        source_ad_id=row["source_ad_id"],
+        campaign_id=row["campaign_id"],
+        adset_id=row["adset_id"],
+        components=json.loads(row["components"]),
+        deployment_status=row["deployment_status"],
+        static_ad_id=row["static_ad_id"],
+        created_at=row["created_at"],
+    )
+
+
+@app.get("/api/suggestions", response_model=list[SuggestionResponse])
+def list_suggestions(
+    campaign_id: str = Query(None),
+    user_id: int = Depends(get_current_user_id),
+):
+    """List stored suggestions for the current user, optionally filtered by campaign_id."""
+    db = get_db()
+    if campaign_id:
+        rows = db.execute(
+            """
+            SELECT * FROM suggested_configurations
+            WHERE user_id = ? AND campaign_id = ?
+            ORDER BY created_at DESC
+            """,
+            (user_id, campaign_id),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT * FROM suggested_configurations WHERE user_id = ? ORDER BY created_at DESC",
+            (user_id,),
+        ).fetchall()
+    db.close()
+    return [_suggestion_from_row(r) for r in rows]
+
+
+@app.post("/api/suggestions", response_model=SuggestionResponse, status_code=201)
+def store_suggestion(
+    body: StoreSuggestionRequest,
+    user_id: int = Depends(get_current_user_id),
+):
+    """
+    Store a suggested configuration for a dynamic ad (e.g. returned by an external
+    suggestion API). The suggestion starts in 'suggested' status and is linked to the
+    source dynamic template via source_ad_id.
+    """
+    _, ad_account_id = _meta_creds(user_id)
+    db = get_db()
+    cur = db.execute(
+        """
+        INSERT INTO suggested_configurations
+            (user_id, ad_account_id, campaign_id, adset_id, source_ad_id, components)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id, ad_account_id, body.campaign_id, body.adset_id,
+            body.source_ad_id, json.dumps(body.components),
+        ),
+    )
+    row_id = cur.lastrowid
+    db.commit()
+    row = db.execute(
+        "SELECT * FROM suggested_configurations WHERE id = ?", (row_id,)
+    ).fetchone()
+    db.close()
+    return _suggestion_from_row(row)
+
+
+@app.post(
+    "/api/suggestions/{suggestion_id}/confirm",
+    response_model=SuggestionResponse,
+)
+async def confirm_suggestion(
+    suggestion_id: int,
+    body: ConfirmSuggestionRequest,
+    user_id: int = Depends(get_current_user_id),
+):
+    """
+    Confirm a suggested configuration.
+
+    action="create":
+      - Calls _clone_dynamic_to_static_ad to create a new static ad in Meta.
+      - Persists the returned static_ad_id.
+      - Transitions deployment_status → "created_static".
+      - If Meta call fails, deployment_status is NOT changed.
+
+    action="replace":
+      - Validated but Meta deployment not yet implemented.
+      - Transitions deployment_status → "pending_confirmation".
+      - Optionally pre-links static_ad_id (for manual / test use).
+    """
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM suggested_configurations WHERE id = ? AND user_id = ?",
+        (suggestion_id, user_id),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Suggestion not found")
+    if row["deployment_status"] not in ("suggested", "pending_confirmation"):
+        raise HTTPException(
+            409,
+            f"Cannot confirm suggestion in status '{row['deployment_status']}'",
+        )
+    if body.action not in ("create", "replace"):
+        raise HTTPException(400, "action must be 'create' or 'replace'")
+
+    if body.action == "create":
+        access_token, ad_account_id = _meta_creds(user_id)
+        # Meta call happens outside the DB transaction — if it raises, we never
+        # reach the UPDATE so the stored status is preserved.
+        async with httpx.AsyncClient(timeout=30) as client:
+            new_ad_id = await _clone_dynamic_to_static_ad(
+                client=client,
+                access_token=access_token,
+                ad_account_id=ad_account_id,
+                adset_id=row["adset_id"],
+                source_ad_id=row["source_ad_id"],
+                components=json.loads(row["components"]),
+                suggestion_id=suggestion_id,
+            )
+        db.execute(
+            """
+            UPDATE suggested_configurations
+            SET deployment_status = 'created_static',
+                static_ad_id      = ?,
+                updated_at        = datetime('now')
+            WHERE id = ?
+            """,
+            (new_ad_id, suggestion_id),
+        )
+    else:
+        # action == "replace": hold at pending_confirmation until replacement
+        # semantics are implemented in a future phase.
+        db.execute(
+            """
+            UPDATE suggested_configurations
+            SET deployment_status = 'pending_confirmation',
+                static_ad_id      = COALESCE(?, static_ad_id),
+                updated_at        = datetime('now')
+            WHERE id = ?
+            """,
+            (body.static_ad_id, suggestion_id),
+        )
+
+    db.commit()
+    row = db.execute(
+        "SELECT * FROM suggested_configurations WHERE id = ?", (suggestion_id,)
+    ).fetchone()
+    db.close()
+    return _suggestion_from_row(row)
+
+
+# ── Bayesian Optimisation routes ──────────────────────────────────────────────
+
+class BOPick(BaseModel):
+    combination_key: str
+    combination: dict
+    selection_type: str
+    ei_score: float | None = None
+    gpr_mean: float | None = None
+    gpr_std: float | None = None
+
+
+class BORunRequest(BaseModel):
+    seed_ad_id: str
+    text_source_id: str  # usually same as seed_ad_id
+
+
+class BORunResponse(BaseModel):
+    seed_ad_id: str
+    text_source_id: str
+    picks: list[BOPick]
+    scored_count: int
+    candidate_count: int
+
+
+@app.post("/api/bo/run", response_model=BORunResponse)
+def run_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_current_user_id)):
+    """
+    Run Bayesian Optimisation for an ad and return up to 2 recommended combinations.
+    seed_ad_id and text_source_id are normally the same (both = the ingested ad_id).
+    """
+    from bo_pipeline.pipeline import run_bo
+    from bo_pipeline.selector import get_candidate_combinations, get_scored_combinations
+    from bo_pipeline.storage import DB_PATH as BO_DB_PATH, save_bo_run
+
+    scored = get_scored_combinations(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
+    candidates = get_candidate_combinations(body.text_source_id, body.seed_ad_id, user_id, db_path=BO_DB_PATH)
+    picks = run_bo(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
+
+    if picks:
+        save_bo_run(body.seed_ad_id, body.text_source_id, picks, BO_DB_PATH)
+
+    return BORunResponse(
+        seed_ad_id=body.seed_ad_id,
+        text_source_id=body.text_source_id,
+        picks=[BOPick(**p) for p in picks],
+        scored_count=len(scored),
+        candidate_count=len(candidates),
+    )
+
+
+@app.get("/api/bo/results/{ad_id}", response_model=list[BOPick])
+def get_bo_results(ad_id: str, user_id: int = Depends(get_current_user_id)):
+    """Return the most recent BO picks for an ad."""
+    from bo_pipeline.storage import DB_PATH as BO_DB_PATH, get_latest_bo_run
+    return [BOPick(**p) for p in get_latest_bo_run(ad_id, ad_id, BO_DB_PATH)]
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
