@@ -1,9 +1,11 @@
 """
-Seed synthetic scored observations for BO testing.
+Seed scored observations for BO by running real combinations through the
+fine-tuned scoring model (AZURE_SCORING_DEPLOYMENT).
 
-Reads real text combination embeddings from ad_text_combination_embeddings,
-picks N of them as "scored" variants, and inserts the necessary rows into
-ad_generation_jobs, ad_generation_variants, and ad_embeddings.
+Reads text combination embeddings from ad_text_combination_embeddings, scores
+each combination against the seed ad's first image URL using the fine-tune
+model, and inserts the necessary rows into ad_generation_jobs,
+ad_generation_variants, and ad_embeddings.
 
 Usage:
     python seed_bo.py --ad-id <ad_id> --user-id <user_id> [--n 5] [--campaign-id <id>]
@@ -16,18 +18,29 @@ Find your ad_id and user_id:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
 
 import numpy as np
 
+from ad_generation.scorer import score_variant
+
 DB_PATH = Path(__file__).parent / "app.db"
-EMBED_DIM = 1536  # synthetic image vector dimension (matches OpenAI text-embedding-3-small)
+
+
+def _get_image_url(conn: sqlite3.Connection, ad_id: str) -> str | None:
+    row = conn.execute(
+        """SELECT value FROM ad_creative_structures
+           WHERE ad_id = ? AND slot = 'image' AND value LIKE 'http%'
+           ORDER BY slot_index LIMIT 1""",
+        (ad_id,),
+    ).fetchone()
+    return row["value"] if row else None
 
 
 def seed(ad_id: str, user_id: int, campaign_id: str, n: int, db_path: Path) -> None:
-    rng = np.random.default_rng(seed=42)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -80,6 +93,14 @@ def seed(ad_id: str, user_id: int, campaign_id: str, n: int, db_path: Path) -> N
     """)
     conn.commit()
 
+    image_url = _get_image_url(conn, ad_id)
+    if not image_url:
+        print(f"No image URL found for ad_id={ad_id}. Run structure ingest first.")
+        conn.close()
+        return
+
+    print(f"Using image URL: {image_url}")
+
     # Load N text combinations for this ad
     rows = conn.execute(
         """SELECT combination_key, vector FROM ad_text_combination_embeddings
@@ -94,47 +115,52 @@ def seed(ad_id: str, user_id: int, campaign_id: str, n: int, db_path: Path) -> N
 
     print(f"Seeding {len(rows)} scored observations for ad_id={ad_id}, user_id={user_id}")
 
-    for i, row in enumerate(rows):
-        combo = json.loads(row["combination_key"])
-        headline = combo.get("headline", "")
-        short_text = combo.get("primary_text", "")
-        score = round(rng.uniform(2.0, 7.0), 2)  # synthetic score 2–7
+    async def _seed_all() -> None:
+        for i, row in enumerate(rows):
+            combo = json.loads(row["combination_key"])
+            headline = combo.get("headline", "")
+            short_text = combo.get("primary_text", "")
 
-        # Insert job
-        cur = conn.execute(
-            """INSERT INTO ad_generation_jobs
-               (user_id, campaign_id, adset_id, seed_ad_id, seed_image_url, headline, short_text, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'done')""",
-            (user_id, campaign_id, "synthetic_adset", ad_id, "https://synthetic/image.jpg", headline, short_text),
-        )
-        job_id = cur.lastrowid
+            result = await score_variant(image_url, headline, short_text)
+            # scorer returns 0–1 defect score (higher = worse); invert to a 0–10 quality score
+            score = round((1.0 - result.score) * 10.0, 2)
 
-        # Insert variant with score
-        cur2 = conn.execute(
-            """INSERT INTO ad_generation_variants
-               (job_id, suggestion, status, score)
-               VALUES (?, ?, 'scored', ?)""",
-            (job_id, json.dumps(combo), score),
-        )
-        variant_id = cur2.lastrowid
+            cur = conn.execute(
+                """INSERT INTO ad_generation_jobs
+                   (user_id, campaign_id, adset_id, seed_ad_id, seed_image_url, headline, short_text, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'done')""",
+                (user_id, campaign_id, "synthetic_adset", ad_id, image_url, headline, short_text),
+            )
+            job_id = cur.lastrowid
 
-        # Insert synthetic embedding with ad_id = gen_{job_id}_{variant_id}
-        emb_ad_id = f"gen_{job_id}_{variant_id}"
-        text_vec = np.frombuffer(row["vector"], dtype=np.float32)
-        image_vec = rng.random(EMBED_DIM).astype(np.float32)  # synthetic image embedding
-        combined = np.concatenate([text_vec[:128], image_vec[:128]])
+            cur2 = conn.execute(
+                """INSERT INTO ad_generation_variants
+                   (job_id, suggestion, status, score, severity, score_labels)
+                   VALUES (?, ?, 'scored', ?, ?, ?)""",
+                (job_id, json.dumps(combo), score, result.severity, json.dumps(result.labels)),
+            )
+            variant_id = cur2.lastrowid
 
-        conn.execute(
-            """INSERT OR REPLACE INTO ad_embeddings
-               (user_id, ad_id, campaign_id, text_vector, image_vector, combined_vector)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (user_id, emb_ad_id, campaign_id,
-             text_vec.tobytes(), image_vec.tobytes(), combined.tobytes()),
-        )
+            emb_ad_id = f"gen_{job_id}_{variant_id}"
+            text_vec = np.frombuffer(row["vector"], dtype=np.float32)
+            # Use zero image vector — real image embedding not available at seed time
+            image_vec = np.zeros(1536, dtype=np.float32)
+            combined = np.concatenate([text_vec[:128], image_vec[:128]])
 
-        print(f"  [{i+1}] job={job_id} variant={variant_id} score={score:.2f} headline='{headline[:40]}'")
+            conn.execute(
+                """INSERT OR REPLACE INTO ad_embeddings
+                   (user_id, ad_id, campaign_id, text_vector, image_vector, combined_vector, image_url)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, emb_ad_id, campaign_id,
+                 text_vec.tobytes(), image_vec.tobytes(), combined.tobytes(), image_url),
+            )
 
-    conn.commit()
+            print(f"  [{i+1}] job={job_id} variant={variant_id} score={score:.2f} "
+                  f"severity={result.severity} headline='{headline[:40]}'")
+
+        conn.commit()
+
+    asyncio.run(_seed_all())
     conn.close()
     print("Done. Run BO via POST /api/bo/run or python -m bo_pipeline.pipeline")
 

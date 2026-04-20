@@ -24,10 +24,11 @@ No more spreadsheet-driven split tests. Just signal.
 - [Claude Code Instructions](CLAUDE.md) — instructions for AI-assisted development in this repo
 
 ### AI Module Docs
-- [Embeddings pipeline](backend/embeddings/README.md) — embed ingested ads (image + text)
+- [Embeddings pipeline](backend/embeddings/README.md) — embed ingested ads (text + image, truncate, concatenate)
 - [Image generation pipeline](backend/ad_generation/README.md) — generate FLUX image variants
 - [Text generation pipeline](backend/ad_text_generation/README.md) — generate copy variants via GPT-4o
 - [Combination embeddings](backend/ad_combination_embeddings/README.md) — embed all text slot combinations for BO
+- [Bayesian Optimisation](backend/bo_pipeline/BO.md) — GPR kernel, length scale, EI acquisition, fantasy batch step
 
 ---
 
