@@ -11,6 +11,7 @@ SLOT_HINTS: dict[str, str] = {
     "headline":     "Headlines are short and attention-grabbing, typically under 40 characters.",
     "primary_text": "Primary text is the main body copy, typically 1–3 short sentences.",
     "description":  "Descriptions support the headline, typically under 30 characters.",
+    "cta":          "Call-to-action button text, typically 2–4 action words like 'Shop Now', 'Learn More', 'Get Started'. Match the intent of the ad.",
 }
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
+### Start everything (preferred)
+```bash
+./start.sh              # prod: backend :8000, frontend :5173, then ngrok on :5173
+./start.sh staging      # staging: backend :8001, frontend :5174, APP_ENV=staging, then ngrok on :5174
+```
+`start.sh` starts backend + frontend in the background, then runs ngrok in the foreground on the frontend port.
+
 ### Backend (FastAPI)
 ```bash
 cd backend
@@ -71,7 +78,7 @@ business logic live here. Key sections in reading order:
 
 | Section | What it does |
 |---|---|
-| `init_db()` | Creates all 6 SQLite tables; runs ALTER TABLE migrations for columns added after initial schema |
+| `init_db()` | Creates all SQLite tables (including `ad_generation_*`, `ad_text_combination_embeddings`, and `dynamic_generation_jobs` tables via helper calls); runs ALTER TABLE migrations for columns added after initial schema — including `tier TEXT NOT NULL DEFAULT 'free'` on `users`, and `seed_ad_id`, `adset_id`, `meta_ad_id` on `dynamic_generation_jobs` |
 | `get_current_user_id()` | FastAPI dependency; decodes Bearer JWT |
 | `_meta_creds(user_id)` | Loads `(access_token, ad_account_id)` from `meta_connections` for authenticated user |
 | `_fetch_campaigns_and_insights()` | Shared async helper for campaigns + 7d insights from Meta; returns `(campaigns_raw, metrics_by_campaign, insights_error_count)` — callers use `insights_error_count` to distinguish API failure from genuine zero delivery |
@@ -79,36 +86,54 @@ business logic live here. Key sections in reading order:
 | `_normalize_creative(ad)` | Pure function; detects dynamic (presence of `asset_feed_spec`) vs static; extracts slots |
 | `_clone_dynamic_to_static_ad()` | Creates a new static Meta ad from chosen components; used by confirm-create flow |
 | `_suggestion_from_row()` | Converts a DB row → `SuggestionResponse` Pydantic model |
+| `_download_ad_images(components)` | Downloads Meta CDN image URLs to `backend/ad_images/` synchronously during ingest (before expiry); returns components list with local URLs substituted. Required because Meta CDN URLs are signed and expire quickly — background tasks can't use them. |
+| `GET /me` | Returns current user's email and tier (`free`/`premium`) |
+| `_upload_image_to_meta()` | Resolves a locally-served image URL (`/images/...` or `/ad-images/...`) to a file on disk, uploads it to `/{ad_account_id}/adimages`, returns the image hash. Returns `None` on failure — push continues without image rather than aborting. |
+| `_clone_dynamic_to_static_ad()` | Creates a new static Meta ad from chosen component values. Accepts optional `image_hash`; uses `image_hash` in `link_data` when provided, falls back to `picture` URL otherwise. Fetches `object_story_spec` and `asset_feed_spec` from source ad to inherit `page_id` and destination link URL. |
+| `POST /api/push` | Finds all completed `dynamic_generation_jobs` for the user where `meta_ad_id IS NULL` and `seed_ad_id`/`adset_id` are set; uploads each ad's image to Meta, then calls `_clone_dynamic_to_static_ad` to create a PAUSED static ad; records `meta_ad_id` on success. Requires Meta app in Live mode — returns per-job errors gracefully if blocked. |
 
-Image serving: `main.py` mounts `StaticFiles` at `/images` → `backend/generated_images/`. This is how locally-saved generated images are made accessible to the scoring model and eventually to the frontend.
+Image serving: `main.py` mounts `StaticFiles` at `/images` → `backend/generated_images/` and at `/ad-images` → `backend/ad_images/`. The `/ad-images` mount serves downloaded copies of Meta CDN ad images used by the embedding pipeline.
 
 See `SCHEMAS.md` for full table definitions and `README.md` for the API route table.
 
 ## Embeddings (`backend/embeddings/`)
 
-Standalone async module. Called fire-and-forget from structural ingest; also runnable standalone. Not wired into any HTTP route. See **`backend/embeddings/README.md`** for full documentation, env vars, and test instructions.
+Standalone async module. Called fire-and-forget from structural ingest and from the dynamic ad generation background task. See **`AD.md`** for a full conceptual explanation of what embeddings are, why we use three separate tasks, and how they connect to BO. See **`backend/embeddings/README.md`** for env vars and standalone runner docs.
 
-Structural ingest fires **three** embedding tasks per ad (all fire-and-forget):
+Structural ingest and dynamic ad generation both fire **three** embedding tasks per ad (all fire-and-forget):
 1. `embed_ad(...)` — seed embedding: slot[0] text + image[0] → `ad_embeddings` (one row per ad)
 2. `embed_images(...)` — per-image embeddings for each URL image slot → `ad_image_embeddings` (one row per image)
-3. `embed_all_combinations(...)` — N×M×K text combinations → `ad_text_combination_embeddings`
+3. `embed_all_combinations(...)` — N×M×K text combinations → `ad_text_combination_embeddings`; slots always `('headline', 'primary_text', 'description')` — 4×4×4 = 64 rows for a generated dynamic ad
 
 `embed_all_combinations` skips already-embedded combinations (idempotent, no repeated API calls).
 Image slots stored as Meta hashes (not URLs) are resolved to CDN URLs via the Meta `adimages` API during `fetch_campaign_structure` before normalization.
+
+**Image download before embedding:** `_download_ad_images(components)` is called synchronously during ingest (before firing background tasks) to download Meta CDN image URLs to `backend/ad_images/`. The local URLs (`http://localhost:8000/ad-images/...`) are passed to `embed_ad` and `embed_images`. This prevents embedding failures due to expired signed CDN URLs. AI-generated images (at `/images/...`) are already local and don't need this step.
+
+**Smart skip for `embed_ad`:** Skips only if `text_snapshot` matches AND both `text_vector` AND `image_vector` are non-NULL. Any partial failure leaves a NULL column; next ingest retries both.
 
 Public entry points in `embeddings/pipeline.py`: `embed_ad(...)`, `embed_images(...)`.
 
 ## Ad generation pipeline (`backend/ad_generation/`)
 
-Fully async standalone module. 7-step pipeline: analyze → generate → poll → save → score → QA → correct. Not wired into any HTTP route yet. See **`backend/ad_generation/README.md`** for full documentation, env vars, and test instructions.
+Fully async standalone module. 7-step pipeline: analyze → generate → poll → save → score → QA → correct. Called directly from the dynamic ad generation background task (`_run_dynamic_generation`). See **`backend/ad_generation/README.md`** for full documentation, env vars, and test instructions.
 
 Public entry points from `ad_generation/pipeline.py`: `create_job()`, `run_generation_job()`, `get_job_status()`, `get_job_variants()`, `get_active_variants()`.
 
+**Image passing to Azure:** Scoring and QA use `_image_data_url(filename)` which reads the file from disk and sends it as a `data:image/png;base64,...` URL. This is required because Azure OpenAI cannot reach `localhost` URLs. Falls back to the serve URL if the file cannot be read. Image deduplication in variant selection uses `local_filename` to prevent the same cached deAPI result appearing multiple times.
+
+The dynamic gen task calls `create_job()` once, then `run_generation_job()` which generates ~10 image variants internally. After completion, the top-4 scored active variants are selected as the image pool for the new dynamic ad.
+
 ## Ad text generation pipeline (`backend/ad_text_generation/`)
 
-Standalone async module. Generates N new text variants per slot (headline, primary_text, description) from a seed ad's components, assembles them with optional image URLs into a dynamic ad component list, and stores the result. See **`backend/ad_text_generation/README.md`** for full documentation.
+Standalone async module. Generates N new text variants per slot from a seed ad's components. **Text slots: `headline`, `primary_text`, `description`, `cta`** (CTA added to `TEXT_SLOTS` in `generator.py`). See **`backend/ad_text_generation/README.md`** for full documentation.
 
 Public entry point: `run_text_pipeline(seed_components, n_per_slot, image_urls, ...) → generated_ad_id` in `ad_text_generation/pipeline.py`.
+
+**HTTP routes (wired):**
+- `POST /api/generate/text/{campaign_id}` — static mode: generates 10 text variants per slot from the first ingested ad; stores in `generated_ads`/`generated_ad_slots`; synchronous; no images; no embeddings
+- `POST /api/generate/dynamic/{campaign_id}` — dynamic mode: starts background job; returns `{job_id, status:'running'}`; generates 4 variants per slot + 4 AI images + fires all embeddings; stores in `ad_creative_structures`
+- `GET /api/generate/dynamic/status/{job_id}` — poll status; returns full slots + image_urls when `status='complete'`
 
 ## Ad text combination embeddings (`backend/ad_combination_embeddings/`)
 
@@ -131,7 +156,7 @@ Public entry points: `run_bo(seed_ad_id, text_source_id, user_id, db_path)` → 
 Key design: `selector.py` is the only file that knows the DB schema; `gpr.py` is pure numpy/sklearn; `pipeline.py` orchestrates. Falls back to random selection when fewer than 2 scored observations exist.
 
 Scored combinations: `ad_generation_variants` (score IS NOT NULL, status != defunct) joined via `ad_embeddings` using convention `ad_id = gen_{job_id}_{variant_id}`.
-Candidate combinations: all rows in `ad_text_combination_embeddings` for `text_source_id`, each paired with the seed ad's image embedding (None image_vec is allowed — combiner zero-pads that slot).
+Candidate combinations: **N_text × N_images cross-product** — all rows in `ad_text_combination_embeddings` for `text_source_id`, each paired with every row in `ad_image_embeddings` for the seed ad. Falls back to the seed ad's single `image_vector` from `ad_embeddings` if no per-image embeddings exist. Each pick's `combination` dict includes `image_url` (the local `/ad-images/...` URL) for display. With 64 text combos and 4 image embeddings → 256 candidates.
 
 **HTTP endpoints (wired):** `POST /api/bo/run` runs BO and saves picks; `GET /api/bo/results/{ad_id}` returns the latest picks.
 
@@ -144,18 +169,26 @@ python seed_bo.py --ad-id <ad_id> --user-id <user_id> --campaign-id <campaign_id
 
 | File | Role |
 |---|---|
-| `api.js` | Single fetch wrapper; JWT stored in `localStorage`; all API calls go through here |
-| `App.jsx` | Root layout with nav; React Router `<Outlet>` |
+| `api.js` | Single fetch wrapper; JWT stored in `localStorage`; all API calls go through here — includes `getMe()`, `runBO()`, `generateTextAds()`, `startDynamicGeneration()`, `getDynamicGenStatus()`, `getLocalAds()`, `deleteLocalAd(adId)` |
+| `App.jsx` | Root layout with nav; React Router `<Outlet>`; fetches `GET /me` on load and exposes user via `UserContext`; shows tier badge in nav |
+| `UserContext.js` | React context (`UserContext`) + `useUser()` hook; default tier `"free"` |
 | `pages/AuthPage.jsx` | Signup / login |
 | `pages/SettingsPage.jsx` | Meta OAuth connect flow; reads `?meta_connected=true` redirect param |
-| `pages/CampaignsPage.jsx` | Main working page — campaigns table, pause/resume, metric history, Creatives panel, Suggestions panel |
-| `pages/AdsPage.jsx` | Ad creatives listing |
+| `pages/CampaignsPage.jsx` | Main working page — campaigns table, pause/resume, metric history, structure panel, suggestions panel |
+| `pages/AdsPage.jsx` | Local ad library — reads `GET /api/ads/local`; card grid with source/status badges; click a card to open a detail modal showing image grid + all text slot variants; delete button with confirm dialog calls `DELETE /api/ads/local/{ad_id}` |
 | `pages/ExplorerPage.jsx` | Raw Meta API explorer (debug) |
 
-The Campaigns page drives three separate panels per campaign row, all toggled inline:
-- **History panel** — stored metric snapshots
+The Campaigns page drives panels per campaign row:
+- **Header controls** — "Sync" button: pushes unpushed generated ads (`POST /api/push`) then pulls latest campaigns (`POST /api/ingest`); shows last-synced timestamp (stored in `localStorage`); amber note if push is blocked by Meta dev-mode
+- **Ingest/Reingest button** — per-campaign; label is "Ingest" on first use, "Reingest" thereafter (tracked in `localStorage` as `ingestedIds`); both trigger `POST /api/ingest/structure/<id>`
+- **History panel** — stored metric snapshots; when campaign is ingested, shows three action buttons:
+  - **Get Recommendations** — triggers BO; shows picks with image preview
+  - **Static Text Ads** — triggers `POST /api/generate/text/{campaign_id}`; synchronous; shows generated text variants per slot (headline, primary_text, description, cta)
+  - **Dynamic Ad (AI Images)** — triggers `POST /api/generate/dynamic/{campaign_id}`; async; polls every 5s; shows 4-image grid + 4 text variants per slot when complete
 - **Structure panel** — ingested creative structure (slots + lifecycle badges)
 - **Suggestions panel** (inside structure panel) — pending/confirmed suggestions with Confirm Create button
+
+State keys in `CampaignsPage.jsx`: `boStateById`, `genStateById` (static), `dynJobById` (dynamic). Dynamic polling runs via `useEffect` watching `dynJobById` — clears interval when no jobs have `status='running'`.
 
 ## Product model
 
@@ -221,7 +254,7 @@ Used by: `ad_generation/` pipeline (analyze, score, QA, text gen steps)
 | Variable | Description |
 |---|---|
 | `DEAPI_API_KEY` | deAPI key for FLUX img2img image generation |
-| `IMAGES_SERVE_BASE_URL` | Base URL for serving generated images (default `http://localhost:8000/images`) |
+| `IMAGES_SERVE_BASE_URL` | Base URL for serving generated images (default `http://localhost:8000/images`). Must be a full URL with scheme — used by the ad generation pipeline for scoring/QA and by `_upload_image_to_meta` to resolve local file paths. |
 
 Used by: `ad_generation/` pipeline (generate + poll steps)
 
@@ -246,85 +279,9 @@ Synthetic metrics are **deterministic per campaign ID** — the same campaign al
 
 Routes that always hit Meta directly (not masked): `/auth/meta/callback`, `/api/explore`, structural ingest (`_fetch_campaign_structure`), and static ad creation (`_clone_dynamic_to_static_ad`).
 
-## Manual API testing (curl)
+## Manual API testing
 
-All routes require a JWT. Get one first:
-
-```bash
-curl -s -X POST http://localhost:8000/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email": "you@example.com", "password": "yourpassword"}'
-# → {"token": "eyJ..."}
-```
-
-Set it for reuse:
-```bash
-TOKEN=eyJ...
-```
-
-### Ingest campaign metrics
-```bash
-curl -s -X POST http://localhost:8000/api/ingest \
-  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
-# → {"campaigns_saved": 1, "ad_account_id": "act_...", "message": "Ingested 1 campaign snapshot(s)..."}
-# campaigns_saved=0 means campaign exists but had no delivery in last 7 days (NULL metrics saved, still OK)
-```
-
-### Ingest creative structure (triggers embeddings)
-```bash
-curl -s -X POST http://localhost:8000/api/ingest/structure/<campaign_id> \
-  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
-# → {"campaign_id": "...", "ads_processed": 1, "components_saved": 16}
-# Embedding jobs fire in background — check DB after a few seconds
-```
-
-### Verify embeddings
-```bash
-# Seed ad embedding (1 per ad)
-sqlite3 backend/app.db "SELECT ad_id, CASE WHEN image_vector IS NULL THEN 'no' ELSE 'yes' END AS has_image FROM ad_embeddings;"
-
-# Per-image embeddings (one per image slot)
-sqlite3 backend/app.db "SELECT ad_id, slot_index, CASE WHEN vector IS NULL THEN 'no' ELSE 'yes' END AS embedded FROM ad_image_embeddings;"
-
-# Text combination embeddings (N×M×K per ad)
-sqlite3 backend/app.db "SELECT source_id, COUNT(*) AS combinations FROM ad_text_combination_embeddings GROUP BY source_id;"
-# A 4×4×4 dynamic ad → 64 rows
-```
-
-### Seed synthetic BO training data (first time only)
-```bash
-# Find your ad_id and user_id first
-sqlite3 backend/app.db "SELECT DISTINCT ad_id FROM ad_creative_structures;"
-sqlite3 backend/app.db "SELECT id, email FROM users;"
-
-python seed_bo.py --ad-id <ad_id> --user-id <user_id> --campaign-id <campaign_id> --n 5
-# → Seeding 5 scored observations...
-# → [1] job=1 variant=1 score=5.87 headline='...'
-```
-
-### Run Bayesian Optimisation
-```bash
-curl -s -X POST http://localhost:8000/api/bo/run \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"seed_ad_id": "<ad_id>", "text_source_id": "<ad_id>"}' | python3 -m json.tool
-# → {
-#     "seed_ad_id": "...",
-#     "scored_count": 5,       ← training observations used
-#     "candidate_count": 64,   ← unscored combinations evaluated
-#     "picks": [
-#       {"selection_type": "ei",      "combination": {...}, "gpr_mean": 5.6, "ei_score": 0.109},
-#       {"selection_type": "fantasy", "combination": {...}, "gpr_mean": 5.6, "ei_score": 0.085}
-#     ]
-#   }
-# With <2 scored observations → falls back to random selection_type
-```
-
-### Get latest BO results
-```bash
-curl -s http://localhost:8000/api/bo/results/<ad_id> \
-  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
-```
+See `DEV_QUICKSTART.md` for full curl examples covering auth, ingest, embeddings verification, BO seeding, and BO runs.
 
 ## Provider layer (`backend/providers/`)
 
@@ -356,9 +313,11 @@ curl -s http://localhost:8000/api/bo/results/<ad_id> \
 - Token refresh for Meta access tokens
 - Login-time reconciliation of ingested structure against live Meta state
 - Sync classification (new / updated / unchanged) on structural ingest
-- HTTP routes to trigger / inspect `ad_generation` jobs — module exists but is not yet wired into `main.py`
-- HTTP routes to trigger `ad_text_generation` — standalone, not wired into `main.py`
-- Frontend visibility into generated images, text variants, or BO recommendations
-- Wiring `bo_pipeline` output into the Suggestions panel UI (BO runs via API, not surfaced in UI yet)
+- Push to Meta is implemented (`POST /api/push`) but requires the Meta app to be in **Live mode** (not Development); until then, generated ads show a "ready to push" amber note after Sync
 - Auto-activation of new static ads (always created PAUSED, user activates manually in Meta)
-- Per-image BO: currently all text combinations are paired with the seed ad's single image vector; pairing each text combo with each of the 4 image embeddings (4×64=256 candidates) is not yet implemented
+- User tier enforcement beyond UI display — no backend guard on premium-only routes yet
+
+## Known technical notes
+
+- `combined_vector` stored in `ad_embeddings` is the **raw concatenation** of text (1536-dim) + image (1536-dim) = 3072-dim float32 blob. The BO pipeline's `_build_X()` truncates via `ad_embedding_combiner` to 256-dim at inference time. The stored blob is not used directly by the BO; it is informational only.
+- The `embed_ad` fallback path uses image_vector slot from `ad_embeddings` (the seed ad's combined_vector image slot), not from `ad_image_embeddings`. Per-image BO uses `ad_image_embeddings` directly in `selector.get_candidate_combinations`.

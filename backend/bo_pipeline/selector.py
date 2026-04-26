@@ -191,27 +191,45 @@ def get_candidate_combinations(
     db_path: Path = DB_PATH,
 ) -> list[dict]:
     """
-    Return all text combinations for text_source_id paired with the seed ad's
-    image_vector.  Combinations whose combination_key is in exclude_keys are
-    omitted (they are already scored).
+    Return all (text combination × image) candidates for the seed ad.
+
+    Each text combination from ad_text_combination_embeddings is paired with
+    every image embedding in ad_image_embeddings for the seed ad, producing
+    N×M candidates. Falls back to the single image_vector in ad_embeddings if
+    no per-image embeddings exist.
 
     Each dict:
-      combination_key  — str
-      combination      — dict
+      combination_key  — str  (compound JSON of text combo + image_slot)
+      combination      — dict (text fields + image_url for display)
       text_vector      — np.ndarray float32
-      image_vector     — np.ndarray float32  (seed ad's image embedding)
+      image_vector     — np.ndarray float32
     """
     c = _conn(db_path)
 
-    # Seed ad image vector (None = no image embedding yet; combiner uses zeros)
-    seed_row = c.execute(
-        "SELECT image_vector FROM ad_embeddings WHERE ad_id = ? AND user_id = ?",
-        (seed_ad_id, user_id),
-    ).fetchone()
-    seed_image_vec = _vec(seed_row["image_vector"]) if seed_row else None
+    # Per-image embeddings for seed ad (one row per image slot)
+    image_rows = c.execute(
+        """SELECT slot_index, image_ref, vector
+           FROM ad_image_embeddings
+           WHERE user_id = ? AND ad_id = ?
+           ORDER BY slot_index""",
+        (user_id, seed_ad_id),
+    ).fetchall()
+
+    if image_rows:
+        image_slots = [
+            {"slot_index": r["slot_index"], "image_ref": r["image_ref"], "image_vec": _vec(r["vector"])}
+            for r in image_rows
+        ]
+    else:
+        # Fall back to single image_vector from ad_embeddings
+        seed_row = c.execute(
+            "SELECT image_vector FROM ad_embeddings WHERE ad_id = ? AND user_id = ?",
+            (seed_ad_id, user_id),
+        ).fetchone()
+        image_slots = [{"slot_index": 0, "image_ref": None, "image_vec": _vec(seed_row["image_vector"]) if seed_row else None}]
 
     # All text combinations for this source
-    rows = c.execute(
+    text_rows = c.execute(
         """SELECT combination_key, vector
            FROM ad_text_combination_embeddings
            WHERE source_id = ?
@@ -221,17 +239,26 @@ def get_candidate_combinations(
     c.close()
 
     results = []
-    for row in rows:
-        key = row["combination_key"]
-        if exclude_keys and key in exclude_keys:
-            continue
-        text_vec = _vec(row["vector"])
+    for text_row in text_rows:
+        text_vec = _vec(text_row["vector"])
         if text_vec is None:
             continue
-        results.append({
-            "combination_key": key,
-            "combination": json.loads(key),
-            "text_vector": text_vec,
-            "image_vector": seed_image_vec,
-        })
+        text_combo = json.loads(text_row["combination_key"])
+
+        for img in image_slots:
+            compound_key = json.dumps(
+                {"combo": text_combo, "image_slot": img["slot_index"]},
+                sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            )
+            if exclude_keys and compound_key in exclude_keys:
+                continue
+            combination = {**text_combo}
+            if img["image_ref"]:
+                combination["image_url"] = img["image_ref"]
+            results.append({
+                "combination_key": compound_key,
+                "combination": combination,
+                "text_vector": text_vec,
+                "image_vector": img["image_vec"],
+            })
     return results

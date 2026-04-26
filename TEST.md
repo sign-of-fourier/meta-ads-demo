@@ -122,12 +122,42 @@ curl -s "$API/api/campaigns" -H "Authorization: Bearer $TOKEN" | jq > /tmp/c2.js
 diff /tmp/c1.json /tmp/c2.json   # should be empty
 ```
 
-### Ingest
+### Sync campaigns (ingest metric snapshots)
 
 ```bash
-curl -s "$API/api/ingest/preview" -H "Authorization: Bearer $TOKEN" | jq
 curl -s -X POST "$API/api/ingest" -H "Authorization: Bearer $TOKEN" | jq
 ```
+
+### Ingest creative structure for a campaign
+
+```bash
+export CAMPAIGN_ID="<id from /api/campaigns>"
+curl -s -X POST "$API/api/ingest/structure/$CAMPAIGN_ID" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+### Verify embeddings after structural ingest
+
+After clicking "Ingest" on a campaign (or calling the endpoint above), the embedding
+tasks run in the background. Wait a few seconds, then confirm:
+
+```bash
+# Seed embedding per ad — has_text and has_image should both be 'yes' when keys are set
+sqlite3 backend/app.db "SELECT ad_id, text_snapshot, CASE WHEN text_vector IS NULL THEN 'no' ELSE 'yes' END as has_text, CASE WHEN image_vector IS NULL THEN 'no' ELSE 'yes' END as has_image FROM ad_embeddings;"
+
+# Check combined vector dimension (expect 256: TEXT_DIM=128 + IMAGE_DIM=128)
+sqlite3 backend/app.db "SELECT ad_id, LENGTH(combined_vector) / 8 as combined_dim FROM ad_embeddings;"
+
+# Per-image-slot embeddings
+sqlite3 backend/app.db "SELECT ad_id, slot_index, image_ref, CASE WHEN vector IS NULL THEN 'no' ELSE 'yes' END as embedded FROM ad_image_embeddings;"
+
+# Text combination embeddings — a 4×4×4 dynamic ad produces 64 rows
+sqlite3 backend/app.db "SELECT source_id, COUNT(*) as combinations FROM ad_text_combination_embeddings GROUP BY source_id;"
+```
+
+If `has_image` is `no` or `ad_image_embeddings` is empty, `AZURE_INFERENCE_KEY` is
+likely missing or wrong. If `has_text` is `no`, check `OPENAI_KEY`. Once keys are
+fixed, hit "Reingest" — the backend skips already-complete embeddings and only
+re-runs what failed.
 
 ### Pause / Resume
 

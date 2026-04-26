@@ -50,16 +50,16 @@ export default function SettingsPage() {
         {error && <p className="error">{error}</p>}
 
         {status?.connected ? (
-          <p className="connected-status">
-            Connected to ad account{" "}
-            <code>{status.ad_account_id}</code>
-          </p>
+          <div className="connected-row">
+            <p className="connected-status">
+              Connected to ad account <code>{status.ad_account_id}</code>
+            </p>
+            <button onClick={handleConnect} disabled={connecting} className="btn-secondary">
+              {connecting ? "Redirecting..." : "Reconnect"}
+            </button>
+          </div>
         ) : (
-          <button
-            onClick={handleConnect}
-            disabled={connecting}
-            className="btn-primary"
-          >
+          <button onClick={handleConnect} disabled={connecting} className="btn-primary">
             {connecting ? "Redirecting..." : "Connect Meta Ads Account"}
           </button>
         )}
