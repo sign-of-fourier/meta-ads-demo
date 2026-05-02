@@ -10,6 +10,7 @@ import AdsPage from "./pages/AdsPage.jsx";
 import ExplorerPage from "./pages/ExplorerPage.jsx";
 import LandingPage from "./pages/landingPage.jsx";
 import DashboardMock from "./pages/DashboardMock.jsx";
+import DocsPage from "./pages/DocsPage.jsx";
 import { isLoggedIn } from "./api.js";
 
 function ProtectedRoute({ children }) {
@@ -21,6 +22,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(
     <BrowserRouter>
       <Routes>
         <Route path="/" element={<LandingPage />} />
+        <Route path="/docs" element={<DocsPage />} />
         <Route path="/dashboard" element={<DashboardMock />} />
         <Route path="/app" element={<App />}>
           <Route index element={<Navigate to="/app/settings" replace />} />
