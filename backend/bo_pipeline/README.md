@@ -136,11 +136,30 @@ been scored.
 
 ---
 
+## Candidate pool
+
+The candidate pool is a **cross-product of text combinations × image embeddings**:
+
+- Text dimension: all rows in `ad_text_combination_embeddings` for `text_source_id` (N combinations)
+- Image dimension: all rows in `ad_image_embeddings` for the seed ad (M image slots)
+- Total candidates: N × M (e.g., 64 text combos × 4 images = 256)
+
+Falls back to the seed ad's single `image_vector` from `ad_embeddings` if no per-image embeddings exist (e.g., embed step not yet run or ad has no URL image slots).
+
+Each candidate's `combination` dict includes `image_url` (the local `/ad-images/...` URL) when a per-image embedding is present, allowing the frontend to display the recommended image alongside text slots.
+
+Compound key format:
+```json
+{"combo": {"headline": "...", "primary_text": "..."}, "image_slot": 0}
+```
+
+---
+
 ## Files
 
 | File | Role |
 |---|---|
 | `gpr.py` | Pure numpy/sklearn — `fit_gpr`, `predict_with_std`, `expected_improvement`, `fantasize` |
-| `selector.py` | DB access only — loads scored variants and candidate combinations as numpy arrays |
+| `selector.py` | DB access only — loads scored variants and candidate combinations as numpy arrays; cross-products text × image embeddings |
 | `pipeline.py` | Orchestration — calls selector → gpr → returns picks |
 | `storage.py` | Persistence — `save_bo_run`, `get_latest_bo_run` |

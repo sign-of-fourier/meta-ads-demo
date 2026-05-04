@@ -28,7 +28,7 @@ No more spreadsheet-driven split tests. Just signal.
 - [Image generation pipeline](backend/ad_generation/README.md) — generate FLUX image variants
 - [Text generation pipeline](backend/ad_text_generation/README.md) — generate copy variants via GPT-4o
 - [Combination embeddings](backend/ad_combination_embeddings/README.md) — embed all text slot combinations for BO
-- [Bayesian Optimisation](backend/bo_pipeline/BO.md) — GPR kernel, length scale, EI acquisition, fantasy batch step
+- [Bayesian Optimisation](backend/bo_pipeline/README.md) — GPR kernel, length scale, EI acquisition, fantasy batch step
 
 ---
 
@@ -101,7 +101,7 @@ See [`backend/ad_generation/README.md`](backend/ad_generation/README.md) for ful
 
 ### 3. Text generation pipeline (`backend/ad_text_generation/`)
 
-Generates N new copy variants per text slot (headline, primary_text, description) from
+Generates N new copy variants per text slot (headline, primary_text, description, cta) from
 a seed ad using GPT-4o, then assembles them with optional image URLs into a dynamic ad
 component list and stores the result.
 
@@ -187,32 +187,7 @@ These are **four separate accounts/resources**. Azure AI Inference and Azure Ope
 
 ## Setup
 
-### Backend
-
-```bash
-cd backend
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env
-# Required: META_APP_ID, META_APP_SECRET, META_REDIRECT_URI, JWT_SECRET
-# AI modules: AZURE_INFERENCE_KEY, AZURE_OPENAI_KEY, AZURE_OPENAI_ENDPOINT, DEAPI_API_KEY
-
-python main.py   # → http://localhost:8000
-```
-
-### Frontend
-
-```bash
-cd frontend
-npm install
-cp .env.example .env   # VITE_API_URL defaults to http://localhost:8000
-npm run dev            # → http://localhost:5173
-```
-
-### Tests
-
-See [`TEST.md`](TEST.md) for the full test catalog, individual test descriptions, and manual curl tests for the masking layer.
+See [`DEV_QUICKSTART.md`](DEV_QUICKSTART.md) for the full environment setup, server startup, curl workflow, and BO seeding guide. See [`TEST.md`](TEST.md) for the test catalog.
 
 ---
 
@@ -301,13 +276,24 @@ All routes except auth require `Authorization: Bearer <jwt>`.
 | POST | `/api/bo/run` | Run BO, return and persist up to 2 picks |
 | GET | `/api/bo/results/{ad_id}` | Latest BO picks for an ad |
 
+### Ad Generation
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/generate/text/{campaign_id}` | Generate 10 static text variants per slot; synchronous |
+| POST | `/api/generate/dynamic/{campaign_id}` | Start async dynamic ad job (4×4 text + 4 AI images + embeddings) |
+| GET | `/api/generate/dynamic/status/{job_id}` | Poll job status; returns slots + image_urls when complete |
+
 ### Other
 
 | Method | Path | Description |
 |---|---|---|
 | GET | `/api/ads` | Live ad creatives from Meta |
+| GET | `/api/ads/local` | All locally stored ads (ingested + generated), grouped by ad_id with full slot data |
+| DELETE | `/api/ads/local/{ad_id}` | Delete a local ad and its embeddings; Meta-sourced ads reappear on next sync |
 | GET | `/api/explore` | Raw Meta data (campaigns → adsets → ads) for debugging |
-| GET | `/images/{filename}` | Serve generated images (static mount) |
+| GET | `/images/{filename}` | Serve AI-generated images (static mount) |
+| GET | `/ad-images/{filename}` | Serve downloaded Meta CDN images (static mount) |
 
 ---
 
@@ -333,7 +319,7 @@ See [`STAGING_POLICY.md`](STAGING_POLICY.md) for what is and isn't safe to run a
 - **Auth:** Minimal JWT, 24h expiry. No email verification or rate limiting.
 - **Meta token:** Short-lived user token, no refresh logic.
 - **SQLite:** `backend/app.db` is gitignored. Delete it to reset all data.
-- **AI modules:** Embedding pipeline and BO are wired into HTTP routes. Ad generation, text generation, and combination embedding modules are standalone — runnable directly or callable from Python.
+- **AI modules:** All generation modules are now wired into HTTP routes. See `CLAUDE.md` for the full route list. Modules are also independently runnable — no running server required.
 - **Static ad images:** The clone flow passes image values as hosted URLs. Creatives stored only as image hashes (not URLs) will fail at Meta creative creation.
 
 For schema details see [`SCHEMAS.md`](SCHEMAS.md).

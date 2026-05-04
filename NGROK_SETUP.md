@@ -24,10 +24,19 @@ Meta OAuth requires HTTPS for redirect URIs. ngrok provides that tunnel so you d
 Follow ngrok's quickstart at https://dashboard.ngrok.com/get-started/setup to install and run `ngrok config add-authtoken <token>`.
 
 ### Start the tunnel
+
+**Preferred — use `start.sh`** (starts backend + frontend + ngrok together):
 ```bash
-ngrok http 5173
+./start.sh              # prod: ngrok on port 5173
+./start.sh staging      # staging: ngrok on port 5174
 ```
-Point ngrok at **port 5173** (Vite), not 8000. Vite's proxy handles forwarding to the backend internally — the browser never needs to reach port 8000 directly.
+
+**Manual fallback:**
+```bash
+ngrok http 5173         # prod
+ngrok http 5174         # staging
+```
+Point ngrok at the **Vite port**, not 8000. Vite's proxy handles forwarding to the backend internally — the browser never needs to reach port 8000 directly.
 
 ### AWS VPC / Security Groups
 If ngrok fails to establish a tunnel from EC2, your VPC security group may be blocking outbound traffic. ngrok connects outbound on port 443 (or 80). Fix:

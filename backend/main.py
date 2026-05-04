@@ -12,6 +12,7 @@ Minimal SaaS control-plane that:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -34,6 +35,9 @@ from pydantic import BaseModel
 
 # ── Load .env ──────────────────────────────────────────────────────────────────
 load_dotenv()
+_app_env = os.getenv("APP_ENV", "")
+if _app_env:
+    load_dotenv(Path(__file__).parent / f".env.{_app_env}", override=True)
 
 from providers.factory import get_meta_provider  # noqa: E402 – must follow load_dotenv
 from providers.mask_policy import MaskPolicy  # noqa: E402 – must follow load_dotenv
@@ -51,7 +55,7 @@ JWT_EXPIRE_HOURS = 24
 
 META_GRAPH = f"https://graph.facebook.com/{META_API_VERSION}"
 
-DB_PATH = Path(__file__).parent / "app.db"
+DB_PATH = Path(__file__).parent / os.getenv("DATABASE_PATH", "app.db")
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +126,17 @@ def init_db() -> None:
             mask_profile    TEXT,                             -- 'healthy' | 'stable' | 'weak' | NULL
             UNIQUE (user_id, ad_id, slot, slot_index)
         );
+        CREATE TABLE IF NOT EXISTS dynamic_generation_jobs (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id          INTEGER NOT NULL REFERENCES users(id),
+            campaign_id      TEXT NOT NULL,
+            status           TEXT NOT NULL DEFAULT 'running',
+            ad_id            TEXT,
+            images_generated INTEGER,
+            error            TEXT,
+            created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at     TEXT
+        );
         CREATE TABLE IF NOT EXISTS suggested_configurations (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id           INTEGER NOT NULL REFERENCES users(id),
@@ -175,8 +190,48 @@ def init_db() -> None:
         conn.commit()
     except Exception:
         pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE dynamic_generation_jobs ADD COLUMN images_generated INTEGER"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE dynamic_generation_jobs ADD COLUMN seed_ad_id TEXT"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE dynamic_generation_jobs ADD COLUMN adset_id TEXT"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE dynamic_generation_jobs ADD COLUMN meta_ad_id TEXT"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
     conn.commit()
     conn.close()
+    # Ensure tables for modules not yet wired into HTTP routes (needed by BO)
+    from ad_generation.storage import ensure_tables as _ensure_ad_tables
+    _ensure_ad_tables()
+    from ad_combination_embeddings.storage import ensure_table as _ensure_combo_table
+    _ensure_combo_table()
 
 
 # ── App lifecycle ──────────────────────────────────────────────────────────────
@@ -199,6 +254,10 @@ app.add_middleware(
 _GENERATED_IMAGES_DIR = Path(__file__).parent / "generated_images"
 _GENERATED_IMAGES_DIR.mkdir(exist_ok=True)
 app.mount("/images", StaticFiles(directory=str(_GENERATED_IMAGES_DIR)), name="generated_images")
+
+_AD_IMAGES_DIR = Path(__file__).parent / "ad_images"
+_AD_IMAGES_DIR.mkdir(exist_ok=True)
+app.mount("/ad-images", StaticFiles(directory=str(_AD_IMAGES_DIR)), name="ad_images")
 
 
 # ── JWT auth helpers ───────────────────────────────────────────────────────────
@@ -231,6 +290,11 @@ class SignupLogin(BaseModel):
 
 class TokenResponse(BaseModel):
     token: str
+
+
+class UserInfo(BaseModel):
+    email: str
+    tier: str
 
 
 class MetaStatus(BaseModel):
@@ -268,6 +332,25 @@ class AdCreative(BaseModel):
     status: str | None = None
     campaign_id: str | None = None
     adset_id: str | None = None
+
+
+class LocalAdSlot(BaseModel):
+    slot: str
+    slot_index: int
+    value: str | None = None
+
+
+class LocalAd(BaseModel):
+    ad_id: str
+    campaign_id: str
+    adset_id: str
+    creative_type: str
+    lifecycle_status: str
+    data_source: str
+    ingested_at: str
+    headline: str | None = None
+    image_url: str | None = None
+    slots: list[LocalAdSlot] = []
 
 
 class CampaignHistoryPoint(BaseModel):
@@ -384,6 +467,15 @@ def login(body: SignupLogin):
     if not row or not pwd_ctx.verify(body.password, row["pw_hash"]):
         raise HTTPException(401, "Invalid email or password")
     return TokenResponse(token=create_token(row["id"]))
+
+
+# ── User info ─────────────────────────────────────────────────────────────────
+@app.get("/me", response_model=UserInfo)
+def get_me(user_id: int = Depends(get_current_user_id)):
+    db = get_db()
+    row = db.execute("SELECT email, tier FROM users WHERE id = ?", (user_id,)).fetchone()
+    db.close()
+    return UserInfo(email=row["email"], tier=row["tier"])
 
 
 # ── Meta connection routes ─────────────────────────────────────────────────────
@@ -843,6 +935,39 @@ async def _fetch_campaign_structure(
     return adsets, ads
 
 
+async def _download_ad_images(components: list[dict]) -> list[dict]:
+    """
+    For each image-slot component with a Meta CDN URL, download the image to
+    ad_images/ and return a new components list with local serve URLs substituted.
+    Skips download if the file already exists (idempotent).
+    """
+    from urllib.parse import urlparse as _urlparse
+
+    _backend_base = os.getenv("IMAGES_SERVE_BASE_URL", "http://localhost:8000/images").replace("/images", "")
+
+    result = []
+    async with httpx.AsyncClient(timeout=20) as client:
+        for comp in components:
+            if comp.get("slot") == "image" and comp.get("value", "").startswith("http"):
+                url = comp["value"]
+                filename = Path(_urlparse(url).path).name
+                dest = _AD_IMAGES_DIR / filename
+                if not dest.exists():
+                    try:
+                        r = await client.get(url)
+                        r.raise_for_status()
+                        dest.write_bytes(r.content)
+                    except Exception:
+                        logger.warning("Failed to download ad image %s", url, exc_info=True)
+                        result.append(comp)
+                        continue
+                local_url = f"{_backend_base}/ad-images/{filename}"
+                result.append({**comp, "value": local_url})
+            else:
+                result.append(comp)
+    return result
+
+
 @app.post("/api/ingest/structure/{campaign_id}", response_model=StructureIngestResult)
 async def ingest_campaign_structure(
     campaign_id: str,
@@ -937,13 +1062,37 @@ async def ingest_campaign_structure(
     # source_id = ad_id links both tables back to the ad and its campaign.
     # Failures are logged and swallowed; ingest result is already committed.
     try:
-        import asyncio as _asyncio
-        from embeddings.pipeline import embed_ad, embed_images
+        import sqlite3 as _sqlite3
+        from embeddings.pipeline import embed_ad, embed_images, DB_PATH as _EMB_DB
+        from embeddings.extractor import extract_fields as _extract_fields, text_as_json as _text_as_json
         from ad_combination_embeddings.pipeline import embed_all_combinations
+
         for _ad_id, _comps in ad_components_map.items():
-            _asyncio.create_task(embed_ad(user_id, _ad_id, campaign_id, _comps))
-            _asyncio.create_task(embed_images(user_id, _ad_id, campaign_id, _comps))
-            _asyncio.create_task(embed_all_combinations(source_id=_ad_id, components=_comps))
+            # Download Meta CDN images to local storage while URLs are still fresh
+            _local_comps = await _download_ad_images(_comps)
+
+            # Skip embed_ad if text snapshot unchanged and image_vector already exists
+            _need_seed_embed = True
+            try:
+                _snap = _text_as_json(_extract_fields(_local_comps))
+                _c = _sqlite3.connect(str(_EMB_DB))
+                _row = _c.execute(
+                    "SELECT text_snapshot, image_vector, text_vector FROM ad_embeddings WHERE user_id = ? AND ad_id = ?",
+                    (user_id, _ad_id),
+                ).fetchone()
+                _c.close()
+                if _row and _row[0] == _snap and _row[1] is not None and _row[2] is not None:
+                    _need_seed_embed = False
+                    logger.info("embed_ad: skipping ad=%s (unchanged, already embedded)", _ad_id)
+            except Exception:
+                pass  # if check fails, proceed with embedding
+
+            if _need_seed_embed:
+                asyncio.create_task(embed_ad(user_id, _ad_id, campaign_id, _local_comps))
+            # embed_images skips slot_indexes that already have vectors
+            asyncio.create_task(embed_images(user_id, _ad_id, campaign_id, _local_comps))
+            # embed_all_combinations is text-only — no URL expiry concern
+            asyncio.create_task(embed_all_combinations(source_id=_ad_id, components=_comps))
     except Exception:
         logger.warning("embedding hook unavailable — skipping", exc_info=True)
 
@@ -1012,6 +1161,71 @@ async def list_ads(user_id: int = Depends(get_current_user_id)):
         )
         for a in ads_raw
     ]
+
+
+# ── Local ad library ──────────────────────────────────────────────────────────
+
+@app.get("/api/ads/local", response_model=list[LocalAd])
+def list_local_ads(user_id: int = Depends(get_current_user_id)):
+    """Return all ads stored locally (ingested + generated), grouped by ad_id."""
+    with get_db() as db:
+        rows = db.execute(
+            """
+            SELECT ad_id, campaign_id, adset_id, creative_type,
+                   lifecycle_status, data_source, ingested_at,
+                   slot, slot_index, value
+            FROM ad_creative_structures
+            WHERE user_id = ?
+            ORDER BY ingested_at DESC, ad_id, slot, slot_index
+            """,
+            (user_id,),
+        ).fetchall()
+
+    ads: dict[str, LocalAd] = {}
+    for r in rows:
+        ad_id = r["ad_id"]
+        if ad_id not in ads:
+            ads[ad_id] = LocalAd(
+                ad_id=ad_id,
+                campaign_id=r["campaign_id"],
+                adset_id=r["adset_id"],
+                creative_type=r["creative_type"],
+                lifecycle_status=r["lifecycle_status"],
+                data_source=r["data_source"],
+                ingested_at=r["ingested_at"],
+            )
+        ads[ad_id].slots.append(
+            LocalAdSlot(slot=r["slot"], slot_index=r["slot_index"], value=r["value"])
+        )
+        if r["slot"] == "headline" and r["slot_index"] == 0 and not ads[ad_id].headline:
+            ads[ad_id].headline = r["value"]
+        if r["slot"] == "image" and r["slot_index"] == 0 and not ads[ad_id].image_url:
+            ads[ad_id].image_url = r["value"]
+
+    return list(ads.values())
+
+
+@app.delete("/api/ads/local/{ad_id}", status_code=204)
+def delete_local_ad(ad_id: str, user_id: int = Depends(get_current_user_id)):
+    """Delete a locally stored ad and all related embedding rows."""
+    with get_db() as db:
+        db.execute(
+            "DELETE FROM ad_creative_structures WHERE user_id = ? AND ad_id = ?",
+            (user_id, ad_id),
+        )
+        db.execute(
+            "DELETE FROM ad_embeddings WHERE user_id = ? AND ad_id = ?",
+            (user_id, ad_id),
+        )
+        db.execute(
+            "DELETE FROM ad_image_embeddings WHERE user_id = ? AND ad_id = ?",
+            (user_id, ad_id),
+        )
+        db.execute(
+            "DELETE FROM ad_text_combination_embeddings WHERE source_id = ?",
+            (ad_id,),
+        )
+        db.commit()
 
 
 # ── Raw Meta explorer ─────────────────────────────────────────────────────────
@@ -1164,6 +1378,66 @@ async def resume_campaign(
 
 # ── Suggestion routes ─────────────────────────────────────────────────────────
 
+async def _upload_image_to_meta(
+    client: httpx.AsyncClient,
+    access_token: str,
+    ad_account_id: str,
+    image_url: str,
+) -> str | None:
+    """
+    Upload a locally-served image to Meta adimages API and return its hash.
+    Handles both /images/ (generated) and /ad-images/ (downloaded Meta CDN) paths.
+    Returns None if the file can't be found on disk or the upload fails.
+    """
+    local_path: Path | None = None
+    _backend_dir = Path(__file__).parent
+
+    generated_base = os.getenv("IMAGES_SERVE_BASE_URL", "http://localhost:8000/images").rstrip("/")
+    if image_url.startswith(generated_base + "/"):
+        filename = image_url[len(generated_base) + 1:]
+        candidate = _backend_dir / "generated_images" / filename
+        if candidate.exists():
+            local_path = candidate
+    elif image_url.startswith("/images/"):
+        # Relative URL stored when IMAGES_SERVE_BASE_URL was not set
+        filename = image_url[len("/images/"):]
+        candidate = _backend_dir / "generated_images" / filename
+        if candidate.exists():
+            local_path = candidate
+    elif "/ad-images/" in image_url:
+        filename = image_url.split("/ad-images/")[-1]
+        candidate = _backend_dir / "ad_images" / filename
+        if candidate.exists():
+            local_path = candidate
+
+    if not local_path:
+        logger.warning("_upload_image_to_meta: local file not found for %s", image_url)
+        return None
+
+    suffix = local_path.suffix.lower()
+    mime = "image/jpeg" if suffix in (".jpg", ".jpeg") else "image/png"
+
+    with open(local_path, "rb") as f:
+        image_bytes = f.read()
+
+    resp = await client.post(
+        f"{META_GRAPH}/{ad_account_id}/adimages",
+        data={"access_token": access_token},
+        files={"filename": (local_path.name, image_bytes, mime)},
+        timeout=60,
+    )
+    if resp.status_code != 200:
+        logger.warning("adimages upload failed (%s): %s", resp.status_code, resp.text)
+        return None
+
+    for img_data in resp.json().get("images", {}).values():
+        h = img_data.get("hash")
+        if h:
+            return h
+
+    return None
+
+
 async def _clone_dynamic_to_static_ad(
     client: httpx.AsyncClient,
     access_token: str,
@@ -1172,6 +1446,7 @@ async def _clone_dynamic_to_static_ad(
     source_ad_id: str,
     components: dict[str, str],
     suggestion_id: int,
+    image_hash: str | None = None,
 ) -> str:
     """
     Create a new static ad in Meta from a chosen set of component values.
@@ -1190,7 +1465,7 @@ async def _clone_dynamic_to_static_ad(
         f"{META_GRAPH}/{source_ad_id}",
         params={
             "access_token": access_token,
-            "fields": "creative{page_id,object_story_spec}",
+            "fields": "creative{object_story_spec,asset_feed_spec}",
         },
     )
     if src_resp.status_code != 200:
@@ -1198,16 +1473,21 @@ async def _clone_dynamic_to_static_ad(
 
     src_creative = (src_resp.json().get("creative") or {})
     oss = src_creative.get("object_story_spec") or {}
-    page_id = src_creative.get("page_id") or oss.get("page_id")
+    page_id = oss.get("page_id")
     if not page_id:
         raise HTTPException(502, "Could not determine page_id from source ad creative")
 
-    # Inherit the destination link URL from the source so the static ad is valid
+    # Inherit the destination link URL — static ads use link_data.link,
+    # dynamic ads store it in asset_feed_spec.link_urls[0].website_url
     src_link_data = oss.get("link_data") or {}
     link_url = (
         src_link_data.get("link")
         or (src_link_data.get("call_to_action") or {}).get("value", {}).get("link")
     )
+    if not link_url:
+        link_urls = (src_creative.get("asset_feed_spec") or {}).get("link_urls") or []
+        if link_urls:
+            link_url = link_urls[0].get("website_url")
 
     # 2. Build static link_data from chosen components
     link_data: dict[str, Any] = {}
@@ -1219,7 +1499,9 @@ async def _clone_dynamic_to_static_ad(
         link_data["name"] = components["headline"]
     if components.get("description"):
         link_data["description"] = components["description"]
-    if components.get("image"):
+    if image_hash:
+        link_data["image_hash"] = image_hash
+    elif components.get("image"):
         link_data["picture"] = components["image"]
 
     # 3. Create the ad creative
@@ -1470,8 +1752,455 @@ def get_bo_results(ad_id: str, user_id: int = Depends(get_current_user_id)):
     return [BOPick(**p) for p in get_latest_bo_run(ad_id, ad_id, BO_DB_PATH)]
 
 
+# ── Push to Meta ─────────────────────────────────────────────────────────────
+
+class PushAdResult(BaseModel):
+    ad_id: str
+    meta_ad_id: str | None = None
+    error: str | None = None
+
+
+class PushResponse(BaseModel):
+    pushed: int
+    failed: int
+    results: list[PushAdResult] = []
+
+
+@app.post("/api/push", response_model=PushResponse)
+async def push_generated_ads(user_id: int = Depends(get_current_user_id)):
+    """Push all unpushed completed generated ads to Meta as static ads (PAUSED)."""
+    try:
+        access_token, ad_account_id = _meta_creds(user_id)
+    except HTTPException:
+        return PushResponse(pushed=0, failed=0)
+
+    db = get_db()
+    jobs = db.execute(
+        """
+        SELECT id, campaign_id, ad_id, seed_ad_id, adset_id
+        FROM dynamic_generation_jobs
+        WHERE user_id = ? AND status = 'complete'
+          AND ad_id IS NOT NULL AND meta_ad_id IS NULL
+          AND adset_id IS NOT NULL AND seed_ad_id IS NOT NULL
+        """,
+        (user_id,),
+    ).fetchall()
+    db.close()
+
+    if not jobs:
+        logger.info("push: no pushable jobs found for user %d", user_id)
+        return PushResponse(pushed=0, failed=0)
+
+    logger.info("push: found %d job(s) to push for user %d", len(jobs), user_id)
+    pushed = 0
+    failed = 0
+    results: list[PushAdResult] = []
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        for job in jobs:
+            try:
+                db = get_db()
+                slot_rows = db.execute(
+                    """
+                    SELECT slot, value FROM ad_creative_structures
+                    WHERE user_id = ? AND ad_id = ? AND slot_index = 0
+                    """,
+                    (user_id, job["ad_id"]),
+                ).fetchall()
+                db.close()
+
+                components = {r["slot"]: r["value"] for r in slot_rows if r["value"]}
+                if not components:
+                    results.append(PushAdResult(ad_id=job["ad_id"], error="No components found"))
+                    failed += 1
+                    continue
+
+                # Upload image to Meta first so we get a hash (local URLs aren't reachable by Meta)
+                image_hash: str | None = None
+                if components.get("image"):
+                    image_hash = await _upload_image_to_meta(
+                        client, access_token, ad_account_id, components["image"]
+                    )
+
+                meta_ad_id = await _clone_dynamic_to_static_ad(
+                    client=client,
+                    access_token=access_token,
+                    ad_account_id=ad_account_id,
+                    adset_id=job["adset_id"],
+                    source_ad_id=job["seed_ad_id"],
+                    components=components,
+                    suggestion_id=job["id"],
+                    image_hash=image_hash,
+                )
+
+                db = get_db()
+                db.execute(
+                    "UPDATE dynamic_generation_jobs SET meta_ad_id = ? WHERE id = ?",
+                    (meta_ad_id, job["id"]),
+                )
+                db.commit()
+                db.close()
+
+                pushed += 1
+                results.append(PushAdResult(ad_id=job["ad_id"], meta_ad_id=meta_ad_id))
+
+            except Exception as exc:
+                logger.warning("push: job %d failed: %s", job["id"], exc)
+                failed += 1
+                results.append(PushAdResult(ad_id=job["ad_id"], error=str(exc)))
+
+    logger.info("push: done — pushed=%d failed=%d", pushed, failed)
+    return PushResponse(pushed=pushed, failed=failed, results=results)
+
+
+# ── Ad text generation routes ─────────────────────────────────────────────────
+
+class GeneratedAdSlot(BaseModel):
+    slot: str
+    slot_index: int
+    value: str
+    source: str
+
+
+class GenerateTextResponse(BaseModel):
+    generated_ad_id: int
+    source_ad_id: str
+    slots: list[GeneratedAdSlot]
+
+
+@app.post("/api/generate/text/{campaign_id}", response_model=GenerateTextResponse)
+async def generate_text_ads(
+    campaign_id: str,
+    seed_ad_id: str = Query(None),
+    user_id: int = Depends(get_current_user_id),
+):
+    """Generate 10 new text variants per slot from an ingested ad in the campaign."""
+    from ad_text_generation.pipeline import run_text_pipeline
+    from ad_text_generation.storage import get_generated_ad
+
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT ad_id, slot, slot_index, value
+        FROM ad_creative_structures
+        WHERE user_id = ? AND campaign_id = ?
+        ORDER BY ad_id, slot, slot_index
+        """,
+        (user_id, campaign_id),
+    ).fetchall()
+    db.close()
+
+    if not rows:
+        raise HTTPException(404, "No ingested creative structure found for this campaign. Run Ingest first.")
+
+    available_ids = list(dict.fromkeys(r["ad_id"] for r in rows))
+    if seed_ad_id and seed_ad_id not in available_ids:
+        raise HTTPException(400, f"seed_ad_id not found in this campaign. Available: {available_ids}")
+    if not seed_ad_id:
+        seed_ad_id = available_ids[0]
+    seed_components = [
+        {"slot": r["slot"], "slot_index": r["slot_index"], "value": r["value"]}
+        for r in rows
+        if r["ad_id"] == seed_ad_id
+    ]
+
+    generated_ad_id = await run_text_pipeline(
+        seed_components=seed_components,
+        n_per_slot=10,
+        source_ad_id=seed_ad_id,
+    )
+
+    slots = get_generated_ad(generated_ad_id)
+    return GenerateTextResponse(
+        generated_ad_id=generated_ad_id,
+        source_ad_id=seed_ad_id,
+        slots=[GeneratedAdSlot(**s) for s in slots],
+    )
+
+
+# ── Dynamic ad generation routes ──────────────────────────────────────────────
+
+class DynamicGenJob(BaseModel):
+    job_id: int
+    status: str
+
+
+class DynamicGenSlot(BaseModel):
+    slot: str
+    slot_index: int
+    value: str
+
+
+class DynamicGenResult(BaseModel):
+    job_id: int
+    status: str
+    ad_id: str | None = None
+    error: str | None = None
+    images_generated: int | None = None
+    slots: list[DynamicGenSlot] = []
+    image_urls: list[str] = []
+
+
+async def _run_dynamic_generation(
+    dyn_job_id: int,
+    campaign_id: str,
+    user_id: int,
+    seed_ad_id: str,
+    seed_components: list[dict],
+    seed_image_url: str | None,
+    seed_adset_id: str,
+) -> None:
+    """Background task: generate 4×4×4×4 dynamic ad with AI images and fire embeddings."""
+    import uuid as _uuid
+    from ad_text_generation.generator import TEXT_SLOTS, generate_all_slots
+    from embeddings.pipeline import embed_ad, embed_images
+    from ad_combination_embeddings.pipeline import embed_all_combinations
+
+    db = get_db()
+    try:
+        # ── Step 1: Generate 4 text variants per slot ─────────────────────────
+        generated_text = await generate_all_slots(
+            seed_components=seed_components,
+            n_per_slot=4,
+            slots=list(TEXT_SLOTS),
+        )
+
+        # ── Step 2: Generate 4 images via image pipeline ──────────────────────
+        image_urls: list[str] = []
+        if seed_image_url:
+            try:
+                from ad_generation.pipeline import (
+                    create_job as _create_img_job,
+                    get_active_variants,
+                    run_generation_job,
+                )
+                headline = next(
+                    (c["value"] for c in seed_components if c["slot"] == "headline"), ""
+                )
+                short_text = next(
+                    (c["value"] for c in seed_components if c["slot"] == "primary_text"), ""
+                )
+                gen_job_id = _create_img_job(
+                    user_id=user_id,
+                    campaign_id=campaign_id,
+                    adset_id=seed_adset_id,
+                    seed_image_url=seed_image_url,
+                    headline=headline,
+                    short_text=short_text,
+                    seed_ad_id=seed_ad_id,
+                )
+                await run_generation_job(gen_job_id)
+                variants = get_active_variants(gen_job_id)
+                usable = [v for v in variants if v.get("local_filename")]
+                scored = sorted(
+                    [v for v in usable if v.get("score") is not None],
+                    key=lambda v: v["score"],
+                    reverse=True,
+                )
+                unscored = [v for v in usable if v.get("score") is None]
+                base_url = os.getenv("IMAGES_SERVE_BASE_URL", "http://localhost:8000/images")
+                seen_filenames: set[str] = set()
+                unique_variants: list[dict] = []
+                for v in scored + unscored:
+                    if v["local_filename"] not in seen_filenames:
+                        seen_filenames.add(v["local_filename"])
+                        unique_variants.append(v)
+                image_urls = [
+                    f"{base_url}/{v['local_filename']}"
+                    for v in unique_variants[:4]
+                ]
+            except Exception:
+                logger.warning("dynamic generation: image pipeline failed", exc_info=True)
+
+        # ── Step 3: Assemble components ───────────────────────────────────────
+        new_ad_id = f"gen_dyn_{_uuid.uuid4().hex[:12]}"
+        now_ts = datetime.utcnow().isoformat()
+        components: list[dict] = []
+
+        for slot_name, variants_list in generated_text.items():
+            for idx, value in enumerate(variants_list[:4]):
+                components.append({"slot": slot_name, "slot_index": idx, "value": value})
+
+        images_generated = len(image_urls)
+        if image_urls:
+            for idx, url in enumerate(image_urls[:4]):
+                components.append({"slot": "image", "slot_index": idx, "value": url})
+        else:
+            # No generated images — carry seed images through as-is (deduplicated)
+            seen_image_urls: set[str] = set()
+            for comp in seed_components:
+                if comp["slot"] == "image" and comp.get("value") and comp["value"] not in seen_image_urls:
+                    seen_image_urls.add(comp["value"])
+                    components.append(comp)
+            logger.warning("dynamic generation job %d: no images generated; using %d seed image(s)", dyn_job_id, len(seen_image_urls))
+
+        # ── Step 4: Persist into ad_creative_structures ───────────────────────
+        for comp in components:
+            db.execute(
+                """
+                INSERT INTO ad_creative_structures
+                    (user_id, ad_account_id, campaign_id, adset_id, ad_id,
+                     creative_type, slot, slot_index, value,
+                     ingested_at, lifecycle_status, data_source)
+                VALUES (?, 'generated', ?, 'generated', ?,
+                        'dynamic', ?, ?, ?,
+                        ?, 'generated', 'generated')
+                ON CONFLICT (user_id, ad_id, slot, slot_index) DO UPDATE SET
+                    value = excluded.value,
+                    ingested_at = excluded.ingested_at
+                """,
+                (
+                    user_id, campaign_id, new_ad_id,
+                    comp["slot"], comp["slot_index"], comp.get("value"),
+                    now_ts,
+                ),
+            )
+        db.commit()
+
+        # ── Step 5: Fire embeddings (fire-and-forget) ─────────────────────────
+        asyncio.create_task(embed_ad(user_id, new_ad_id, campaign_id, components))
+        asyncio.create_task(embed_images(user_id, new_ad_id, campaign_id, components))
+        asyncio.create_task(
+            embed_all_combinations(
+                source_id=new_ad_id,
+                components=components,
+                slots=("headline", "primary_text", "description"),
+            )
+        )
+
+        # ── Step 6: Mark job complete ─────────────────────────────────────────
+        db.execute(
+            """UPDATE dynamic_generation_jobs
+               SET status = 'complete', ad_id = ?, images_generated = ?, completed_at = datetime('now')
+               WHERE id = ?""",
+            (new_ad_id, images_generated, dyn_job_id),
+        )
+        db.commit()
+        logger.info("dynamic generation job %d complete: ad_id=%s images_generated=%d", dyn_job_id, new_ad_id, images_generated)
+
+    except Exception as exc:
+        logger.exception("dynamic generation job %d failed", dyn_job_id)
+        try:
+            db.execute(
+                "UPDATE dynamic_generation_jobs SET status = 'failed', error = ? WHERE id = ?",
+                (str(exc), dyn_job_id),
+            )
+            db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+@app.post("/api/generate/dynamic/{campaign_id}", response_model=DynamicGenJob)
+async def start_dynamic_generation(
+    campaign_id: str,
+    seed_ad_id: str = Query(None),
+    user_id: int = Depends(get_current_user_id),
+):
+    """Start async dynamic ad generation: 4 text variants per slot + 4 AI images."""
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT ad_id, adset_id, slot, slot_index, value
+        FROM ad_creative_structures
+        WHERE user_id = ? AND campaign_id = ?
+        ORDER BY ad_id, slot, slot_index
+        """,
+        (user_id, campaign_id),
+    ).fetchall()
+
+    if not rows:
+        db.close()
+        raise HTTPException(
+            404, "No ingested creative structure found. Run Ingest first."
+        )
+
+    available_ids = list(dict.fromkeys(r["ad_id"] for r in rows))
+    if seed_ad_id and seed_ad_id not in available_ids:
+        db.close()
+        raise HTTPException(400, f"seed_ad_id not found in this campaign. Available: {available_ids}")
+    if not seed_ad_id:
+        seed_ad_id = available_ids[0]
+
+    seed_adset_id = next(r["adset_id"] for r in rows if r["ad_id"] == seed_ad_id)
+    seed_components = [
+        {"slot": r["slot"], "slot_index": r["slot_index"], "value": r["value"]}
+        for r in rows
+        if r["ad_id"] == seed_ad_id
+    ]
+    _image_urls = [c["value"] for c in seed_components if c["slot"] == "image" and c["value"]]
+    seed_image_url = secrets.choice(_image_urls) if _image_urls else None
+
+    db.execute(
+        "INSERT INTO dynamic_generation_jobs (user_id, campaign_id, seed_ad_id, adset_id) VALUES (?, ?, ?, ?)",
+        (user_id, campaign_id, seed_ad_id, seed_adset_id),
+    )
+    db.commit()
+    dyn_job_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    db.close()
+
+    asyncio.create_task(
+        _run_dynamic_generation(
+            dyn_job_id=dyn_job_id,
+            campaign_id=campaign_id,
+            user_id=user_id,
+            seed_ad_id=seed_ad_id,
+            seed_components=seed_components,
+            seed_image_url=seed_image_url,
+            seed_adset_id=seed_adset_id,
+        )
+    )
+
+    return DynamicGenJob(job_id=dyn_job_id, status="running")
+
+
+@app.get("/api/generate/dynamic/status/{job_id}", response_model=DynamicGenResult)
+def get_dynamic_gen_status(
+    job_id: int,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Poll status of a dynamic generation job; returns slots + images when complete."""
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM dynamic_generation_jobs WHERE id = ? AND user_id = ?",
+        (job_id, user_id),
+    ).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Job not found")
+
+    result = DynamicGenResult(
+        job_id=row["id"],
+        status=row["status"],
+        ad_id=row["ad_id"],
+        error=row["error"],
+        images_generated=row["images_generated"],
+    )
+
+    if row["status"] == "complete" and row["ad_id"]:
+        slot_rows = db.execute(
+            """SELECT slot, slot_index, value FROM ad_creative_structures
+               WHERE user_id = ? AND ad_id = ? ORDER BY slot, slot_index""",
+            (user_id, row["ad_id"]),
+        ).fetchall()
+        result.slots = [
+            DynamicGenSlot(slot=r["slot"], slot_index=r["slot_index"], value=r["value"] or "")
+            for r in slot_rows
+            if r["slot"] != "image"
+        ]
+        raw_image_urls = [r["value"] for r in slot_rows if r["slot"] == "image" and r["value"]]
+        result.image_urls = [
+            u.split("localhost:8000", 1)[-1] if "localhost:8000" in u else u
+            for u in raw_image_urls
+        ]
+
+    db.close()
+    return result
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)

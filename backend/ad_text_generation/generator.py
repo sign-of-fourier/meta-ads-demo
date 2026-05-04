@@ -15,7 +15,7 @@ from openai import AzureOpenAI
 
 from ad_text_generation.prompts import GENERATE_SLOT_VARIANTS, SLOT_HINTS
 
-TEXT_SLOTS = ("headline", "primary_text", "description")
+TEXT_SLOTS = ("headline", "primary_text", "description", "cta")
 
 
 def _make_client() -> AzureOpenAI:

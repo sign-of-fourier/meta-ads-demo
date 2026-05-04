@@ -28,6 +28,7 @@ Public API:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -35,7 +36,7 @@ from pathlib import Path
 
 from ad_generation.analyzer import analyze_image
 from ad_generation.generator import submit_generation
-from ad_generation.poller import extract_result_url, poll_until_done, save_image_locally
+from ad_generation.poller import _images_dir, extract_result_url, poll_until_done, save_image_locally
 from ad_generation.qa_checker import check_for_artifacts
 from ad_generation.scorer import score_variant
 from ad_generation.storage import (
@@ -57,6 +58,19 @@ def _images_base_url() -> str:
 
 def _serve_url(filename: str) -> str:
     return f"{_images_base_url()}/{filename}"
+
+
+def _image_data_url(filename: str) -> str:
+    """Read a locally saved image and return a base64 data URL for API calls.
+
+    Azure OpenAI cannot reach localhost URLs, so we embed the image inline.
+    Falls back to the serve URL if the file cannot be read.
+    """
+    try:
+        raw = (_images_dir() / filename).read_bytes()
+        return "data:image/png;base64," + base64.b64encode(raw).decode()
+    except Exception:
+        return _serve_url(filename)
 
 
 # ---------------------------------------------------------------------------
@@ -168,9 +182,8 @@ async def _run(job_id: int, db_path: Path) -> None:
             update_variant(vid, db_path, qa_status="skipped")
             return
 
-        serve_url = _serve_url(variant["local_filename"])
         try:
-            result = await check_for_artifacts(serve_url)
+            result = await check_for_artifacts(_image_data_url(variant["local_filename"]))
             if result.passed:
                 update_variant(vid, db_path, qa_status="passed")
                 logger.info("job %d variant %d: QA passed", job_id, vid)
@@ -268,10 +281,9 @@ async def _score(vid: int, job: dict, db_path: Path) -> None:
     variant = _get_variant(vid, job["id"], db_path)
     if variant is None or variant["status"] != "done" or not variant.get("local_filename"):
         return
-    serve_url = _serve_url(variant["local_filename"])
     try:
         result = await score_variant(
-            image_url=serve_url,
+            image_url=_image_data_url(variant["local_filename"]),
             headline=job["headline"],
             short_text=job["short_text"],
         )

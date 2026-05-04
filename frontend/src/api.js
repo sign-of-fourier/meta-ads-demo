@@ -62,6 +62,12 @@ export function isLoggedIn() {
   return !!localStorage.getItem("token");
 }
 
+// ── User ─────────────────────────────────────────────────────────────────────
+
+export async function getMe() {
+  return request("/me");
+}
+
 // ── Meta connection ─────────────────────────────────────────────────────────
 
 export async function getMetaStatus() {
@@ -92,6 +98,14 @@ export async function getAds() {
   return request("/api/ads");
 }
 
+export async function getLocalAds() {
+  return request("/api/ads/local");
+}
+
+export async function deleteLocalAd(adId) {
+  return request(`/api/ads/local/${adId}`, { method: "DELETE" });
+}
+
 // ── Ingest ──────────────────────────────────────────────────────────────────
 
 export async function getIngestPreview() {
@@ -100,6 +114,10 @@ export async function getIngestPreview() {
 
 export async function runIngest() {
   return request("/api/ingest", { method: "POST" });
+}
+
+export async function pushGeneratedAds() {
+  return request("/api/push", { method: "POST" });
 }
 
 export async function getExplore() {
@@ -133,4 +151,36 @@ export async function confirmSuggestion(id, action) {
     method: "POST",
     body: JSON.stringify({ action }),
   });
+}
+
+// ── Bayesian Optimisation ────────────────────────────────────────────────────
+
+export async function runBO(seedAdId, textSourceId) {
+  return request("/api/bo/run", {
+    method: "POST",
+    body: JSON.stringify({ seed_ad_id: seedAdId, text_source_id: textSourceId }),
+  });
+}
+
+// ── Ad text generation ────────────────────────────────────────────────────────
+
+export async function generateTextAds(campaignId, seedAdId) {
+  const qs = seedAdId ? `?seed_ad_id=${encodeURIComponent(seedAdId)}` : "";
+  return request(`/api/generate/text/${campaignId}${qs}`, { method: "POST" });
+}
+
+export async function startDynamicGeneration(campaignId, seedAdId) {
+  const qs = seedAdId ? `?seed_ad_id=${encodeURIComponent(seedAdId)}` : "";
+  return request(`/api/generate/dynamic/${campaignId}${qs}`, { method: "POST" });
+}
+
+export async function storeSuggestion(data) {
+  return request("/api/suggestions", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+}
+
+export async function getDynamicGenStatus(jobId) {
+  return request(`/api/generate/dynamic/status/${jobId}`);
 }

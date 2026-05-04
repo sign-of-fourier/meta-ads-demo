@@ -87,11 +87,11 @@ Normalised creative components. One row per `(user, ad, slot, slot_index)`.
 | `value` | TEXT | The component text or image URL / hash |
 | `ingested_at` | TEXT | ISO timestamp of last ingest |
 | `lifecycle_status` | TEXT | `'active'`, `'inactive'`, or `'missing'` (see below) |
-| `data_source` | TEXT | `'real'` \| `'masked'` \| `'demo'` — added via ALTER TABLE migration |
+| `data_source` | TEXT | `'real'` \| `'masked'` \| `'demo'` \| `'generated'` — added via ALTER TABLE migration |
 | `mask_profile` | TEXT nullable | `'healthy'` \| `'stable'` \| `'weak'` — only set when `data_source='masked'` |
 | UNIQUE | | `(user_id, ad_id, slot, slot_index)` — drives idempotent upsert |
 
-**Lifecycle status rules** (set during `POST /api/ingest/structure/{campaign_id}`):
+**Lifecycle status rules** (set during `POST /api/ingest/structure/{campaign_id}` for Meta-ingested ads):
 
 | Status | Condition |
 |---|---|
@@ -100,6 +100,8 @@ Normalised creative components. One row per `(user, ad, slot, slot_index)`.
 | `missing` | Ad has rows in DB but was absent from the latest Meta fetch for this campaign |
 
 **Ingest behaviour:** `ON CONFLICT DO UPDATE` replaces `creative_type`, `value`, `ingested_at`, and `lifecycle_status` in place. Previously ingested ads absent from the current fetch are updated to `lifecycle_status = 'missing'` in a separate `UPDATE` pass.
+
+**Generated ad rows** (written by `_run_dynamic_generation`): use `data_source='generated'`, `lifecycle_status='generated'`, `ad_account_id='generated'`, `adset_id='generated'`, `ad_id='gen_dyn_{uuid12}'`. These represent locally-created ads not yet pushed to Meta.
 
 ---
 
@@ -424,6 +426,23 @@ from ad_combination_embeddings import get_embeddings_for_source
 rows = get_embeddings_for_source("my_ad_001")
 # Each row: {"combination_key": str, "combination": dict, "vector": np.ndarray, "model": str, "embedded_at": str}
 ```
+
+---
+
+### `dynamic_generation_jobs`
+
+Tracks the status of async `POST /api/generate/dynamic/{campaign_id}` jobs. One row per button click.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK | Returned as `job_id` to the frontend |
+| `user_id` | INTEGER | FK → `users.id` |
+| `campaign_id` | TEXT | The campaign being generated for |
+| `status` | TEXT | `'running'` \| `'complete'` \| `'failed'` |
+| `ad_id` | TEXT nullable | Set on completion — the `gen_dyn_*` ad_id in `ad_creative_structures` |
+| `error` | TEXT nullable | Set on failure |
+| `created_at` | TEXT | |
+| `completed_at` | TEXT nullable | Set on completion or failure |
 
 ---
 
