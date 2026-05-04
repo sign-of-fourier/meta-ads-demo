@@ -37,6 +37,7 @@ async def run_text_pipeline(
     image_urls: list[str] | None = None,
     text_slots: list[str] | None = None,
     source_ad_id: str | None = None,
+    platform: str = "meta",
     db_path: Path = DB_PATH,
 ) -> int:
     """
@@ -64,6 +65,7 @@ async def run_text_pipeline(
         seed_components=seed_components,
         n_per_slot=n_per_slot,
         slots=text_slots,
+        platform=platform,
     )
 
     for slot, variants in generated_text.items():

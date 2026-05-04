@@ -4,9 +4,65 @@ from datetime import datetime, timedelta
 
 import httpx
 
-from .meta_provider import MetaProvider
+from .meta_provider import PlatformProvider
 
-class DemoMetaProvider(MetaProvider):
+class DemoMetaProvider(PlatformProvider):
+    @property
+    def platform_name(self) -> str:
+        return "meta"
+
+    def normalize_creative(self, ad: dict) -> tuple[str, list[dict]]:
+        creative = ad.get("creative") or {}
+        asset_feed = creative.get("asset_feed_spec")
+
+        if asset_feed:
+            components: list[dict] = []
+
+            for i, item in enumerate(asset_feed.get("titles", [])):
+                components.append({"slot": "headline", "slot_index": i, "value": item.get("text")})
+
+            for i, item in enumerate(asset_feed.get("descriptions", [])):
+                components.append({"slot": "description", "slot_index": i, "value": item.get("text")})
+
+            for i, item in enumerate(asset_feed.get("bodies", [])):
+                components.append({"slot": "primary_text", "slot_index": i, "value": item.get("text")})
+
+            for i, item in enumerate(asset_feed.get("images", [])):
+                value = item.get("url") or item.get("hash")
+                components.append({"slot": "image", "slot_index": i, "value": value})
+
+            has_url_image = any(
+                c["slot"] == "image" and c["value"] and c["value"].startswith("http")
+                for c in components
+            )
+            if not has_url_image:
+                thumbnail = creative.get("thumbnail_url") or creative.get("image_url")
+                if thumbnail:
+                    components.append({"slot": "image", "slot_index": 9999, "value": thumbnail})
+
+            return "dynamic", components
+
+        components = []
+        link_data = (creative.get("object_story_spec") or {}).get("link_data") or {}
+
+        headline = creative.get("title") or link_data.get("name")
+        if headline:
+            components.append({"slot": "headline", "slot_index": 0, "value": headline})
+
+        description = link_data.get("description")
+        if description:
+            components.append({"slot": "description", "slot_index": 0, "value": description})
+
+        primary_text = creative.get("body") or link_data.get("message")
+        if primary_text:
+            components.append({"slot": "primary_text", "slot_index": 0, "value": primary_text})
+
+        image = creative.get("image_url") or creative.get("thumbnail_url")
+        if image:
+            components.append({"slot": "image", "slot_index": 0, "value": image})
+
+        return "static", components
+
     async def fetch_campaigns_and_insights(
         self,
         client: httpx.AsyncClient,

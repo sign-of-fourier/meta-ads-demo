@@ -39,9 +39,11 @@ _app_env = os.getenv("APP_ENV", "")
 if _app_env:
     load_dotenv(Path(__file__).parent / f".env.{_app_env}", override=True)
 
-from providers.factory import get_meta_provider  # noqa: E402 – must follow load_dotenv
+from providers.factory import get_meta_provider, get_google_provider  # noqa: E402 – must follow load_dotenv
 from providers.mask_policy import MaskPolicy  # noqa: E402 – must follow load_dotenv
+import google_ads_api  # noqa: E402 – must follow load_dotenv
 meta_provider = get_meta_provider()
+google_provider = get_google_provider()
 APP_MODE = os.getenv("APP_MODE", "live").lower()
 
 META_APP_ID = os.environ["META_APP_ID"]
@@ -49,6 +51,12 @@ META_APP_SECRET = os.environ["META_APP_SECRET"]
 META_REDIRECT_URI = os.environ["META_REDIRECT_URI"]
 META_API_VERSION = os.getenv("META_API_VERSION", "v19.0")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
+GOOGLE_DEVELOPER_TOKEN = os.getenv("GOOGLE_DEVELOPER_TOKEN", "")
+GOOGLE_ADS_API_VERSION = os.getenv("GOOGLE_ADS_API_VERSION", "")
 JWT_SECRET = os.getenv("JWT_SECRET", "change-me")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 24
@@ -152,6 +160,35 @@ def init_db() -> None:
             created_at        TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
         );
+        CREATE TABLE IF NOT EXISTS google_connections (
+            user_id             INTEGER PRIMARY KEY REFERENCES users(id),
+            customer_id         TEXT NOT NULL,
+            login_customer_id   TEXT,
+            refresh_token       TEXT NOT NULL,
+            customer_name       TEXT,
+            connected_at        TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS google_pending_connections (
+            key          TEXT PRIMARY KEY,
+            user_id      INTEGER NOT NULL,
+            refresh_token TEXT NOT NULL,
+            accounts_json TEXT NOT NULL,
+            created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS bo_selections (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            seed_ad_id              TEXT NOT NULL,
+            text_source_id          TEXT NOT NULL,
+            pick_rank               INTEGER NOT NULL,
+            combination_key         TEXT NOT NULL,
+            combination             TEXT NOT NULL,
+            selection_type          TEXT NOT NULL,
+            ei_score                REAL,
+            gpr_mean                REAL,
+            gpr_std                 REAL,
+            google_ad_resource_name TEXT,
+            created_at              TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         """
     )
     # Migration: add lifecycle_status column to existing databases that predate this column
@@ -221,6 +258,34 @@ def init_db() -> None:
     try:
         conn.execute(
             "ALTER TABLE dynamic_generation_jobs ADD COLUMN meta_ad_id TEXT"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE ad_insights ADD COLUMN platform TEXT NOT NULL DEFAULT 'meta'"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE ad_creative_structures ADD COLUMN platform TEXT NOT NULL DEFAULT 'meta'"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE oauth_states ADD COLUMN provider TEXT NOT NULL DEFAULT 'meta'"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE bo_selections ADD COLUMN google_ad_resource_name TEXT"
         )
         conn.commit()
     except Exception:
@@ -300,6 +365,12 @@ class UserInfo(BaseModel):
 class MetaStatus(BaseModel):
     connected: bool
     ad_account_id: str | None = None
+
+
+class GoogleStatus(BaseModel):
+    connected: bool
+    customer_id: str | None = None
+    customer_name: str | None = None
 
 
 class LoginUrlResponse(BaseModel):
@@ -619,6 +690,168 @@ def _meta_creds(user_id: int) -> tuple[str, str]:
     return row["access_token"], row["ad_account_id"]
 
 
+# ── Google connection routes ───────────────────────────────────────────────────
+@app.get("/me/google-status", response_model=GoogleStatus)
+def google_status(user_id: int = Depends(get_current_user_id)):
+    db = get_db()
+    row = db.execute(
+        "SELECT customer_id, customer_name FROM google_connections WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    db.close()
+    if row:
+        return GoogleStatus(connected=True, customer_id=row["customer_id"], customer_name=row["customer_name"])
+    return GoogleStatus(connected=False)
+
+
+@app.get("/auth/google/login-url", response_model=LoginUrlResponse)
+def google_login_url(user_id: int = Depends(get_current_user_id)):
+    state = secrets.token_urlsafe(32)
+    db = get_db()
+    db.execute(
+        "INSERT OR REPLACE INTO oauth_states (state, user_id, provider) VALUES (?, ?, 'google')",
+        (state, user_id),
+    )
+    db.commit()
+    db.close()
+    scopes = "https://www.googleapis.com/auth/adwords"
+    url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        f"?client_id={GOOGLE_CLIENT_ID}"
+        f"&redirect_uri={GOOGLE_REDIRECT_URI}"
+        f"&scope={scopes}"
+        f"&state={state}"
+        f"&response_type=code"
+        f"&access_type=offline"
+        f"&prompt=consent"
+    )
+    return LoginUrlResponse(url=url)
+
+
+@app.get("/auth/google/callback")
+async def google_callback(
+    code: str = Query(None),
+    state: str = Query(None),
+    error: str = Query(None),
+):
+    if error or not code or not state:
+        msg = error or "Google login failed or was cancelled"
+        return RedirectResponse(f"{FRONTEND_URL}/app/settings?google_error={msg}")
+
+    db = get_db()
+    row = db.execute(
+        "SELECT user_id FROM oauth_states WHERE state = ? AND provider = 'google'",
+        (state,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(400, "Invalid or expired OAuth state")
+    user_id = row["user_id"]
+    db.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+    db.commit()
+
+    try:
+        token_data = await google_ads_api.exchange_code_for_tokens(code, GOOGLE_REDIRECT_URI)
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc))
+
+    refresh_token: str = token_data.get("refresh_token", "")
+    access_token: str = token_data.get("access_token", "")
+    if not refresh_token:
+        raise HTTPException(400, "No refresh token returned — re-authorize with offline access.")
+
+    try:
+        resource_names = await google_ads_api.list_accessible_customers(
+            access_token, GOOGLE_DEVELOPER_TOKEN, GOOGLE_ADS_API_VERSION
+        )
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc))
+
+    if not resource_names:
+        raise HTTPException(400, "No Google Ads accounts found for this Google account.")
+
+    customer_ids = [r.split("/")[-1] for r in resource_names]
+    names = await asyncio.gather(
+        *[
+            google_ads_api.get_customer_name(cid, access_token, GOOGLE_DEVELOPER_TOKEN, GOOGLE_ADS_API_VERSION)
+            for cid in customer_ids
+        ]
+    )
+    accounts = [
+        {"customer_id": cid, "name": name or cid}
+        for cid, name in zip(customer_ids, names)
+    ]
+
+    pending_key = secrets.token_urlsafe(32)
+    db.execute(
+        "INSERT INTO google_pending_connections (key, user_id, refresh_token, accounts_json) VALUES (?, ?, ?, ?)",
+        (pending_key, user_id, refresh_token, json.dumps(accounts)),
+    )
+    db.commit()
+    db.close()
+
+    return RedirectResponse(f"{FRONTEND_URL}/app/settings?google_pick={pending_key}")
+
+
+@app.get("/auth/google/pending/{key}")
+async def google_pending_accounts(key: str, user_id: int = Depends(get_current_user_id)):
+    db = get_db()
+    row = db.execute(
+        "SELECT user_id, accounts_json FROM google_pending_connections WHERE key = ?", (key,)
+    ).fetchone()
+    db.close()
+    if not row or row["user_id"] != user_id:
+        raise HTTPException(404, "Pending connection not found or expired.")
+    return {"accounts": json.loads(row["accounts_json"])}
+
+
+class SelectAccountRequest(BaseModel):
+    key: str
+    customer_id: str
+    login_customer_id: str | None = None
+
+
+@app.post("/auth/google/select-account")
+async def google_select_account(body: SelectAccountRequest, user_id: int = Depends(get_current_user_id)):
+    db = get_db()
+    row = db.execute(
+        "SELECT user_id, refresh_token, accounts_json FROM google_pending_connections WHERE key = ?",
+        (body.key,),
+    ).fetchone()
+    if not row or row["user_id"] != user_id:
+        raise HTTPException(404, "Pending connection not found or expired.")
+
+    clean_id = body.customer_id.replace("-", "").strip()
+    clean_login = body.login_customer_id.replace("-", "").strip() if body.login_customer_id else None
+
+    accounts = json.loads(row["accounts_json"])
+    match = next((a for a in accounts if a["customer_id"] == clean_id), None)
+    name = match["name"] if match else clean_id
+
+    db.execute(
+        "INSERT OR REPLACE INTO google_connections (user_id, customer_id, login_customer_id, refresh_token, customer_name) VALUES (?, ?, ?, ?, ?)",
+        (user_id, clean_id, clean_login, row["refresh_token"], name),
+    )
+    db.execute("DELETE FROM google_pending_connections WHERE key = ?", (body.key,))
+    db.commit()
+    db.close()
+    return {"success": True}
+
+
+# ── Helper: load user's Google creds ──────────────────────────────────────────
+async def _google_creds(user_id: int) -> tuple[str, str, str | None]:
+    """Return (access_token, customer_id, login_customer_id) or raise 400. Always refreshes."""
+    db = get_db()
+    row = db.execute(
+        "SELECT refresh_token, customer_id, login_customer_id FROM google_connections WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(400, "Google Ads account not connected")
+    access_token = await google_ads_api.refresh_access_token(row["refresh_token"])
+    return access_token, row["customer_id"], row["login_customer_id"]
+
+
 def _current_data_provenance() -> tuple[str, str | None]:
     """
     Returns (data_source, mask_profile)
@@ -668,6 +901,174 @@ async def list_campaigns(user_id: int = Depends(get_current_user_id)):
         )
         for c in campaigns_raw
     ]
+
+
+# ── Google campaigns ───────────────────────────────────────────────────────────
+@app.get("/api/google/campaigns", response_model=list[Campaign])
+async def list_google_campaigns(user_id: int = Depends(get_current_user_id)):
+    access_token, customer_id, login_customer_id = await _google_creds(user_id)
+    async with httpx.AsyncClient(timeout=30) as client:
+        campaigns_raw, metrics_by_campaign, _ = await google_provider.fetch_campaigns_and_insights(
+            client, access_token, customer_id, login_customer_id=login_customer_id
+        )
+    return [
+        Campaign(
+            id=c["id"],
+            name=c.get("name", ""),
+            status=c.get("status", ""),
+            daily_budget=c.get("daily_budget"),
+            spend_7d=metrics_by_campaign.get(c["id"], {}).get("spend"),
+            impressions_7d=metrics_by_campaign.get(c["id"], {}).get("impressions"),
+            clicks_7d=metrics_by_campaign.get(c["id"], {}).get("clicks"),
+            ctr_7d=metrics_by_campaign.get(c["id"], {}).get("ctr"),
+            cpm_7d=metrics_by_campaign.get(c["id"], {}).get("cpm"),
+        )
+        for c in campaigns_raw
+    ]
+
+
+# ── Google structural ingest ──────────────────────────────────────────────────
+
+@app.post("/api/google/ingest/structure/{campaign_id}", response_model=StructureIngestResult)
+async def ingest_google_campaign_structure(
+    campaign_id: str,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Fetch Google campaign → ad group → ad → creative structure and persist to
+    ad_creative_structures with platform='google'. Idempotent: existing rows for the
+    same (user_id, ad_id, slot, slot_index) are replaced."""
+    access_token, customer_id, login_customer_id = await _google_creds(user_id)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        _adsets, ads = await google_provider.fetch_campaign_structure(
+            client, access_token, customer_id, campaign_id,
+            login_customer_id=login_customer_id,
+        )
+
+    db = get_db()
+    existing_ad_ids: set[str] = set(
+        row[0]
+        for row in db.execute(
+            "SELECT DISTINCT ad_id FROM ad_creative_structures "
+            "WHERE user_id = ? AND campaign_id = ? AND platform = 'google'",
+            (user_id, campaign_id),
+        ).fetchall()
+    )
+
+    ingested_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ads_processed = 0
+    components_saved = 0
+    current_ad_ids: set[str] = set()
+    _ads_for_embedding: list[tuple[str, str, list[dict]]] = []
+
+    for ad in ads:
+        ad_id = ad["id"]
+        current_ad_ids.add(ad_id)
+        adset_id = ad.get("adset_id", "")
+
+        raw_status = ad.get("effective_status") or ad.get("status", "")
+        lifecycle_status = "active" if raw_status in ("ENABLED", "ACTIVE") else "inactive"
+
+        creative_type, components = google_provider.normalize_creative(ad)
+        _ads_for_embedding.append((ad_id, creative_type, components))
+
+        for comp in components:
+            db.execute(
+                """
+                INSERT INTO ad_creative_structures
+                    (user_id, ad_account_id, campaign_id, adset_id, ad_id,
+                     creative_type, slot, slot_index, value, ingested_at,
+                     lifecycle_status, data_source, mask_profile, platform)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'real', NULL, 'google')
+                ON CONFLICT (user_id, ad_id, slot, slot_index)
+                DO UPDATE SET
+                    creative_type    = excluded.creative_type,
+                    value            = excluded.value,
+                    ingested_at      = excluded.ingested_at,
+                    lifecycle_status = excluded.lifecycle_status,
+                    platform         = 'google'
+                """,
+                (
+                    user_id, customer_id, campaign_id, adset_id, ad_id,
+                    creative_type, comp["slot"], comp["slot_index"],
+                    comp["value"], ingested_at, lifecycle_status,
+                ),
+            )
+            components_saved += 1
+
+        ads_processed += 1
+
+    missing_ad_ids = existing_ad_ids - current_ad_ids
+    if missing_ad_ids:
+        placeholders = ",".join("?" * len(missing_ad_ids))
+        db.execute(
+            f"UPDATE ad_creative_structures SET lifecycle_status = 'missing' "
+            f"WHERE user_id = ? AND campaign_id = ? AND platform = 'google' "
+            f"AND ad_id IN ({placeholders})",
+            (user_id, campaign_id, *missing_ad_ids),
+        )
+
+    db.commit()
+    db.close()
+
+    # ── Embedding hook (fire-and-forget) ──────────────────────────────────────
+    # RSA and video/display get text-only embeddings via embed_ad (image_url=None
+    # is handled gracefully — zeros in image slot of combined vector).
+    # Combinations use headline × description slots for all Google creative types.
+    # Per-image embeddings (embed_images) are deferred until URL resolution for
+    # display/video assets is implemented.
+    _GOOGLE_COMBO_SLOTS = ("headline", "description")
+    try:
+        from embeddings.pipeline import embed_ad
+        from ad_combination_embeddings.pipeline import embed_all_combinations
+        for _ad_id, _creative_type, _comps in _ads_for_embedding:
+            asyncio.create_task(embed_ad(user_id, _ad_id, campaign_id, _comps))
+            asyncio.create_task(
+                embed_all_combinations(source_id=_ad_id, components=_comps, slots=_GOOGLE_COMBO_SLOTS)
+            )
+    except Exception:
+        logger.warning("google ingest: embedding hook unavailable — skipping", exc_info=True)
+
+    return StructureIngestResult(
+        campaign_id=campaign_id,
+        ads_processed=ads_processed,
+        components_saved=components_saved,
+    )
+
+
+@app.get("/api/google/structure/{campaign_id}", response_model=list[AdStructure])
+def get_google_campaign_structure(
+    campaign_id: str,
+    user_id: int = Depends(get_current_user_id),
+):
+    """Return persisted Google creative structures for a campaign, grouped by ad."""
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT ad_id, adset_id, creative_type, slot, slot_index, value, lifecycle_status
+        FROM ad_creative_structures
+        WHERE user_id = ? AND campaign_id = ? AND platform = 'google'
+        ORDER BY ad_id, slot, slot_index
+        """,
+        (user_id, campaign_id),
+    ).fetchall()
+    db.close()
+
+    ads_map: dict[str, dict] = {}
+    for row in rows:
+        ad_id = row["ad_id"]
+        if ad_id not in ads_map:
+            ads_map[ad_id] = {
+                "ad_id": ad_id,
+                "adset_id": row["adset_id"] or "",
+                "campaign_id": campaign_id,
+                "creative_type": row["creative_type"],
+                "lifecycle_status": row["lifecycle_status"],
+                "components": {},
+            }
+        ads_map[ad_id]["components"].setdefault(row["slot"], []).append(row["value"])
+
+    return list(ads_map.values())
 
 
 # ── Ingest preview + explicit ingest ──────────────────────────────────────────
@@ -822,70 +1223,7 @@ _SUPPORTED_SLOTS = ("headline", "description", "primary_text", "image")
 
 
 def _normalize_creative(ad: dict) -> tuple[str, list[dict]]:
-    """
-    Derive creative_type and component list from a raw Meta ad dict.
-
-    Returns (creative_type, components) where each component is:
-        {"slot": str, "slot_index": int, "value": str | None}
-
-    Dynamic detection: presence of "asset_feed_spec" in the creative.
-    Supported slots: headline, description, primary_text, image.
-    """
-    creative = ad.get("creative") or {}
-    asset_feed = creative.get("asset_feed_spec")
-
-    if asset_feed:
-        creative_type = "dynamic"
-        components: list[dict] = []
-
-        for i, item in enumerate(asset_feed.get("titles", [])):
-            components.append({"slot": "headline", "slot_index": i, "value": item.get("text")})
-
-        for i, item in enumerate(asset_feed.get("descriptions", [])):
-            components.append({"slot": "description", "slot_index": i, "value": item.get("text")})
-
-        for i, item in enumerate(asset_feed.get("bodies", [])):
-            components.append({"slot": "primary_text", "slot_index": i, "value": item.get("text")})
-
-        for i, item in enumerate(asset_feed.get("images", [])):
-            value = item.get("url") or item.get("hash")
-            components.append({"slot": "image", "slot_index": i, "value": value})
-
-        # If all image values are hashes (no URLs), use thumbnail_url as a real URL fallback
-        has_url_image = any(
-            c["slot"] == "image" and c["value"] and c["value"].startswith("http")
-            for c in components
-        )
-        if not has_url_image:
-            thumbnail = creative.get("thumbnail_url") or creative.get("image_url")
-            if thumbnail:
-                components.append({"slot": "image", "slot_index": 9999, "value": thumbnail})
-
-        return creative_type, components
-
-    # Static: pull from top-level creative fields or object_story_spec
-    creative_type = "static"
-    components = []
-
-    link_data = (creative.get("object_story_spec") or {}).get("link_data") or {}
-
-    headline = creative.get("title") or link_data.get("name")
-    if headline:
-        components.append({"slot": "headline", "slot_index": 0, "value": headline})
-
-    description = link_data.get("description")
-    if description:
-        components.append({"slot": "description", "slot_index": 0, "value": description})
-
-    primary_text = creative.get("body") or link_data.get("message")
-    if primary_text:
-        components.append({"slot": "primary_text", "slot_index": 0, "value": primary_text})
-
-    image = creative.get("image_url") or creative.get("thumbnail_url")
-    if image:
-        components.append({"slot": "image", "slot_index": 0, "value": image})
-
-    return creative_type, components
+    return meta_provider.normalize_creative(ad)
 
 
 async def _fetch_campaign_structure(
@@ -894,45 +1232,7 @@ async def _fetch_campaign_structure(
     ad_account_id: str,
     campaign_id: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """
-    Fetch adsets and ads (with expanded creative fields) for a single campaign.
-    Returns (adsets, ads).
-    """
-    adsets_resp = await client.get(
-        f"{META_GRAPH}/{ad_account_id}/adsets",
-        params={
-            "access_token": access_token,
-            "fields": "id,name,status,campaign_id",
-            "effective_status": '["ACTIVE","PAUSED","ARCHIVED","WITH_ISSUES"]',
-            "filtering": f'[{{"field":"campaign.id","operator":"EQUAL","value":"{campaign_id}"}}]',
-            "limit": 500,
-        },
-    )
-    if adsets_resp.status_code != 200:
-        raise HTTPException(502, f"Failed to fetch adsets: {adsets_resp.text}")
-    adsets = adsets_resp.json().get("data", [])
-
-    ads_resp = await client.get(
-        f"{META_GRAPH}/{ad_account_id}/ads",
-        params={
-            "access_token": access_token,
-            "fields": (
-                "id,name,status,effective_status,campaign_id,adset_id,"
-                "creative{"
-                "id,name,body,title,image_url,thumbnail_url,"
-                "asset_feed_spec,object_story_spec"
-                "}"
-            ),
-            "effective_status": '["ACTIVE","PAUSED","ARCHIVED","WITH_ISSUES"]',
-            "filtering": f'[{{"field":"campaign.id","operator":"EQUAL","value":"{campaign_id}"}}]',
-            "limit": 500,
-        },
-    )
-    if ads_resp.status_code != 200:
-        raise HTTPException(502, f"Failed to fetch ads: {ads_resp.text}")
-    ads = ads_resp.json().get("data", [])
-
-    return adsets, ads
+    return await meta_provider.fetch_campaign_structure(client, access_token, ad_account_id, campaign_id)
 
 
 async def _download_ad_images(components: list[dict]) -> list[dict]:
@@ -981,7 +1281,7 @@ async def ingest_campaign_structure(
     access_token, ad_account_id = _meta_creds(user_id)
 
     async with httpx.AsyncClient(timeout=30) as client:
-        _adsets, ads = await meta_provider.fetch_campaign_structure(
+        _adsets, ads = await _fetch_campaign_structure(
             client, access_token, ad_account_id, campaign_id
         )
 
@@ -1752,6 +2052,53 @@ def get_bo_results(ad_id: str, user_id: int = Depends(get_current_user_id)):
     return [BOPick(**p) for p in get_latest_bo_run(ad_id, ad_id, BO_DB_PATH)]
 
 
+@app.post("/api/google/bo/run", response_model=BORunResponse)
+def run_google_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_current_user_id)):
+    """
+    Run Bayesian Optimisation for a Google RSA ad and return up to 2 recommended combinations.
+    seed_ad_id and text_source_id should both be the ingested Google ad_id.
+    Falls back to random when fewer than MIN_TRAINING_POINTS scored variants exist.
+    """
+    from bo_pipeline.pipeline import run_bo
+    from bo_pipeline.selector import get_candidate_combinations, get_scored_combinations
+    from bo_pipeline.storage import DB_PATH as BO_DB_PATH, save_bo_run
+
+    db = get_db()
+    ct_row = db.execute(
+        "SELECT creative_type FROM ad_creative_structures "
+        "WHERE ad_id = ? AND platform = 'google' LIMIT 1",
+        (body.seed_ad_id,),
+    ).fetchone()
+    db.close()
+    if ct_row and ct_row["creative_type"] in _UNSUPPORTED_FOR_OPTIMIZATION:
+        raise HTTPException(
+            400,
+            f"Creative type '{ct_row['creative_type']}' is not supported for optimization.",
+        )
+
+    scored = get_scored_combinations(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
+    candidates = get_candidate_combinations(body.text_source_id, body.seed_ad_id, user_id, db_path=BO_DB_PATH)
+    picks = run_bo(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
+
+    if picks:
+        save_bo_run(body.seed_ad_id, body.text_source_id, picks, BO_DB_PATH)
+
+    return BORunResponse(
+        seed_ad_id=body.seed_ad_id,
+        text_source_id=body.text_source_id,
+        picks=[BOPick(**p) for p in picks],
+        scored_count=len(scored),
+        candidate_count=len(candidates),
+    )
+
+
+@app.get("/api/google/bo/results/{ad_id}", response_model=list[BOPick])
+def get_google_bo_results(ad_id: str, user_id: int = Depends(get_current_user_id)):
+    """Return the most recent BO picks for a Google ad."""
+    from bo_pipeline.storage import DB_PATH as BO_DB_PATH, get_latest_bo_run
+    return [BOPick(**p) for p in get_latest_bo_run(ad_id, ad_id, BO_DB_PATH)]
+
+
 # ── Push to Meta ─────────────────────────────────────────────────────────────
 
 class PushAdResult(BaseModel):
@@ -1853,6 +2200,168 @@ async def push_generated_ads(user_id: int = Depends(get_current_user_id)):
     return PushResponse(pushed=pushed, failed=failed, results=results)
 
 
+# ── Push to Google ────────────────────────────────────────────────────────────
+
+class GooglePushAdResult(BaseModel):
+    seed_ad_id: str
+    ad_resource_name: str | None = None
+    error: str | None = None
+
+
+class GooglePushResponse(BaseModel):
+    pushed: int
+    failed: int
+    results: list[GooglePushAdResult] = []
+    note: str | None = None
+
+
+async def _create_google_rsa_ad(
+    user_id: int,
+    seed_ad_id: str,
+    bo_combination: dict,
+    customer_id: str,
+    access_token: str,
+    login_customer_id: str | None,
+) -> str:
+    """Look up ad group + final_url + generated text, create a PAUSED RSA.
+
+    The BO-picked headline and description are placed first (pinned). Returns
+    the resource name of the created ad group ad.
+    """
+    db = get_db()
+    struct_row = db.execute(
+        "SELECT adset_id FROM ad_creative_structures "
+        "WHERE user_id = ? AND ad_id = ? AND platform = 'google' LIMIT 1",
+        (user_id, seed_ad_id),
+    ).fetchone()
+    final_url_row = db.execute(
+        "SELECT value FROM ad_creative_structures "
+        "WHERE user_id = ? AND ad_id = ? AND slot = 'final_url' AND slot_index = 0 LIMIT 1",
+        (user_id, seed_ad_id),
+    ).fetchone()
+    gen_rows = db.execute(
+        """
+        SELECT gs.slot, gs.value
+        FROM generated_ad_slots gs
+        JOIN generated_ads ga ON ga.id = gs.generated_ad_id
+        WHERE ga.source_ad_id = ?
+        ORDER BY gs.slot, gs.slot_index
+        """,
+        (seed_ad_id,),
+    ).fetchall()
+    db.close()
+
+    if not struct_row:
+        raise ValueError(f"No ingested structure for ad {seed_ad_id}")
+
+    ad_group_id = struct_row["adset_id"]
+    final_url = final_url_row["value"] if final_url_row else ""
+    if not final_url:
+        raise ValueError(f"No final_url in ingested structure for ad {seed_ad_id}")
+
+    bo_headline = bo_combination.get("headline", "")
+    bo_description = bo_combination.get("description", "")
+
+    extra_headlines = [
+        r["value"] for r in gen_rows
+        if r["slot"] == "headline" and r["value"] != bo_headline
+    ][:14]
+    extra_descriptions = [
+        r["value"] for r in gen_rows
+        if r["slot"] == "description" and r["value"] != bo_description
+    ][:3]
+
+    headlines = ([bo_headline] if bo_headline else []) + extra_headlines
+    descriptions = ([bo_description] if bo_description else []) + extra_descriptions
+
+    if len(headlines) < 3 or len(descriptions) < 2:
+        raise ValueError(
+            f"Not enough variants: {len(headlines)} headlines, {len(descriptions)} descriptions "
+            f"(need ≥3 and ≥2). Generate RSA text before pushing."
+        )
+
+    api_version = os.getenv("GOOGLE_ADS_API_VERSION", "")
+    developer_token = os.getenv("GOOGLE_DEVELOPER_TOKEN", "")
+
+    return await google_ads_api.create_rsa(
+        customer_id=customer_id,
+        access_token=access_token,
+        developer_token=developer_token,
+        api_version=api_version,
+        ad_group_id=ad_group_id,
+        headlines=headlines,
+        descriptions=descriptions,
+        final_url=final_url,
+        login_customer_id=login_customer_id,
+    )
+
+
+@app.post("/api/google/push", response_model=GooglePushResponse)
+async def push_google_ads(user_id: int = Depends(get_current_user_id)):
+    """Push all unpushed BO-recommended RSA configurations to Google Ads (PAUSED)."""
+    try:
+        access_token, customer_id, login_customer_id = await _google_creds(user_id)
+    except HTTPException:
+        return GooglePushResponse(pushed=0, failed=0, note="Google Ads not connected")
+
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT bs.id, bs.seed_ad_id, bs.combination
+        FROM bo_selections bs
+        INNER JOIN (
+            SELECT seed_ad_id, MAX(created_at) AS max_ts
+            FROM bo_selections
+            WHERE pick_rank = 1 AND google_ad_resource_name IS NULL
+            GROUP BY seed_ad_id
+        ) latest ON bs.seed_ad_id = latest.seed_ad_id AND bs.created_at = latest.max_ts
+        WHERE bs.pick_rank = 1 AND bs.google_ad_resource_name IS NULL
+          AND bs.seed_ad_id IN (
+              SELECT DISTINCT ad_id FROM ad_creative_structures
+              WHERE user_id = ? AND platform = 'google'
+          )
+        """,
+        (user_id,),
+    ).fetchall()
+    db.close()
+
+    if not rows:
+        return GooglePushResponse(pushed=0, failed=0)
+
+    pushed = 0
+    failed = 0
+    results: list[GooglePushAdResult] = []
+
+    for row in rows:
+        seed_ad_id = row["seed_ad_id"]
+        try:
+            combination = json.loads(row["combination"])
+            resource_name = await _create_google_rsa_ad(
+                user_id=user_id,
+                seed_ad_id=seed_ad_id,
+                bo_combination=combination,
+                customer_id=customer_id,
+                access_token=access_token,
+                login_customer_id=login_customer_id,
+            )
+            db = get_db()
+            db.execute(
+                "UPDATE bo_selections SET google_ad_resource_name = ? WHERE id = ?",
+                (resource_name, row["id"]),
+            )
+            db.commit()
+            db.close()
+            pushed += 1
+            results.append(GooglePushAdResult(seed_ad_id=seed_ad_id, ad_resource_name=resource_name))
+        except Exception as exc:
+            logger.warning("google push: seed_ad %s failed: %s", seed_ad_id, exc)
+            failed += 1
+            results.append(GooglePushAdResult(seed_ad_id=seed_ad_id, error=str(exc)))
+
+    logger.info("google push: done — pushed=%d failed=%d", pushed, failed)
+    return GooglePushResponse(pushed=pushed, failed=failed, results=results)
+
+
 # ── Ad text generation routes ─────────────────────────────────────────────────
 
 class GeneratedAdSlot(BaseModel):
@@ -1908,6 +2417,69 @@ async def generate_text_ads(
         seed_components=seed_components,
         n_per_slot=10,
         source_ad_id=seed_ad_id,
+    )
+
+    slots = get_generated_ad(generated_ad_id)
+    return GenerateTextResponse(
+        generated_ad_id=generated_ad_id,
+        source_ad_id=seed_ad_id,
+        slots=[GeneratedAdSlot(**s) for s in slots],
+    )
+
+
+_UNSUPPORTED_FOR_OPTIMIZATION = frozenset({"shopping", "unknown"})
+
+
+@app.post("/api/google/generate/text/{campaign_id}", response_model=GenerateTextResponse)
+async def generate_google_text_ads(
+    campaign_id: str,
+    seed_ad_id: str = Query(None),
+    user_id: int = Depends(get_current_user_id),
+):
+    """Generate 10 new RSA headline and description variants from an ingested Google ad."""
+    from ad_text_generation.pipeline import run_text_pipeline
+    from ad_text_generation.storage import get_generated_ad
+
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT ad_id, slot, slot_index, value, creative_type
+        FROM ad_creative_structures
+        WHERE user_id = ? AND campaign_id = ? AND platform = 'google'
+        ORDER BY ad_id, slot, slot_index
+        """,
+        (user_id, campaign_id),
+    ).fetchall()
+    db.close()
+
+    if not rows:
+        raise HTTPException(404, "No ingested Google creative structure found for this campaign. Run Ingest first.")
+
+    available_ids = list(dict.fromkeys(r["ad_id"] for r in rows))
+    if seed_ad_id and seed_ad_id not in available_ids:
+        raise HTTPException(400, f"seed_ad_id not found in this campaign. Available: {available_ids}")
+    if not seed_ad_id:
+        seed_ad_id = available_ids[0]
+
+    seed_rows = [r for r in rows if r["ad_id"] == seed_ad_id]
+    if seed_rows:
+        creative_type = seed_rows[0]["creative_type"]
+        if creative_type in _UNSUPPORTED_FOR_OPTIMIZATION:
+            raise HTTPException(
+                400,
+                f"Creative type '{creative_type}' is not supported for text optimization.",
+            )
+
+    seed_components = [
+        {"slot": r["slot"], "slot_index": r["slot_index"], "value": r["value"]}
+        for r in seed_rows
+    ]
+
+    generated_ad_id = await run_text_pipeline(
+        seed_components=seed_components,
+        n_per_slot=10,
+        source_ad_id=seed_ad_id,
+        platform="google",
     )
 
     slots = get_generated_ad(generated_ad_id)

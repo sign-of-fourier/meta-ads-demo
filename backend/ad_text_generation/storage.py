@@ -105,6 +105,21 @@ def get_generated_ad(generated_ad_id: int, db_path: Path = DB_PATH) -> list[dict
     return [dict(r) for r in rows]
 
 
+def get_generated_slots_for_source(source_ad_id: str, db_path: Path = DB_PATH) -> list[dict]:
+    """Return all slot rows across all generated ads with the given source_ad_id."""
+    c = _conn(db_path)
+    rows = c.execute(
+        """SELECT gs.slot, gs.slot_index, gs.value
+           FROM generated_ad_slots gs
+           JOIN generated_ads ga ON ga.id = gs.generated_ad_id
+           WHERE ga.source_ad_id = ?
+           ORDER BY gs.slot, gs.slot_index""",
+        (source_ad_id,),
+    ).fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
 def get_generated_ad_meta(generated_ad_id: int, db_path: Path = DB_PATH) -> dict | None:
     """Return the generated_ads header row."""
     c = _conn(db_path)
