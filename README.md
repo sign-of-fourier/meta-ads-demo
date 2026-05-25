@@ -3,7 +3,7 @@
 Welcome to **AdStac.kr** — an experimentation layer built for performance-focused media buyers.
 
 We take the best practices in A/B testing and automate them, freeing you up to focus on the
-important stuff: strategy, creative direction, and scale. Connect your Meta Ads account,
+important stuff: strategy, creative direction, and scale. Connect your Meta or Google Ads account,
 and AdStac.kr handles the rest — ingesting your campaigns, generating image and copy variants,
 scoring them with AI, and surfacing the next best combination to test via Bayesian Optimisation.
 No more spreadsheet-driven split tests. Just signal.
@@ -28,7 +28,7 @@ No more spreadsheet-driven split tests. Just signal.
 - [Image generation pipeline](backend/ad_generation/README.md) — generate FLUX image variants
 - [Text generation pipeline](backend/ad_text_generation/README.md) — generate copy variants via GPT-4o
 - [Combination embeddings](backend/ad_combination_embeddings/README.md) — embed all text slot combinations for BO
-- [Bayesian Optimisation](backend/bo_pipeline/BO.md) — GPR kernel, length scale, EI acquisition, fantasy batch step
+- [Bayesian Optimisation](backend/bo_pipeline/README.md) — GPR kernel, length scale, EI acquisition, fantasy batch step
 
 ---
 
@@ -37,11 +37,13 @@ No more spreadsheet-driven split tests. Just signal.
 ```
 frontend/ (React + Vite, port 5173)
   └── calls ──▶ backend/ (FastAPI, port 8000)
-                   ├── providers/          Meta API abstraction (live / masking / demo)
+                   ├── providers/          Platform API abstraction layer
+                   │     ├── Meta:   LiveMetaProvider / MaskingMetaProvider / DemoMetaProvider
+                   │     └── Google: GooglePlatformProvider / GoogleMaskingProvider / GoogleDemoProvider
                    └── AI module suite (standalone, independently testable)
                          ├── embeddings/                Embed ingested ads (image + text)
                          ├── ad_generation/             Generate image variants via FLUX
-                         ├── ad_text_generation/        Generate text variants via GPT-4o
+                         ├── ad_text_generation/        Generate text variants via GPT-4o (Meta + Google RSA)
                          ├── ad_combination_embeddings/ Embed all text slot combinations
                          ├── ad_embedding_combiner/     Fuse text + image vectors for GPR
                          └── bo_pipeline/               GPR-based Bayesian Optimisation
@@ -101,13 +103,15 @@ See [`backend/ad_generation/README.md`](backend/ad_generation/README.md) for ful
 
 ### 3. Text generation pipeline (`backend/ad_text_generation/`)
 
-Generates N new copy variants per text slot (headline, primary_text, description) from
-a seed ad using GPT-4o, then assembles them with optional image URLs into a dynamic ad
-component list and stores the result.
+Generates N new copy variants per text slot from a seed ad using GPT-4o, then assembles
+them with optional image URLs into a dynamic ad component list and stores the result.
+Platform-aware: Meta generates `headline`, `primary_text`, `description`, `cta`; Google RSA
+generates `headline` and `description` only (30-char / 90-char limits).
 
 ```python
 from ad_text_generation.pipeline import run_text_pipeline
-generated_ad_id = await run_text_pipeline(seed_components, n_per_slot=5)
+generated_ad_id = await run_text_pipeline(seed_components, n_per_slot=5, platform="meta")
+generated_ad_id = await run_text_pipeline(seed_components, n_per_slot=10, platform="google")
 ```
 
 See [`backend/ad_text_generation/README.md`](backend/ad_text_generation/README.md) for full documentation.
@@ -130,29 +134,35 @@ See [`backend/ad_combination_embeddings/README.md`](backend/ad_combination_embed
 
 Pure function module. Truncates text and image embeddings to fixed dimensions
 (`TEXT_DIM=128`, `IMAGE_DIM=128`) and concatenates them into a single feature vector
-for the GPR. Separated because the fusion strategy is expected to evolve.
+for the GPR. Handles `image_vec=None` (e.g. Google RSA ads) by zero-padding the image
+half — the BO pipeline works across both platforms without modification.
 
 ```python
 from ad_embedding_combiner import combine
 vec = combine(text_vector, image_vector)   # shape: (256,)
+vec = combine(text_vector, None)           # shape: (256,), image half = zeros
 ```
 
 ### 6. Bayesian Optimisation pipeline (`backend/bo_pipeline/`)
 
-Fits a GPR on scored image variants, then selects two text+image combinations to test
-next — one via Expected Improvement, one via a fantasy (batch BO) second pick. Operates
-strictly per-ad: scored variants and text candidates must share the same seed ad.
+Selects two text+image combinations to test next. Operates strictly per-ad: scored
+variants and text candidates must share the same seed ad.
 
 ```python
 from bo_pipeline import run_bo, save_bo_run
 picks = run_bo(seed_ad_id, text_source_id, user_id)
-# picks: [{combination_key, combination, selection_type='ei'|'fantasy', ei_score, gpr_mean, gpr_std}, ...]
+# picks: [{combination_key, combination, selection_type, ei_score, gpr_mean, gpr_std}, ...]
 save_bo_run(seed_ad_id, text_source_id, picks)
 ```
 
+**Two methods:**
+- **Modal GP q-EI** (default, `method="modal"`): PCA-reduces embeddings to 64 dims, calls a Modal serverless GP service for proper batch q-EI selection. Requires `MODAL_BO_API_URL` to be set; silently falls back to local when unset or on API failure.
+- **Local GPR + fantasy** (`method="local"`): fits a local sklearn GPR, picks highest EI, then applies a fantasy step for the second pick.
+
 Falls back to random selection when fewer than 2 scored observations exist.
 
-**HTTP endpoints:** `POST /api/bo/run` runs BO and persists picks; `GET /api/bo/results/{ad_id}` returns latest picks.
+**HTTP endpoints (Meta):** `POST /api/bo/run` runs BO and persists picks; `GET /api/bo/results/{ad_id}` returns latest picks.
+**HTTP endpoints (Google):** `POST /api/google/bo/run`; `GET /api/google/bo/results/{ad_id}` — identical pipeline, different route prefix.
 
 **Seeding test data:** `backend/seed_bo.py` inserts synthetic scored observations for local testing.
 ```bash
@@ -165,11 +175,14 @@ python seed_bo.py --ad-id <ad_id> --user-id <user_id> --campaign-id <id> --n 5
 
 - Python 3.11+
 - Node.js 18+
-- A Meta Developer App with **Marketing API** enabled and an OAuth redirect URI registered
+- A Meta Developer App with **Marketing API** enabled and an OAuth redirect URI registered *(Meta integration)*
+- A Google Cloud OAuth 2.0 client and a Google Ads developer token *(Google integration)*
 - OpenAI API key (text embeddings)
 - Azure AI Inference credentials (image embeddings — separate resource from Azure OpenAI)
 - Azure OpenAI credentials (image analysis, text generation, scoring, QA)
 - deAPI credentials (FLUX image generation)
+
+Both Meta and Google integrations are optional — the app runs with either, both, or neither connected.
 
 ### API keys at a glance
 
@@ -179,40 +192,16 @@ python seed_bo.py --ad-id <ad_id> --user-id <user_id> --campaign-id <id> --n 5
 | Azure AI Inference | `AZURE_INFERENCE_KEY` | `AZURE_EMBEDDING_ENDPOINT` | Image embeddings (`embed-v-4-0`) |
 | Azure OpenAI | `AZURE_OPENAI_KEY` | `AZURE_OPENAI_ENDPOINT` | Ad analysis, text gen, scoring |
 | deAPI | `DEAPI_API_KEY` | — | FLUX img2img generation |
-| Meta | `META_APP_ID` + `META_APP_SECRET` | — | Marketing API |
+| Meta | `META_APP_ID` + `META_APP_SECRET` | — | Meta Marketing API |
+| Google | `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` + `GOOGLE_DEVELOPER_TOKEN` | — | Google Ads API |
 
-These are **four separate accounts/resources**. Azure AI Inference and Azure OpenAI use different endpoints and keys even if they share an Azure subscription.
+Azure AI Inference and Azure OpenAI are **different resources** with different endpoints and keys, even if they share an Azure subscription.
 
 ---
 
 ## Setup
 
-### Backend
-
-```bash
-cd backend
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env
-# Required: META_APP_ID, META_APP_SECRET, META_REDIRECT_URI, JWT_SECRET
-# AI modules: AZURE_INFERENCE_KEY, AZURE_OPENAI_KEY, AZURE_OPENAI_ENDPOINT, DEAPI_API_KEY
-
-python main.py   # → http://localhost:8000
-```
-
-### Frontend
-
-```bash
-cd frontend
-npm install
-cp .env.example .env   # VITE_API_URL defaults to http://localhost:8000
-npm run dev            # → http://localhost:5173
-```
-
-### Tests
-
-See [`TEST.md`](TEST.md) for the full test catalog, individual test descriptions, and manual curl tests for the masking layer.
+See [`DEV_QUICKSTART.md`](DEV_QUICKSTART.md) for the full environment setup, server startup, curl workflow, and BO seeding guide. See [`TEST.md`](TEST.md) for the test catalog.
 
 ---
 
@@ -224,7 +213,14 @@ See [`TEST.md`](TEST.md) for the full test catalog, individual test descriptions
 2. Navigate to **Settings** → **Connect Meta Ads Account**
 3. Approve on Meta's OAuth screen → redirected with `?meta_connected=true`
 
-### Campaigns
+### Connect Google Ads
+
+1. Navigate to **Settings** → **Connect Google Ads Account**
+2. Complete Google's OAuth consent screen
+3. If your Google account has access to multiple ad accounts, you'll see a picker — select the account to connect (or enter a customer ID manually for test accounts)
+4. Optionally enter a **Login Customer ID** if connecting through an MCC manager account
+
+### Meta Campaigns
 
 The Campaigns page shows live data from Meta. Each campaign row supports:
 
@@ -234,8 +230,20 @@ The Campaigns page shows live data from Meta. Each campaign row supports:
   - Creative slots per ad (headline, primary text, description, image)
   - Lifecycle badge: `active`, `inactive`, or `no longer in Meta`
   - **Suggestions panel** — pending/confirmed suggestions with Confirm Create button
+- **Static Text Ads** — generates 10 copy variants per slot (headline, primary_text, description, cta) via GPT-4o
+- **Dynamic Ad (AI Images)** — starts an async job that generates 4 AI image variants + 4 text variants per slot, fires embeddings, and stores the result as a new dynamic ad locally
+- **Get Recommendations** — runs Bayesian Optimisation and surfaces 2 text+image combinations to test next
 
-### Preview & Ingest
+### Google Campaigns
+
+The **Google Ads** page (separate from Meta) shows your Google Ads campaigns with 7-day metrics. Each campaign row supports:
+
+- **Ingest / Reingest** — ingests creative structure from Google Ads API into `ad_creative_structures` with `platform='google'`; normalizes RSA, Responsive Display, Video, Performance Max, and Shopping creatives
+- **Generate RSA Text** — generates 10 headline + description variants (with Google character limits) for RSA ads
+- **Get Recommendations** — runs BO over text combinations and surfaces 2 RSA variants to push
+- **Sync** (header button) — pushes all unpushed BO picks to Google Ads as new PAUSED RSA ads
+
+### Preview & Ingest (Meta)
 
 Click **Preview & Ingest** to preview campaigns live from Meta, then confirm to persist
 metric snapshots to `ad_insights`.
@@ -258,17 +266,33 @@ The new static ad is always created **PAUSED** — activate manually in Meta Ads
 
 All routes except auth require `Authorization: Bearer <jwt>`.
 
-### Auth
+### Auth — common
 
 | Method | Path | Description |
 |---|---|---|
 | POST | `/auth/signup` | Create account, returns JWT |
 | POST | `/auth/login` | Login, returns JWT |
+| GET | `/me` | Current user's email and tier |
+
+### Auth — Meta
+
+| Method | Path | Description |
+|---|---|---|
 | GET | `/me/meta-status` | Check Meta OAuth connection |
 | GET | `/auth/meta/login-url` | Start Meta OAuth flow |
 | GET | `/auth/meta/callback` | Meta OAuth callback (browser redirect) |
 
-### Campaigns
+### Auth — Google
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/me/google-status` | Check Google Ads connection (`{connected, customer_id, customer_name}`) |
+| GET | `/auth/google/login-url` | Start Google OAuth flow |
+| GET | `/auth/google/callback` | Google OAuth callback — redirects to account picker |
+| GET | `/auth/google/pending/{key}` | Fetch accessible accounts for the picker |
+| POST | `/auth/google/select-account` | Save chosen account and login customer ID |
+
+### Meta — Campaigns
 
 | Method | Path | Description |
 |---|---|---|
@@ -277,16 +301,16 @@ All routes except auth require `Authorization: Bearer <jwt>`.
 | POST | `/api/campaigns/{id}/resume` | Resume a campaign |
 | GET | `/api/campaigns/{id}/history` | Stored metric snapshots (`?days=30`) |
 
-### Ingest
+### Meta — Ingest
 
 | Method | Path | Description |
 |---|---|---|
 | GET | `/api/ingest/preview` | Preview campaigns + ads without saving |
 | POST | `/api/ingest` | Save campaign metric snapshots to `ad_insights` |
-| POST | `/api/ingest/structure/{campaign_id}` | Normalize + persist creative structure |
+| POST | `/api/ingest/structure/{campaign_id}` | Normalize + persist creative structure; fires embeddings |
 | GET | `/api/structure/{campaign_id}` | Read persisted structure grouped by ad |
 
-### Suggestions
+### Meta — Suggestions
 
 | Method | Path | Description |
 |---|---|---|
@@ -294,20 +318,64 @@ All routes except auth require `Authorization: Bearer <jwt>`.
 | POST | `/api/suggestions` | Store a suggested configuration |
 | POST | `/api/suggestions/{id}/confirm` | Confirm create or replace |
 
-### Bayesian Optimisation
+### Meta — Ad Generation
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/bo/run` | Run BO, return and persist up to 2 picks |
-| GET | `/api/bo/results/{ad_id}` | Latest BO picks for an ad |
+| POST | `/api/generate/text/{campaign_id}` | Generate 10 text variants per slot (synchronous) |
+| POST | `/api/generate/dynamic/{campaign_id}` | Start async job: 4×4 text + 4 AI images + embeddings |
+| GET | `/api/generate/dynamic/status/{job_id}` | Poll job status; returns slots + image_urls when complete |
+| POST | `/api/push` | Push unpushed generated ads to Meta as PAUSED static ads |
+
+### Meta — Bayesian Optimisation
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/bo/run` | Run BO on Meta ad, return and persist up to 2 picks |
+| GET | `/api/bo/results/{ad_id}` | Latest BO picks for a Meta ad |
+
+### Google — Campaigns
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/google/campaigns` | Live campaigns + 7d metrics from Google Ads |
+
+### Google — Ingest
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/google/ingest/structure/{campaign_id}` | Normalize + persist Google creative structure; fires embeddings |
+| GET | `/api/google/structure/{campaign_id}` | Read persisted Google structure grouped by ad |
+
+### Google — Text Generation
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/google/generate/text/{campaign_id}` | Generate 10 RSA headline + description variants (`?seed_ad_id=` optional) |
+
+### Google — Bayesian Optimisation
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/google/bo/run` | Run BO on Google RSA ad, return and persist up to 2 picks |
+| GET | `/api/google/bo/results/{ad_id}` | Latest BO picks for a Google ad |
+
+### Google — Push
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/google/push` | Push unpushed BO picks to Google Ads as PAUSED RSA ads |
 
 ### Other
 
 | Method | Path | Description |
 |---|---|---|
 | GET | `/api/ads` | Live ad creatives from Meta |
+| GET | `/api/ads/local` | All locally stored ads (ingested + generated), grouped by ad_id with full slot data |
+| DELETE | `/api/ads/local/{ad_id}` | Delete a local ad and its embeddings; Meta-sourced ads reappear on next sync |
 | GET | `/api/explore` | Raw Meta data (campaigns → adsets → ads) for debugging |
-| GET | `/images/{filename}` | Serve generated images (static mount) |
+| GET | `/images/{filename}` | Serve AI-generated images (static mount) |
+| GET | `/ad-images/{filename}` | Serve downloaded Meta CDN images (static mount) |
 
 ---
 
@@ -315,26 +383,45 @@ All routes except auth require `Authorization: Bearer <jwt>`.
 
 For staging demos without spending real budget:
 
+### Meta masking
+
 | Env var | Effect |
 |---|---|
-| `APP_MODE=demo` | Fully synthetic data — no Meta API calls |
+| `APP_MODE=demo` | Fully synthetic Meta data — no Meta API calls |
 | `MASK_MODE=selective\|full` | Selectively override fields (status, budgets, metrics) |
 | `MASK_STATUS=true` | Force all campaign statuses → ACTIVE |
 | `MASK_METRICS=true` | Synthesize metrics for low-delivery campaigns |
 | `MASK_PAUSE_RESUME=true` | pause/resume → no-op (returns success) |
 | `METRIC_PROFILE=healthy\|stable\|weak` | Controls synthetic metric magnitude |
 
-See [`STAGING_POLICY.md`](STAGING_POLICY.md) for what is and isn't safe to run against live accounts, and `CLAUDE.md` for the full masking variable reference.
+### Google masking
+
+| Env var | Effect |
+|---|---|
+| `GOOGLE_APP_MODE=demo` | Fully synthetic Google data — no Google API calls (3 fixture campaigns: RSA, Display, pMax) |
+| `GOOGLE_MASK_MODE=selective\|full` | Selectively override Google campaign fields |
+| `GOOGLE_MASK_STATUS=true` | Force Google campaign statuses → ACTIVE |
+| `GOOGLE_MASK_BUDGETS=true` | Replace daily budgets with deterministic synthetic values |
+| `GOOGLE_MASK_METRICS=true` | Synthesize metrics for low-delivery Google campaigns |
+| `GOOGLE_MASK_PAUSE_RESUME=true` | pause/resume → no-op |
+| `GOOGLE_METRIC_PROFILE=healthy\|stable\|weak` | Controls synthetic Google metric magnitude |
+
+`APP_MODE=demo` enables demo mode for **both** platforms simultaneously. Use platform-specific vars to demo one platform with the other live.
+
+See [`STAGING_POLICY.md`](STAGING_POLICY.md) for what is and isn't safe to run against live accounts, and `CLAUDE.md` for the full variable reference.
 
 ---
 
 ## Notes
 
 - **Auth:** Minimal JWT, 24h expiry. No email verification or rate limiting.
-- **Meta token:** Short-lived user token, no refresh logic.
+- **Meta token:** Short-lived user token — no refresh logic. Re-connect via Settings when it expires.
+- **Google token:** OAuth2 refresh token is stored and refreshed automatically on every API call.
 - **SQLite:** `backend/app.db` is gitignored. Delete it to reset all data.
-- **AI modules:** Embedding pipeline and BO are wired into HTTP routes. Ad generation, text generation, and combination embedding modules are standalone — runnable directly or callable from Python.
-- **Static ad images:** The clone flow passes image values as hosted URLs. Creatives stored only as image hashes (not URLs) will fail at Meta creative creation.
+- **AI modules:** All generation modules are wired into HTTP routes. See `CLAUDE.md` for the full route list. Modules are also independently runnable — no running server required.
+- **Static ad images:** The Meta clone flow passes image values as hosted URLs. Creatives stored only as image hashes (not URLs) will fail at Meta creative creation.
+- **New ads are always PAUSED:** Both Meta (`POST /api/push`) and Google (`POST /api/google/push`) create ads in PAUSED state. Activate manually in the respective Ads Manager.
+- **Google RSA BO:** Operates on text combinations only — no image dimension. The combiner zero-pads the image half, so the BO pipeline code is identical for both platforms.
 
 For schema details see [`SCHEMAS.md`](SCHEMAS.md).
 For running on EC2/ngrok see [`NGROK_SETUP.md`](NGROK_SETUP.md).

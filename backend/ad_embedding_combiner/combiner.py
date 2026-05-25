@@ -1,19 +1,23 @@
 """
 Combines text and image embedding vectors into a single feature vector for BO/GPR.
 
-Strategy: truncate each modality to a fixed dimension, then concatenate.
-If a vector is shorter than the target dim it is zero-padded on the right.
+Strategy: pass the full embedding from each modality (no truncation), then
+concatenate. PCA in the BO pipeline reduces this to the final working dimension.
 
-TEXT_DIM and IMAGE_DIM are the only constants that need to change when tuning
-the feature representation — everything downstream reads output_dim().
+TEXT_DIM and IMAGE_DIM must match the actual embedding model output dimensions:
+  - TEXT_DIM=1536  matches text-embedding-3-small (OpenAI)
+  - IMAGE_DIM=1536 matches embed-v-4-0 (Azure AI Inference)
+
+Changing these constants is the only knob needed when switching embedding models.
+Everything downstream reads output_dim().
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-TEXT_DIM: int = 128
-IMAGE_DIM: int = 128
+TEXT_DIM: int = 1536
+IMAGE_DIM: int = 1536
 
 
 def truncate_pad(vec: np.ndarray, dim: int) -> np.ndarray:

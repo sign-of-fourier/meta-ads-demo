@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Tuple
 import httpx
 
 from .mask_policy import MaskPolicy
-from .meta_provider import MetaProvider
+from .meta_provider import PlatformProvider
 
 logger = logging.getLogger(__name__)
 
@@ -90,15 +90,22 @@ def _synthetic_budget(campaign_id: str) -> int:
     return _BUDGET_SEEDS[idx]
 
 
-class MaskingMetaProvider(MetaProvider):
+class MaskingMetaProvider(PlatformProvider):
     """
     Wraps a live provider and selectively overrides fields according to MaskPolicy.
     Real API calls are made first; masks are applied on the way out.
     """
 
-    def __init__(self, live_provider: MetaProvider, policy: MaskPolicy) -> None:
+    def __init__(self, live_provider: PlatformProvider, policy: MaskPolicy) -> None:
         self._live = live_provider
         self._policy = policy
+
+    @property
+    def platform_name(self) -> str:
+        return self._live.platform_name
+
+    def normalize_creative(self, ad: dict) -> tuple[str, list[dict]]:
+        return self._live.normalize_creative(ad)
 
     # ------------------------------------------------------------------
     # fetch_campaigns_and_insights

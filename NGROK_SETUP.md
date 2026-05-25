@@ -24,10 +24,19 @@ Meta OAuth requires HTTPS for redirect URIs. ngrok provides that tunnel so you d
 Follow ngrok's quickstart at https://dashboard.ngrok.com/get-started/setup to install and run `ngrok config add-authtoken <token>`.
 
 ### Start the tunnel
+
+**Preferred — use `start.sh`** (starts backend + frontend + ngrok together):
 ```bash
-ngrok http 5173
+./start.sh              # prod: ngrok on port 5173
+./start.sh staging      # staging: ngrok on port 5174
 ```
-Point ngrok at **port 5173** (Vite), not 8000. Vite's proxy handles forwarding to the backend internally — the browser never needs to reach port 8000 directly.
+
+**Manual fallback:**
+```bash
+ngrok http 5173         # prod
+ngrok http 5174         # staging
+```
+Point ngrok at the **Vite port**, not 8000. Vite's proxy handles forwarding to the backend internally — the browser never needs to reach port 8000 directly.
 
 ### AWS VPC / Security Groups
 If ngrok fails to establish a tunnel from EC2, your VPC security group may be blocking outbound traffic. ngrok connects outbound on port 443 (or 80). Fix:
@@ -56,14 +65,17 @@ For browser visits, just click through the interstitial once per session. It won
 server: {
   host: "0.0.0.0",   // bind to all interfaces (needed if you also want direct EC2 IP access)
                       // change to "127.0.0.1" if only using ngrok (more secure)
-  port: 5173,
+  port: 5173,         // overridable via VITE_PORT env var
   allowedHosts: ["<your-ngrok-subdomain>.ngrok-free.dev"],  // must be updated when ngrok URL changes
   proxy: {
-    "/api":          "http://localhost:8000",
+    "/api":          "http://localhost:8000",  // overridable via VITE_BACKEND_URL env var
     "/auth/signup":  "http://localhost:8000",
     "/auth/login":   "http://localhost:8000",
     "/auth/meta":    "http://localhost:8000",
+    "/auth/google":  "http://localhost:8000",
     "/me":           "http://localhost:8000",
+    "/images":       "http://localhost:8000",  // serves generated images
+    "/ad-images":    "http://localhost:8000",  // serves downloaded Meta CDN images
   },
   headers: {
     "ngrok-skip-browser-warning": "true",  // bypasses ngrok free tier interstitial for API calls
@@ -113,14 +125,23 @@ Go to https://developers.facebook.com → your app, and update these fields:
 
 Free tier ngrok subdomains change every time you restart ngrok. Go through this list:
 
+### Frontend + backend config
 - [ ] Update `allowedHosts` in `frontend/vite.config.js`
-- [ ] Update `META_REDIRECT_URI` in `backend/.env`
 - [ ] Update `FRONTEND_URL` in `backend/.env`
+- [ ] Restart the Vite dev server (`npm run dev`)
+- [ ] Restart the FastAPI backend (`python main.py`)
+
+### Meta OAuth
+- [ ] Update `META_REDIRECT_URI` in `backend/.env`
 - [ ] Update **App Domains** in Meta Developer App
 - [ ] Update **Site URL** in Meta Developer App
 - [ ] Update **Valid OAuth Redirect URIs** in Meta → Facebook Login → Settings
-- [ ] Restart the Vite dev server (`npm run dev`)
-- [ ] Restart the FastAPI backend (`python main.py`)
+
+### Google OAuth
+- [ ] Update `GOOGLE_REDIRECT_URI` in `backend/.env`
+- [ ] Go to [Google Cloud Console](https://console.cloud.google.com) → APIs & Services → Credentials → your OAuth 2.0 client
+- [ ] Under **Authorized redirect URIs**, replace the old ngrok URL with the new one: `https://<your-ngrok-subdomain>.ngrok-free.dev/auth/google/callback`
+- [ ] Save
 
 To avoid this churn, consider upgrading to a paid ngrok plan which gives you a fixed custom subdomain.
 

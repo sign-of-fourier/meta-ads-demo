@@ -21,37 +21,27 @@ Higher score = better ad (0–10 scale after inversion from the fine-tuned score
 
 ## Feature space
 
-Each combination is represented as a **256-dimensional float32 vector**:
+Each combination is represented as a **3072-dimensional float32 vector**:
 
 ```
-[text_128 | image_128]
+[text_1536 | image_1536]
 ```
 
-- `text_128`: first 128 dimensions of the OpenAI text embedding (1536-dim originally)
-- `image_128`: first 128 dimensions of the Azure image embedding, or zeros if no image
-  embedding is available for that variant
+- `text_1536`: full OpenAI text-embedding-3-small output (1536-dim)
+- `image_1536`: full Azure AI Inference embed-v-4-0 output (1536-dim), or zeros if no
+  image embedding is available for that variant (e.g. Google RSA ads)
 
-Truncation is done by `ad_embedding_combiner/combiner.py` (`TEXT_DIM=128`, `IMAGE_DIM=128`).
+Concatenation is done by `ad_embedding_combiner/combiner.py` (`TEXT_DIM=1536`, `IMAGE_DIM=1536`).
+No truncation is applied — the full information from both modalities is preserved.
 
-### Why 128 + 128 and not the full vectors?
+### Dimensionality reduction via PCA
 
-This is primarily a **computational decision**, not a claim that the remaining dimensions
-carry no information. GPR inference scales as O(n³) in the number of training points, and
-the squared-exponential (RBF) kernel's hyperparameter optimisation (marginal likelihood
-maximisation) becomes expensive as dimensionality grows. At 256 dimensions with the small
-training sets we operate with (typically 5–20 scored variants), fitting is fast and the
-length scale is identifiable.
+The 3072-dim vectors are PCA-reduced at BO inference time before being passed to the GP.
+`MODAL_BO_PCA_DIMS` (default 64) controls the target dimension. PCA is fit on the union of
+scored observations and candidate vectors so the projection captures the full space.
 
-Underdetermination is less of a concern here than it might appear, because **the RBF
-kernel implicitly operates in an infinite-dimensional feature space** (via the kernel
-trick). The effective complexity of the function class is controlled by the learned length
-scale, not by the input dimension. Truncating to 128 dimensions does discard information
-encoded in the tail of each embedding, but the leading dimensions of both OpenAI and Azure
-embeddings capture the bulk of semantic variance by construction (their training objectives
-push the most discriminative signal into early dimensions).
-
-If training set size grows substantially (100+ scored variants), revisiting the truncation
-point or switching to a sparse GPR approximation would be reasonable.
+For the local GPR fallback path, PCA is applied inside `_run_local_bo` via the same
+`fit_pca` helper used by the Modal path — both paths see identically-shaped inputs.
 
 ---
 
@@ -136,11 +126,30 @@ been scored.
 
 ---
 
+## Candidate pool
+
+The candidate pool is a **cross-product of text combinations × image embeddings**:
+
+- Text dimension: all rows in `ad_text_combination_embeddings` for `text_source_id` (N combinations)
+- Image dimension: all rows in `ad_image_embeddings` for the seed ad (M image slots)
+- Total candidates: N × M (e.g., 64 text combos × 4 images = 256)
+
+Falls back to the seed ad's single `image_vector` from `ad_embeddings` if no per-image embeddings exist (e.g., embed step not yet run or ad has no URL image slots).
+
+Each candidate's `combination` dict includes `image_url` (the local `/ad-images/...` URL) when a per-image embedding is present, allowing the frontend to display the recommended image alongside text slots.
+
+Compound key format:
+```json
+{"combo": {"headline": "...", "primary_text": "..."}, "image_slot": 0}
+```
+
+---
+
 ## Files
 
 | File | Role |
 |---|---|
 | `gpr.py` | Pure numpy/sklearn — `fit_gpr`, `predict_with_std`, `expected_improvement`, `fantasize` |
-| `selector.py` | DB access only — loads scored variants and candidate combinations as numpy arrays |
+| `selector.py` | DB access only — loads scored variants and candidate combinations as numpy arrays; cross-products text × image embeddings |
 | `pipeline.py` | Orchestration — calls selector → gpr → returns picks |
 | `storage.py` | Persistence — `save_bo_run`, `get_latest_bo_run` |

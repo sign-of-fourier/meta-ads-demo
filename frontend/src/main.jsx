@@ -6,10 +6,12 @@ import App from "./App.jsx";
 import AuthPage from "./pages/AuthPage.jsx";
 import SettingsPage from "./pages/SettingsPage.jsx";
 import CampaignsPage from "./pages/CampaignsPage.jsx";
+import GoogleCampaignsPage from "./pages/GoogleCampaignsPage.jsx";
 import AdsPage from "./pages/AdsPage.jsx";
 import ExplorerPage from "./pages/ExplorerPage.jsx";
 import LandingPage from "./pages/landingPage.jsx";
 import DashboardMock from "./pages/DashboardMock.jsx";
+import DocsPage from "./pages/DocsPage.jsx";
 import { isLoggedIn } from "./api.js";
 
 function ProtectedRoute({ children }) {
@@ -21,6 +23,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(
     <BrowserRouter>
       <Routes>
         <Route path="/" element={<LandingPage />} />
+        <Route path="/docs" element={<DocsPage />} />
         <Route path="/dashboard" element={<DashboardMock />} />
         <Route path="/app" element={<App />}>
           <Route index element={<Navigate to="/app/settings" replace />} />
@@ -38,6 +41,14 @@ ReactDOM.createRoot(document.getElementById("root")).render(
             element={
               <ProtectedRoute>
                 <CampaignsPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="google-campaigns"
+            element={
+              <ProtectedRoute>
+                <GoogleCampaignsPage />
               </ProtectedRoute>
             }
           />

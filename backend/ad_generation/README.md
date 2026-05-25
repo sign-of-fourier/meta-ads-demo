@@ -11,7 +11,7 @@ Given a seed ad (image URL + headline + short text) tied to a campaign/adset:
 2. **Generate** — Each suggestion is submitted to deAPI FLUX img2img; returns async `request_id`s
 3. **Poll** — Each job is polled until done
 4. **Save** — Result images are downloaded and saved locally under `backend/generated_images/`
-5. **Score** — Each saved image is scored by a fine-tuned model (0–1, lower = better ad)
+5. **Score** — Each saved image is scored by the fine-tuned Qwen2-VL model on Modal (0–1, lower = better ad)
 6. **QA check** — GPT-4o inspects each scored image for severe defects only (extra limbs, melted product, large gibberish text)
 7. **Correct** — Flagged images are patched with another img2img pass (low strength, targeted prompt); the original is marked `defunct` and replaced by the corrected child
 
@@ -112,8 +112,8 @@ For tests, override both `GENERATED_IMAGES_DIR` and `IMAGES_SERVE_BASE_URL` — 
 | `AZURE_OPENAI_KEY` | — | Required |
 | `AZURE_OPENAI_ENDPOINT` | — | Required (e.g. `https://your-resource.openai.azure.com/`) |
 | `AZURE_OPENAI_API_VERSION` | `2024-12-01-preview` | |
-| `AZURE_ANALYSIS_DEPLOYMENT` | `gpt-4o` | Used for analysis (step 1) and QA (step 6) |
-| `AZURE_SCORING_DEPLOYMENT` | `gpt-4-04-14` | Fine-tuned model for scoring (step 5) |
+| `AZURE_ANALYSIS_DEPLOYMENT` | `gpt-4.1-nano` | Used for analysis (step 1) and QA (step 6) |
+| `MODAL_SCORING_ENDPOINT` | `https://markshipman4273--bad-ads-qwen2vl-badadsmodel-web.modal.run/predict` | Fine-tuned Qwen2-VL scorer on Modal (step 5) |
 | `DEAPI_API_KEY` | — | Required for generation (steps 2 & 7) |
 | `IMAGES_SERVE_BASE_URL` | `http://localhost:8000/images` | Base URL for scoring/QA image access |
 | `GENERATED_IMAGES_DIR` | `backend/generated_images/` | Override image save directory (useful for tests) |

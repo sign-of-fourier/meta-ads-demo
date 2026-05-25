@@ -2,8 +2,20 @@
 Bayesian Optimisation pipeline for ad combination selection.
 
 Given a seed ad and a source of text combinations, selects two candidate
-combinations to test next: one via Expected Improvement, one via a fantasy
-step (batch BO second pick).
+combinations to test next.
+
+Two methods are available (controlled by the `method` parameter to run_bo):
+
+  "modal"  (default)
+    Reduces the combined embeddings to PCA space, then calls the Modal GP
+    service (stateless q-EI endpoint) to jointly select q=2 candidates.
+    Requires MODAL_BO_API_URL to be set; silently falls back to "local" if
+    the env var is absent or the API call fails.
+
+  "local"
+    Fits a local sklearn GPR, picks the highest-EI candidate, then applies a
+    "fantasy step" (augmented refit) to pick a second candidate.  No network
+    calls; works with no env vars.
 
 Scored observations come from ad_generation_variants (image variants that have
 been model-scored).  Candidates are text combinations from
@@ -12,7 +24,7 @@ ad_text_combination_embeddings paired with the seed ad's image embedding.
 Per-ad constraint: seed_ad_id and text_source_id must refer to the same ad.
 The caller is responsible for providing consistent identifiers.
 
-Higher score = better ad (consistent with the 1–7 rating scale in gpr_pipeline.py).
+Higher score = better ad (consistent with the 1–7 rating scale).
 If your scorer inverts this, negate scores before calling or pass higher_is_better=False.
 """
 
@@ -24,15 +36,16 @@ from pathlib import Path
 import numpy as np
 
 from ad_embedding_combiner import combine
-from bo_pipeline.gpr import MIN_TRAINING_POINTS, expected_improvement, fantasize, fit_gpr, predict_with_std
+from bo_pipeline.gpr import MIN_TRAINING_POINTS, expected_improvement, fantasize, fit_gpr, predict_with_std, transform_y
 from bo_pipeline.selector import get_candidate_combinations, get_scored_combinations
 from bo_pipeline.storage import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-_FALLBACK_TYPE = "random"
-_EI_TYPE = "ei"
-_FANTASY_TYPE = "fantasy"
+_FALLBACK_TYPE  = "random"
+_EI_TYPE        = "ei"
+_FANTASY_TYPE   = "fantasy"
+_MODAL_TYPE     = "modal_q_ei"
 
 
 def _build_X(combinations: list[dict]) -> np.ndarray:
@@ -40,63 +53,33 @@ def _build_X(combinations: list[dict]) -> np.ndarray:
     return np.vstack([combine(c["text_vector"], c["image_vector"]) for c in combinations])
 
 
-def run_bo(
-    seed_ad_id: str,
-    text_source_id: str,
-    user_id: int,
-    db_path: Path = DB_PATH,
-    xi: float = 0.01,
-    higher_is_better: bool = True,
+# ---------------------------------------------------------------------------
+# Local (fantasize) path
+# ---------------------------------------------------------------------------
+
+def _run_local_bo(
+    scored: list[dict],
+    candidates: list[dict],
+    xi: float,
+    higher_is_better: bool,
 ) -> list[dict]:
     """
-    Select up to 2 combinations to test next via GPR-based Bayesian Optimisation.
-
-    Returns a list of 1 or 2 dicts, each with:
-      combination_key  — str
-      combination      — dict (text slot values)
-      selection_type   — 'ei' | 'fantasy' | 'random'
-      ei_score         — float | None
-      gpr_mean         — float | None
-      gpr_std          — float | None
-
-    Falls back to random selection when there are fewer than MIN_TRAINING_POINTS
-    scored combinations available.
+    GPR + EI pick 1, fantasy-step pick 2.  Pure local sklearn — no network.
     """
-    scored = get_scored_combinations(seed_ad_id, text_source_id, user_id, db_path)
-    scored_keys = {s["combination_key"] for s in scored}
-    candidates = get_candidate_combinations(
-        text_source_id, seed_ad_id, user_id, exclude_keys=scored_keys, db_path=db_path
-    )
-
-    logger.info(
-        "run_bo: seed_ad_id=%s scored=%d candidates=%d",
-        seed_ad_id, len(scored), len(candidates),
-    )
-
-    if not candidates:
-        logger.warning("run_bo: no candidates available for seed_ad_id=%s", seed_ad_id)
-        return []
-
-    # --- Fallback: not enough data to fit a reliable GPR ---
-    if len(scored) < MIN_TRAINING_POINTS:
-        logger.info("run_bo: insufficient scored data (%d < %d) — random fallback", len(scored), MIN_TRAINING_POINTS)
-        rng = np.random.default_rng()
-        chosen = rng.choice(len(candidates), size=min(2, len(candidates)), replace=False)
-        return [_make_pick(candidates[i], _FALLBACK_TYPE) for i in chosen]
-
-    # --- Build training arrays ---
-    y = np.array([s["score"] for s in scored], dtype=np.float64)
+    y_raw = np.array([s["score"] for s in scored], dtype=np.float64)
     if not higher_is_better:
-        y = -y
+        y_raw = -y_raw
+    # Rank-transform to standard-normal so the GP sees Gaussian targets.
+    # Mirrors _transform_y in the Modal GP service — ECDF → clamp → norm.ppf.
+    y = transform_y(y_raw)
     y_best = float(y.max())
 
     X_train = _build_X(scored).astype(np.float64)
     X_cands = _build_X(candidates).astype(np.float64)
 
-    # --- Fit GPR ---
     gpr, scaler = fit_gpr(X_train, y)
 
-    # --- Pick 1: highest Expected Improvement ---
+    # Pick 1: highest EI
     ei_scores = expected_improvement(gpr, scaler, X_cands, y_best, xi=xi)
     pick1_idx = int(np.argmax(ei_scores))
     pick1_cand = candidates[pick1_idx]
@@ -105,16 +88,16 @@ def run_bo(
         pick1_cand,
         _EI_TYPE,
         ei_score=float(ei_scores[pick1_idx]),
-        gpr_mean=float(mu1[0]) if not higher_is_better else float(mu1[0]),
+        gpr_mean=float(mu1[0]),
         gpr_std=float(sigma1[0]),
     )
 
     if len(candidates) == 1:
         return [pick1]
 
-    # --- Pick 2: fantasy step ---
+    # Pick 2: fantasy step — pass transformed y so the augmented training set
+    # stays in the same (normal) space as the initial fit.
     gpr2, scaler2 = fantasize(gpr, scaler, X_train, y, X_cands[[pick1_idx]])
-
     remaining_idx = [i for i in range(len(candidates)) if i != pick1_idx]
     X_remaining = X_cands[remaining_idx]
     cands_remaining = [candidates[i] for i in remaining_idx]
@@ -133,6 +116,155 @@ def run_bo(
 
     return [pick1, pick2]
 
+
+# ---------------------------------------------------------------------------
+# Modal (q-EI + PCA) path
+# ---------------------------------------------------------------------------
+
+def _run_modal_bo(
+    scored: list[dict],
+    candidates: list[dict],
+    xi: float,
+    higher_is_better: bool,
+) -> list[dict]:
+    """
+    PCA → Modal GP q-EI → nearest-pool-member snap.
+
+    Returns picks in the same format as _run_local_bo.
+    Raises on any error so the caller can fall back gracefully.
+    """
+    from bo_pipeline.modal_bo import (
+        call_modal_api,
+        dim_bounds,
+        fit_pca,
+        modal_bo_enabled,
+        project,
+        snap_to_pool,
+        _api_url,
+    )
+
+    api_url = _api_url()
+
+    y_raw = np.array([s["score"] for s in scored], dtype=np.float32)
+    # Modal API is a maximisation service (higher = better).
+    # If the caller wants minimisation, negate so the API still maximises the
+    # negated objective.
+    # NOTE: `higher_is_better=False` is NEVER passed by any current call site
+    # (both calls in main.py use the default True). The `-y_raw` branch is
+    # dead code kept as a hook for future "minimise metric" use cases (e.g.
+    # minimise CPC). Do not remove silently — if you add a minimisation path,
+    # this is where to activate it.
+    y = y_raw if higher_is_better else -y_raw  # noqa: SIM210 (dead branch, intentional)
+
+    # Build full embedding pool for PCA fitting (scored ∪ candidates)
+    X_scored = _build_X(scored).astype(np.float32)
+    X_cands  = _build_X(candidates).astype(np.float32)
+    X_all    = np.vstack([X_scored, X_cands])
+
+    # Fit PCA on the union so the projection captures the full space
+    pca, X_all_pca = fit_pca(X_all)
+    X_train_pca = X_all_pca[: len(scored)]
+    X_cands_pca = X_all_pca[len(scored) :]
+
+    bounds = dim_bounds(X_all_pca)
+
+    # Call Modal GP service — raises on failure
+    suggestions_pca = call_modal_api(
+        api_url=api_url,
+        X_train_pca=X_train_pca,
+        y=y,
+        bounds=bounds,
+        q=min(2, len(candidates)),
+        xi=xi,
+    )
+
+    # Snap each GP-suggested PCA point to the nearest unvisited candidate
+    picked_indices = snap_to_pool(suggestions_pca, X_cands_pca, candidates)
+
+    picks = []
+    for idx in picked_indices:
+        picks.append(_make_pick(candidates[idx], _MODAL_TYPE))
+
+    return picks
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+def run_bo(
+    seed_ad_id: str,
+    text_source_id: str,
+    user_id: int,
+    db_path: Path = DB_PATH,
+    xi: float = 0.01,
+    higher_is_better: bool = True,
+    method: str = "modal",
+) -> list[dict]:
+    """
+    Select up to 2 combinations to test next via Bayesian Optimisation.
+
+    method="modal"  (default) — uses the Modal GP service with PCA preprocessing
+                                and proper batch q-EI; falls back to "local" if
+                                MODAL_BO_API_URL is unset or the API call fails.
+    method="local"            — local sklearn GPR + EI + fantasy step; no network.
+
+    Returns a list of 1 or 2 dicts, each with:
+      combination_key  — str
+      combination      — dict (text slot values + optional image_url)
+      selection_type   — 'modal_q_ei' | 'ei' | 'fantasy' | 'random'
+      ei_score         — float | None
+      gpr_mean         — float | None
+      gpr_std          — float | None
+
+    Falls back to random selection when there are fewer than MIN_TRAINING_POINTS
+    scored combinations available.
+    """
+    from bo_pipeline.modal_bo import modal_bo_enabled
+
+    scored = get_scored_combinations(seed_ad_id, text_source_id, user_id, db_path)
+    scored_keys = {s["combination_key"] for s in scored}
+    candidates = get_candidate_combinations(
+        text_source_id, seed_ad_id, user_id, exclude_keys=scored_keys, db_path=db_path
+    )
+
+    logger.info(
+        "run_bo: seed_ad_id=%s scored=%d candidates=%d method=%s",
+        seed_ad_id, len(scored), len(candidates), method,
+    )
+
+    if not candidates:
+        logger.warning("run_bo: no candidates available for seed_ad_id=%s", seed_ad_id)
+        return []
+
+    # --- Fallback: not enough data to fit a reliable model ---
+    if len(scored) < MIN_TRAINING_POINTS:
+        logger.info(
+            "run_bo: insufficient scored data (%d < %d) — random fallback",
+            len(scored), MIN_TRAINING_POINTS,
+        )
+        rng = np.random.default_rng()
+        chosen = rng.choice(len(candidates), size=min(2, len(candidates)), replace=False)
+        return [_make_pick(candidates[i], _FALLBACK_TYPE) for i in chosen]
+
+    # --- Route to Modal or local ---
+    use_modal = (method == "modal") and modal_bo_enabled()
+
+    if use_modal:
+        try:
+            return _run_modal_bo(scored, candidates, xi=xi, higher_is_better=higher_is_better)
+        except Exception as exc:
+            logger.warning(
+                "run_bo: Modal BO failed (%s) — falling back to local GPR", exc
+            )
+            # Fall through to local below
+
+    return _run_local_bo(scored, candidates, xi=xi, higher_is_better=higher_is_better)
+
+
+# ---------------------------------------------------------------------------
+# Shared helper
+# ---------------------------------------------------------------------------
 
 def _make_pick(
     cand: dict,

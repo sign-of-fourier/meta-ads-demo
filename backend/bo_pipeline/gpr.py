@@ -22,6 +22,35 @@ from sklearn.preprocessing import StandardScaler
 MIN_TRAINING_POINTS = 2  # below this, fit() is not called (caller should fallback)
 
 
+def transform_y(y: np.ndarray) -> np.ndarray:
+    """
+    Rank-transform y to standard-normal via the Probability Integral Transform.
+
+    Mirrors _transform_y in the Modal GP service (modal_gp_api.py) so the local
+    GPR path and the Modal path see identically-shaped targets.
+
+    Steps
+    -----
+    1. Empirical CDF:  u = (rank + 1) / (n + 1)
+       Avoids u=0 and u=1 at the extremes (which would give −∞/+∞ from ppf).
+    2. Clamp to (0.00005, 0.99995):  u = u * 0.9999 + 0.00005
+       Shrinks the range by 0.0001 total; the addend is half that shrinkage,
+       keeping the distribution symmetric.
+    3. Inverse normal CDF:  norm.ppf(u)
+       Maps the uniform to a standard-normal.  The GP sees Gaussian targets,
+       which ExactGP / sklearn GPR both require.  Equivalently this is "apply
+       the inverse lognormal CDF then take the log" — the log of exp(norm.ppf(u))
+       is just norm.ppf(u), so the GP fits the log of a lognormal-distributed target.
+
+    Pass y where higher = better (negate minimisation objectives before calling).
+    """
+    n = len(y)
+    ranks = np.argsort(np.argsort(y)).astype(np.float64)
+    u = (ranks + 1.0) / (n + 1.0)
+    u = u * 0.9999 + 0.00005
+    return norm.ppf(u)
+
+
 def _make_kernel() -> object:
     return ConstantKernel(1.0) * RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1)
 

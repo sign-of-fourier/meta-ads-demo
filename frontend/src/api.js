@@ -62,6 +62,12 @@ export function isLoggedIn() {
   return !!localStorage.getItem("token");
 }
 
+// ── User ─────────────────────────────────────────────────────────────────────
+
+export async function getMe() {
+  return request("/me");
+}
+
 // ── Meta connection ─────────────────────────────────────────────────────────
 
 export async function getMetaStatus() {
@@ -70,6 +76,39 @@ export async function getMetaStatus() {
 
 export async function getMetaLoginUrl() {
   return request("/auth/meta/login-url");
+}
+
+// ── Google connection ────────────────────────────────────────────────────────
+
+export async function getGoogleStatus() {
+  return request("/me/google-status");
+}
+
+export async function getGoogleLoginUrl() {
+  return request("/auth/google/login-url");
+}
+
+export async function getGoogleCampaigns() {
+  return request("/api/google/campaigns");
+}
+
+export async function ingestGoogleStructure(campaignId) {
+  return request(`/api/google/ingest/structure/${campaignId}`, { method: "POST" });
+}
+
+export async function getGoogleStructure(campaignId) {
+  return request(`/api/google/structure/${campaignId}`);
+}
+
+export async function getGooglePendingAccounts(key) {
+  return request(`/auth/google/pending/${key}`);
+}
+
+export async function selectGoogleAccount(key, customerId, loginCustomerId) {
+  return request("/auth/google/select-account", {
+    method: "POST",
+    body: JSON.stringify({ key, customer_id: customerId, login_customer_id: loginCustomerId || null }),
+  });
 }
 
 // ── Campaigns ───────────────────────────────────────────────────────────────
@@ -92,6 +131,14 @@ export async function getAds() {
   return request("/api/ads");
 }
 
+export async function getLocalAds() {
+  return request("/api/ads/local");
+}
+
+export async function deleteLocalAd(adId) {
+  return request(`/api/ads/local/${adId}`, { method: "DELETE" });
+}
+
 // ── Ingest ──────────────────────────────────────────────────────────────────
 
 export async function getIngestPreview() {
@@ -100,6 +147,10 @@ export async function getIngestPreview() {
 
 export async function runIngest() {
   return request("/api/ingest", { method: "POST" });
+}
+
+export async function pushGeneratedAds() {
+  return request("/api/push", { method: "POST" });
 }
 
 export async function getExplore() {
@@ -133,4 +184,56 @@ export async function confirmSuggestion(id, action) {
     method: "POST",
     body: JSON.stringify({ action }),
   });
+}
+
+// ── Bayesian Optimisation ────────────────────────────────────────────────────
+
+export async function runBO(seedAdId, textSourceId) {
+  return request("/api/bo/run", {
+    method: "POST",
+    body: JSON.stringify({ seed_ad_id: seedAdId, text_source_id: textSourceId }),
+  });
+}
+
+// ── Ad text generation ────────────────────────────────────────────────────────
+
+export async function generateTextAds(campaignId, seedAdId) {
+  const qs = seedAdId ? `?seed_ad_id=${encodeURIComponent(seedAdId)}` : "";
+  return request(`/api/generate/text/${campaignId}${qs}`, { method: "POST" });
+}
+
+export async function generateGoogleTextAds(campaignId, seedAdId) {
+  const qs = seedAdId ? `?seed_ad_id=${encodeURIComponent(seedAdId)}` : "";
+  return request(`/api/google/generate/text/${campaignId}${qs}`, { method: "POST" });
+}
+
+export async function runGoogleBO(seedAdId, textSourceId) {
+  return request("/api/google/bo/run", {
+    method: "POST",
+    body: JSON.stringify({ seed_ad_id: seedAdId, text_source_id: textSourceId }),
+  });
+}
+
+export async function getGoogleBOResults(adId) {
+  return request(`/api/google/bo/results/${encodeURIComponent(adId)}`);
+}
+
+export async function pushGoogleAds() {
+  return request("/api/google/push", { method: "POST" });
+}
+
+export async function startDynamicGeneration(campaignId, seedAdId) {
+  const qs = seedAdId ? `?seed_ad_id=${encodeURIComponent(seedAdId)}` : "";
+  return request(`/api/generate/dynamic/${campaignId}${qs}`, { method: "POST" });
+}
+
+export async function storeSuggestion(data) {
+  return request("/api/suggestions", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+}
+
+export async function getDynamicGenStatus(jobId) {
+  return request(`/api/generate/dynamic/status/${jobId}`);
 }

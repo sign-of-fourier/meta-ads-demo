@@ -8,9 +8,11 @@ Fully independent — no dependency on the FastAPI app or any metadata layer.
 
 Given a seed ad's component list (one or more values per slot):
 
-1. **Generate** — For each text slot (headline, primary_text, description),
-   call GPT-4o with the existing seed values as context and produce N new variants
-   in the same tone and style. All slots run in parallel.
+1. **Generate** — For each text slot appropriate to the platform, call GPT-4o with the
+   existing seed values as context and produce N new variants in the same tone and style.
+   All slots run in parallel.
+   - **Meta slots:** `headline`, `primary_text`, `description`, `cta`
+   - **Google RSA slots:** `headline`, `description` only (with 30-char / 90-char limits)
 2. **Assemble** — Merge seed values + generated values + optional image URLs
    into a single dynamic ad component list. Seed values keep their original
    slot indices; generated values extend from there.
@@ -21,10 +23,10 @@ Given a seed ad's component list (one or more values per slot):
 
 | File | Role |
 |---|---|
-| `prompts.py` | `GENERATE_SLOT_VARIANTS` prompt + `SLOT_HINTS` per slot type |
-| `generator.py` | `generate_slot_variants(slot, existing_values, n)` and `generate_all_slots(seed_components, n_per_slot)` |
+| `prompts.py` | `GENERATE_SLOT_VARIANTS` prompt + `SLOT_HINTS` per slot type; `GOOGLE_RSA_SLOT_HINTS` with Google character limits |
+| `generator.py` | `TEXT_SLOTS` (Meta); `GOOGLE_RSA_SLOTS = ('headline', 'description')`; `slots_for_platform(platform)`; `generate_slot_variants(slot, existing_values, n, platform)` and `generate_all_slots(seed_components, n_per_slot, platform)` |
 | `assembler.py` | `assemble_dynamic_ad(seed_components, generated_text, image_urls)` → component list |
-| `storage.py` | `generated_ads` + `generated_ad_slots` tables; `save_generated_ad()`, `get_generated_ad()` |
+| `storage.py` | `generated_ads` + `generated_ad_slots` tables; `save_generated_ad()`, `get_generated_ad()`, `get_generated_slots_for_source(source_ad_id)` |
 | `pipeline.py` | `run_text_pipeline(...)` — top-level orchestrator |
 
 ## Public API
@@ -32,15 +34,35 @@ Given a seed ad's component list (one or more values per slot):
 ```python
 from ad_text_generation import run_text_pipeline, get_generated_ad, get_generated_ad_meta
 
+# Meta (default) — generates headline, primary_text, description, cta
 generated_ad_id = await run_text_pipeline(
     seed_components=[...],   # {slot, slot_index, value} dicts
     n_per_slot=5,            # new variants per text slot
     image_urls=[...],        # optional: from image generation pipeline
     source_ad_id="ad_123",  # optional: for traceability
+    platform="meta",         # default; also accepts 'google'
+)
+
+# Google RSA — generates headline and description only, with 30/90 char limits
+generated_ad_id = await run_text_pipeline(
+    seed_components=[...],
+    n_per_slot=10,
+    source_ad_id="google_ad_123",
+    platform="google",
 )
 
 slots = get_generated_ad(generated_ad_id)
 # [{"slot": "headline", "slot_index": 0, "value": "...", "source": "seed"}, ...]
+```
+
+### Platform-aware slot selection
+
+```python
+from ad_text_generation.generator import slots_for_platform
+
+slots_for_platform("meta")    # ('headline', 'primary_text', 'description', 'cta')
+slots_for_platform("google")  # ('headline', 'description')
+slots_for_platform("other")   # ('headline', 'primary_text', 'description', 'cta')  — Meta fallback
 ```
 
 ## Component format
@@ -104,14 +126,16 @@ generated_ad_id = await run_text_pipeline(
 | `AZURE_OPENAI_KEY` | — | Required |
 | `AZURE_OPENAI_ENDPOINT` | — | Required |
 | `AZURE_OPENAI_API_VERSION` | `2024-12-01-preview` | |
-| `AZURE_TEXT_GEN_DEPLOYMENT` | `gpt-4o` | Deployment used for text generation |
+| `AZURE_TEXT_GEN_DEPLOYMENT` | `gpt-4.1-nano` | Deployment used for text generation |
 
 ## Running tests
 
 ```bash
 cd backend
 source .venv/bin/activate
-python -m pytest test_text_pipeline.py -v
+python -m pytest tests/test_text_pipeline.py -v          # integration (API keys required)
+python -m pytest tests/test_google_text_pipeline.py -v  # pure (no API keys needed)
 ```
 
-Tests make real API calls — the env vars above must be set.
+`test_text_pipeline.py` makes real Azure OpenAI API calls — env vars above must be set.
+`test_google_text_pipeline.py` is pure — mocks the LLM and tests slot filtering logic.

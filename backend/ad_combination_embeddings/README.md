@@ -12,6 +12,8 @@ combination captures the joint semantics of that pairing — which is more
 useful for similarity search and quality ranking than embedding each slot in
 isolation.
 
+For Google RSA ads, only `headline` and `description` slots are combined (no `primary_text`). A RSA ad with 10 headlines × 4 descriptions produces 40 combination rows. The `combination_key` format and storage schema are identical regardless of which slots are active.
+
 ## What it does
 
 1. **Enumerate** — Build the Cartesian product of all text slot values.
@@ -44,10 +46,17 @@ from ad_combination_embeddings import (
 # How many combinations?
 n = combination_count(components)   # e.g. 64 for a 4×4×4 dynamic ad
 
-# Embed and store
+# Embed and store — Meta (default slots: headline × primary_text × description)
 stored = await embed_all_combinations(
     source_id="my_ad_001",   # any string the caller chooses
     components=components,   # list of {slot, slot_index, value} dicts
+)
+
+# Google RSA — headline × description only
+stored = await embed_all_combinations(
+    source_id="google_ad_001",
+    components=components,
+    slots=("headline", "description"),
 )
 
 # Retrieve
@@ -101,8 +110,8 @@ cd backend
 source .venv/bin/activate
 
 # Pure combinatorics tests — no API keys needed
-python -m pytest test_combination_embeddings.py -v -k "TestBuildCombinations or TestCombinationKey"
+python -m pytest tests/test_combination_embeddings.py -v -k "TestBuildCombinations or TestCombinationKey"
 
 # Integration tests — AZURE_INFERENCE_KEY must be set
-python -m pytest test_combination_embeddings.py -v
+python -m pytest tests/test_combination_embeddings.py -v
 ```

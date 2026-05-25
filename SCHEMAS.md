@@ -15,6 +15,7 @@ Local auth accounts. Independent of Meta identity.
 | `id` | INTEGER PK | autoincrement |
 | `email` | TEXT UNIQUE | |
 | `pw_hash` | TEXT | bcrypt |
+| `tier` | TEXT | `'free'` \| `'premium'` — added via ALTER TABLE migration; default `'free'` |
 | `created_at` | TEXT | `datetime('now')` |
 
 ---
@@ -35,13 +36,43 @@ One row per user — the connected Meta ad account.
 
 ### `oauth_states`
 
-CSRF state tokens for the Meta OAuth flow. Deleted after successful callback.
+CSRF state tokens for Meta and Google OAuth flows. Deleted after successful callback.
 
 | Column | Type | Notes |
 |---|---|---|
 | `state` | TEXT PK | random `urlsafe` token |
 | `user_id` | INTEGER | FK → `users.id` |
+| `provider` | TEXT | `'meta'` \| `'google'` — added via ALTER TABLE migration; default `'meta'` |
 | `created_at` | TEXT | |
+
+---
+
+### `google_connections`
+
+One row per user — the connected Google Ads account.
+
+| Column | Type | Notes |
+|---|---|---|
+| `user_id` | INTEGER PK | FK → `users.id` |
+| `customer_id` | TEXT | Google Ads customer ID (no hyphens, e.g. `1234567890`) |
+| `login_customer_id` | TEXT nullable | MCC manager account ID when using agency setup |
+| `refresh_token` | TEXT | OAuth2 refresh token; exchanged for access token on each request |
+| `customer_name` | TEXT nullable | Human-readable account name |
+| `connected_at` | TEXT | `datetime('now')` |
+
+---
+
+### `google_pending_connections`
+
+Temporary holding table for Google OAuth when multiple accounts are accessible. Row is written after callback and deleted after account selection.
+
+| Column | Type | Notes |
+|---|---|---|
+| `key` | TEXT PK | `secrets.token_urlsafe(32)` — passed as `?google_pick=<key>` in redirect |
+| `user_id` | INTEGER | FK → `users.id` |
+| `refresh_token` | TEXT | OAuth2 refresh token |
+| `accounts_json` | TEXT | JSON array of `{customer_id, name}` dicts from `listAccessibleCustomers` |
+| `created_at` | TEXT | `datetime('now')` |
 
 ---
 
@@ -63,6 +94,7 @@ Metric snapshots. One row per campaign per `POST /api/ingest` call. No date dedu
 | `ctr` | REAL | computed: `clicks/impressions * 100` |
 | `cpm` | REAL | computed: `spend/impressions * 1000` |
 | `cpc` | REAL | computed: `spend/clicks` |
+| `platform` | TEXT | `'meta'` \| `'google'` — added via ALTER TABLE migration; default `'meta'` |
 | `data_source` | TEXT | `'real'` \| `'masked'` \| `'demo'` — added via ALTER TABLE migration |
 | `mask_profile` | TEXT nullable | `'healthy'` \| `'stable'` \| `'weak'` — only set when `data_source='masked'` |
 | `created_at` | TEXT | |
@@ -80,18 +112,19 @@ Normalised creative components. One row per `(user, ad, slot, slot_index)`.
 | `ad_account_id` | TEXT | |
 | `campaign_id` | TEXT | |
 | `adset_id` | TEXT | |
-| `ad_id` | TEXT | Meta ad id |
-| `creative_type` | TEXT | `'static'` or `'dynamic'` |
-| `slot` | TEXT | `'headline'`, `'description'`, `'primary_text'`, `'image'` |
+| `ad_id` | TEXT | Platform ad id |
+| `platform` | TEXT | `'meta'` \| `'google'` — added via ALTER TABLE migration; default `'meta'` |
+| `creative_type` | TEXT | Meta: `'static'` \| `'dynamic'`; Google: `'rsa'` \| `'display'` \| `'video'` \| `'pmax'` \| `'shopping'` \| `'unknown'` |
+| `slot` | TEXT | `'headline'`, `'description'`, `'primary_text'`, `'image'`, `'video'`, `'final_url'` |
 | `slot_index` | INTEGER | `0` for static; `0, 1, 2…` for dynamic variants |
 | `value` | TEXT | The component text or image URL / hash |
 | `ingested_at` | TEXT | ISO timestamp of last ingest |
-| `lifecycle_status` | TEXT | `'active'`, `'inactive'`, or `'missing'` (see below) |
-| `data_source` | TEXT | `'real'` \| `'masked'` \| `'demo'` — added via ALTER TABLE migration |
+| `lifecycle_status` | TEXT | `'active'`, `'inactive'`, `'missing'`, or `'generated'` (see below) |
+| `data_source` | TEXT | `'real'` \| `'masked'` \| `'demo'` \| `'generated'` — added via ALTER TABLE migration |
 | `mask_profile` | TEXT nullable | `'healthy'` \| `'stable'` \| `'weak'` — only set when `data_source='masked'` |
 | UNIQUE | | `(user_id, ad_id, slot, slot_index)` — drives idempotent upsert |
 
-**Lifecycle status rules** (set during `POST /api/ingest/structure/{campaign_id}`):
+**Lifecycle status rules** (set during `POST /api/ingest/structure/{campaign_id}` for Meta-ingested ads):
 
 | Status | Condition |
 |---|---|
@@ -100,6 +133,8 @@ Normalised creative components. One row per `(user, ad, slot, slot_index)`.
 | `missing` | Ad has rows in DB but was absent from the latest Meta fetch for this campaign |
 
 **Ingest behaviour:** `ON CONFLICT DO UPDATE` replaces `creative_type`, `value`, `ingested_at`, and `lifecycle_status` in place. Previously ingested ads absent from the current fetch are updated to `lifecycle_status = 'missing'` in a separate `UPDATE` pass.
+
+**Generated ad rows** (written by `_run_dynamic_generation`): use `data_source='generated'`, `lifecycle_status='generated'`, `ad_account_id='generated'`, `adset_id='generated'`, `ad_id='gen_dyn_{uuid12}'`. These represent locally-created ads not yet pushed to Meta.
 
 ---
 
@@ -239,6 +274,27 @@ One row per `(user, ad)`. Written by `embeddings/pipeline.py` — called fire-an
 | `image_url` | TEXT nullable | URL that was embedded |
 | `embedded_at` | TEXT | `datetime('now')` |
 | UNIQUE | | `(user_id, ad_id)` |
+
+---
+
+### `ad_image_embeddings`
+
+One row per image slot per ad. Written by `embeddings/pipeline.py` — called fire-and-forget from structural ingest and from the dynamic ad generation background task. Upserted on `(user_id, ad_id, slot_index)`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK | |
+| `user_id` | INTEGER | FK → `users.id` |
+| `ad_id` | TEXT | Platform ad id — joins to `ad_creative_structures.ad_id` |
+| `campaign_id` | TEXT | Denormalised for fast campaign-level queries |
+| `slot_index` | INTEGER | Image slot index (0, 1, 2… for dynamic ads) |
+| `image_ref` | TEXT | Local URL of the image that was embedded (`/ad-images/…` or `/images/…`) |
+| `vector` | BLOB | Raw `float32` bytes — the image embedding from Azure AI Inference |
+| `model` | TEXT nullable | Azure model used for image embedding |
+| `embedded_at` | TEXT | `datetime('now')` |
+| UNIQUE | | `(user_id, ad_id, slot_index)` |
+
+The BO pipeline reads `ad_image_embeddings` to form the image dimension of its candidate pool: each text combination from `ad_text_combination_embeddings` is paired with each row here → N_text × N_images candidates.
 
 ---
 
@@ -427,6 +483,27 @@ rows = get_embeddings_for_source("my_ad_001")
 
 ---
 
+### `dynamic_generation_jobs`
+
+Tracks the status of async `POST /api/generate/dynamic/{campaign_id}` jobs. One row per button click.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK | Returned as `job_id` to the frontend |
+| `user_id` | INTEGER | FK → `users.id` |
+| `campaign_id` | TEXT | The campaign being generated for |
+| `status` | TEXT | `'running'` \| `'complete'` \| `'failed'` |
+| `ad_id` | TEXT nullable | Set on completion — the `gen_dyn_*` ad_id in `ad_creative_structures` |
+| `seed_ad_id` | TEXT nullable | The source ad used as seed — added via ALTER TABLE migration |
+| `adset_id` | TEXT nullable | The adset the generated ad will be pushed to — added via ALTER TABLE migration |
+| `meta_ad_id` | TEXT nullable | Set after successful push to Meta — added via ALTER TABLE migration |
+| `images_generated` | INTEGER nullable | Count of images generated — added via ALTER TABLE migration |
+| `error` | TEXT nullable | Set on failure |
+| `created_at` | TEXT | |
+| `completed_at` | TEXT nullable | Set on completion or failure |
+
+---
+
 ### `bo_selections`
 
 One row per BO-recommended combination per run. Written by `bo_pipeline.save_bo_run()`.
@@ -443,6 +520,7 @@ One row per BO-recommended combination per run. Written by `bo_pipeline.save_bo_
 | `ei_score` | REAL nullable | Expected Improvement value at selection time |
 | `gpr_mean` | REAL nullable | GPR posterior mean at the selected point |
 | `gpr_std` | REAL nullable | GPR posterior std at the selected point |
+| `google_ad_resource_name` | TEXT nullable | Set after successful push to Google Ads — added via ALTER TABLE migration |
 | `created_at` | TEXT | `datetime('now')` — groups a run's two picks by timestamp |
 
 **Variant embedding convention:** when embedding a generated image variant for use in `bo_pipeline`, store it in `ad_embeddings` with `ad_id = f"gen_{job_id}_{variant_id}"`. The selector joins on this convention.

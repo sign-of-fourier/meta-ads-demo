@@ -43,7 +43,7 @@ async def check_for_artifacts(image_url: str) -> QAResult:
     import asyncio
 
     client = _make_client()
-    deployment = os.getenv("AZURE_ANALYSIS_DEPLOYMENT", "gpt-4o")
+    deployment = os.getenv("AZURE_ANALYSIS_DEPLOYMENT", "gpt-4.1-nano")
 
     def _call() -> str:
         completion = client.chat.completions.create(
