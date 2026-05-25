@@ -259,9 +259,25 @@ export default function GoogleCampaignsPage() {
 
   return (
     <div className="campaigns-page">
+      <div className="page-hint-banner">
+        <p style={{ margin: "0 0 0.4rem", fontWeight: 600, color: "#333" }}>How to use this page</p>
+        <ol style={{ margin: 0, paddingLeft: "1.4rem", lineHeight: 1.9, fontSize: "0.88rem" }}>
+          <li>Your campaigns load automatically — click <strong>Sync</strong> to refresh or push ads</li>
+          <li>Click <strong>Ingest</strong> on any campaign row to read its ad creatives</li>
+          <li>Click <strong>Generate RSA Text</strong> to create AI-powered headline and description variants</li>
+          <li>Click <strong>Get Recommendations</strong> — the AI suggests the best combinations to test next</li>
+          <li>Click <strong>Sync</strong> to push recommendations to Google Ads as new paused ads</li>
+        </ol>
+      </div>
+
       <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "12px" }}>
         <h2 style={{ margin: 0 }}>Google Ads Campaigns</h2>
-        <button className="btn-small" onClick={handleSync} disabled={syncing}>
+        <button
+          className="btn-small"
+          onClick={handleSync}
+          disabled={syncing}
+          title="Push generated ads to Google Ads, then refresh campaign data"
+        >
           {syncing ? "Syncing…" : "Sync"}
         </button>
         {syncNote && (
@@ -311,6 +327,13 @@ export default function GoogleCampaignsPage() {
                         ? setOpenStructureId(c.id)
                         : handleIngest(c.id)
                     }
+                    title={
+                      openStructureId === c.id
+                        ? "Hide the creative structure panel"
+                        : ingestedIds.includes(c.id)
+                        ? "View or re-read this campaign's ad creatives"
+                        : "Read this campaign's ad creatives so Adstac.kr can analyse them"
+                    }
                   >
                     {ingestingId === c.id
                       ? "Ingesting…"
@@ -348,6 +371,7 @@ export default function GoogleCampaignsPage() {
                               <button
                                 className="btn-small"
                                 onClick={() => handleRunBO(c.id, genStateById[c.id].data.source_ad_id)}
+                                title="Run Bayesian Optimisation to suggest the best headline and description combinations to test next"
                               >
                                 Get Recommendations
                               </button>
@@ -362,6 +386,7 @@ export default function GoogleCampaignsPage() {
                         <button
                           className="btn-small"
                           onClick={() => handleGenerateText(c.id)}
+                          title="Generate 10 new headline and description variants for this campaign's Responsive Search Ads using AI"
                         >
                           Generate RSA Text
                         </button>

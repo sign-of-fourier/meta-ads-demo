@@ -172,7 +172,7 @@ class LiveMetaProvider(PlatformProvider):
             f"{META_GRAPH}/{ad_account_id}/adsets",
             params={
                 "access_token": access_token,
-                "fields": "id,name,status,campaign_id",
+                "fields": "id,name,status,campaign_id,targeting",
                 "filtering": f'[{{"field":"campaign.id","operator":"EQUAL","value":"{campaign_id}"}}]',
                 "limit": 500,
             },

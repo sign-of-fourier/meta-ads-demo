@@ -49,7 +49,7 @@ async def generate_slot_variants(
     underdelivers (caller should handle gracefully).
     """
     client = _make_client()
-    deployment = os.getenv("AZURE_TEXT_GEN_DEPLOYMENT", "gpt-4o")
+    deployment = os.getenv("AZURE_TEXT_GEN_DEPLOYMENT", "gpt-4.1-nano")
 
     hints = GOOGLE_RSA_SLOT_HINTS if platform == "google" else SLOT_HINTS
     values_list = "\n".join(f"  - {v}" for v in existing_values if v)

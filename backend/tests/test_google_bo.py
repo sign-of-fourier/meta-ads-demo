@@ -92,7 +92,7 @@ def test_combine_none_image_pads_with_zeros():
 
 
 def test_combine_output_dim_unchanged():
-    assert output_dim() == TEXT_DIM + IMAGE_DIM == 256
+    assert output_dim() == TEXT_DIM + IMAGE_DIM == 3072
 
 
 def test_combine_with_image_vec_not_affected():

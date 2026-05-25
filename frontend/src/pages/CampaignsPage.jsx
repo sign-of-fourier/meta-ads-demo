@@ -26,6 +26,52 @@ const SLOT_LABELS = {
   cta: "Call to Action",
 };
 
+function PlacementPreview({ imageUrl, imageWidth, imageHeight, placements }) {
+  const defaultPlacements = [{ label: "Feed", ratio_w: 1, ratio_h: 1 }];
+  const list = placements && placements.length > 0 ? placements : defaultPlacements;
+  const [activeIdx, setActiveIdx] = useState(0);
+  const active = list[Math.min(activeIdx, list.length - 1)];
+  const pct = ((active.ratio_h / active.ratio_w) * 100).toFixed(3);
+
+  return (
+    <div className="placement-preview">
+      {list.length > 1 && (
+        <div className="placement-tabs">
+          {list.map((p, i) => (
+            <button
+              key={i}
+              className={"placement-tab" + (i === activeIdx ? " active" : "")}
+              onClick={() => setActiveIdx(i)}
+            >
+              {p.label}
+              <span className="placement-ratio">
+                {p.ratio_w}:{p.ratio_h}
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="placement-frame" style={{ paddingBottom: `${pct}%` }}>
+        <img
+          src={imageUrl}
+          alt={active.label}
+          style={{
+            position: "absolute",
+            inset: 0,
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+          }}
+        />
+      </div>
+      {list.length === 1 && (
+        <p className="placement-label-single">{list[0].label} &nbsp;{list[0].ratio_w}:{list[0].ratio_h}</p>
+      )}
+    </div>
+  );
+}
+
 const DEPLOYMENT_LABELS = {
   suggested: "Suggested",
   pending_confirmation: "Pending",
@@ -449,6 +495,18 @@ export default function CampaignsPage() {
 
   return (
     <div className="campaigns-page">
+      <div className="page-hint-banner">
+        <p style={{ margin: "0 0 0.4rem", fontWeight: 600, color: "#333" }}>How to use this page</p>
+        <ol style={{ margin: 0, paddingLeft: "1.4rem", lineHeight: 1.9, fontSize: "0.88rem" }}>
+          <li>Click <strong>Sync</strong> (top right) to load your latest campaigns and metrics</li>
+          <li>Click <strong>Ingest</strong> on any campaign row to read its ad creatives</li>
+          <li>Click the <strong>campaign name</strong> to open it and reveal the action buttons</li>
+          <li>Click <strong>Get Recommendations</strong> — the AI suggests the best headline, copy, and image combinations to test next</li>
+          <li>Optionally click <strong>Static Text Ads</strong> or <strong>Dynamic Ad (AI Images)</strong> to generate new variants first</li>
+          <li>Click <strong>Sync</strong> again to push any generated ads to Meta as new paused ads</li>
+        </ol>
+      </div>
+
       <div className="campaigns-header">
         <h2>Campaigns</h2>
         <div className="sync-controls">
@@ -525,6 +583,7 @@ export default function CampaignsPage() {
                         className={
                           c.status === "ACTIVE" ? "btn-warn" : "btn-success"
                         }
+                        title={c.status === "ACTIVE" ? "Pause this campaign in Meta" : "Resume this campaign in Meta"}
                       >
                         {actionLoading[c.id]
                           ? "..."
@@ -614,6 +673,7 @@ export default function CampaignsPage() {
                               className="btn-primary"
                               onClick={() => handleGetRecommendations(c.id)}
                               disabled={boStateById[c.id] === "loading"}
+                              title="Uses Bayesian Optimisation to suggest the best headline, copy, and image combinations to test next"
                             >
                               {boStateById[c.id] === "loading" ? "Running…" : "Get Recommendations"}
                             </button>
@@ -621,6 +681,7 @@ export default function CampaignsPage() {
                               className="btn-secondary"
                               onClick={() => handleGenerateTextAds(c.id)}
                               disabled={genStateById[c.id] === "loading"}
+                              title="Generate 10 new text variants per slot (headline, primary text, description, CTA) using AI — no new images"
                             >
                               {genStateById[c.id] === "loading" ? "Generating…" : "Static Text Ads"}
                             </button>
@@ -628,6 +689,7 @@ export default function CampaignsPage() {
                               className="btn-secondary btn-dynamic"
                               onClick={() => handleGenerateDynamic(c.id)}
                               disabled={dynJobById[c.id]?.status === "running"}
+                              title="Generate AI images plus 4 text variants per slot and build a new dynamic ad — every combination is scored"
                             >
                               {dynJobById[c.id]?.status === "running"
                                 ? "Generating…"
@@ -768,15 +830,16 @@ export default function CampaignsPage() {
                                         </button>
                                       </div>
                                       {pick.combination.image_url && (
-                                        <img
-                                          className="bo-pick-image"
-                                          src={pick.combination.image_url}
-                                          alt="Recommended ad image"
+                                        <PlacementPreview
+                                          imageUrl={pick.combination.image_url}
+                                          imageWidth={pick.combination.image_width}
+                                          imageHeight={pick.combination.image_height}
+                                          placements={pick.placements}
                                         />
                                       )}
                                       <dl className="slot-list">
                                         {Object.entries(pick.combination)
-                                          .filter(([k]) => k !== "image_url")
+                                          .filter(([k]) => !["image_url", "image_width", "image_height"].includes(k))
                                           .map(([k, v]) => (
                                             <div key={k} className="slot-row">
                                               <dt>{SLOT_LABELS[k] ?? k}</dt>

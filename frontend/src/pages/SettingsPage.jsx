@@ -113,6 +113,18 @@ export default function SettingsPage() {
         <div className="error" style={{ marginBottom: "1rem" }}>{googleErrorParam}</div>
       )}
 
+      <section className="card" style={{ background: "#f8f9ff", border: "1px solid #dde3f5" }}>
+        <p style={{ margin: "0 0 0.5rem", fontWeight: 600, color: "#333" }}>How it works</p>
+        <ol style={{ margin: 0, paddingLeft: "1.4rem", lineHeight: 1.9, color: "#444", fontSize: "0.9rem" }}>
+          <li>Connect your Meta and/or Google Ads account below</li>
+          <li>Go to <strong>Meta Ads</strong> or <strong>Google Ads</strong> in the nav</li>
+          <li>Click <strong>Sync</strong> to load your campaigns</li>
+          <li>Click <strong>Ingest</strong> on any campaign row to read its ads</li>
+          <li>Click the <strong>campaign name</strong> to open it</li>
+          <li>Click <strong>Get Recommendations</strong> — Adstac.kr will tell you exactly what to test next</li>
+        </ol>
+      </section>
+
       <section className="card">
         <h3>Meta Ads Connection</h3>
         {metaLoading ? (

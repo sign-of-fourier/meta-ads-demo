@@ -34,7 +34,7 @@ async def analyze_image(
     Returns a list of exactly 10 suggested edit strings.
     """
     client = _make_client()
-    deployment = os.getenv("AZURE_ANALYSIS_DEPLOYMENT", "gpt-4o")
+    deployment = os.getenv("AZURE_ANALYSIS_DEPLOYMENT", "gpt-4.1-nano")
     prompt = SUGGEST_EDITS.format(headline=headline, short_text=short_text)
 
     completion = client.beta.chat.completions.parse(

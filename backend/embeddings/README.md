@@ -101,7 +101,7 @@ python -m embeddings.pipeline --ad-id <ad_id>
 
 ```bash
 cd backend && source .venv/bin/activate
-python -m pytest test_structural_ingest.py -v                        # pure unit tests, no API keys
-python -m pytest test_generation_pipeline.py -v -k "embed"           # real API calls
-python -m pytest test_combination_embeddings.py -v                   # combination embedding tests
+python -m pytest tests/test_structural_ingest.py -v                        # pure unit tests, no API keys
+python -m pytest tests/test_generation_pipeline.py -v -k "embed"           # real API calls
+python -m pytest tests/test_combination_embeddings.py -v                   # combination embedding tests
 ```

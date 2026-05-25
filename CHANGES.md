@@ -4,7 +4,113 @@ Changes are appended by date. Each entry covers one session or logical chunk of 
 
 ---
 
+## 2026-05-23 (session 3)
+
+### Dead-code label on `-y_raw` branch
+
+**`backend/bo_pipeline/pipeline.py`** — Added explanatory comment on the `y = y_raw if higher_is_better else -y_raw` line in `_run_modal_bo`. The `higher_is_better=False` branch is dead code (no call site passes it); the comment explains why it exists and what would activate it, so it isn't silently removed or misread as a bug in future sessions.
+
+---
+
+## 2026-05-23 (session 2)
+
+### Full embeddings + target transform + Modal URL wired
+
+**`backend/ad_embedding_combiner/combiner.py`** — `TEXT_DIM` and `IMAGE_DIM` changed from 128 to 1536. `_build_X()` now passes full text + image embeddings (3072-dim) into PCA rather than truncating to 256 first. No new embedding API calls — the full vectors were already stored in `ad_embeddings` from ingest.
+
+**`backend/bo_pipeline/gpr.py`** — Added `transform_y(y)`: ranks scores to uniform via ECDF → clamps to `(0.00005, 0.99995)` → applies `norm.ppf` to produce Gaussian-distributed targets. Mirrors `_transform_y` inside the Modal GP server so both the local GPR fallback path and the Modal path see equivalently-shaped targets.
+
+**`backend/bo_pipeline/pipeline.py`** — `_run_local_bo` now applies `transform_y` before fitting; `y_best` and the fantasy step both use the transformed values. Local and Modal paths now consistent.
+
+**`backend/.env`** — Added `MODAL_BO_API_URL=https://markshipman4273--bo-gp-service-gp-suggest.modal.run`. Was missing; without it `modal_bo_enabled()` returned `False` and every BO run silently fell back to local GPR.
+
+**`backend/embeddings/embedder.py`** — `embed_image_url` now resolves relative paths (e.g. `/ad-images/foo.png`) to `http://localhost:{PORT}` before the httpx fetch. Fixes `UnsupportedProtocol` crash when `IMAGES_SERVE_BASE_URL=/images`.
+
+**`backend/embeddings/pipeline.py`** — `embed_images` guard updated from `startswith("http")` to `startswith(("http", "/"))` so relative-path images are embedded rather than silently skipped.
+
+**`backend/main.py`** — Login: `ValueError` from bcrypt (password > 72 bytes) is now caught and returned as 401. Signup: upfront byte-length check returns 400 with a clear message.
+
+**Frontend** — Settings, Meta Ads, and Google Ads pages now show numbered step-by-step instruction banners. All action buttons have `title` tooltip text. `QUICK_START.md` updated to make "click the campaign name" an explicit step.
+
+**Docs updated:** `CLAUDE.md`, `AD.md`, `backend/bo_pipeline/README.md`, `QUICK_START.md`, `backend/tests/test_google_bo.py` (hardcoded `256` → `3072`).
+
+---
+
+## 2026-05-23
+
+### Modal GP batch BO integration (`backend/bo_pipeline/`)
+
+Replaced the sequential fantasy-step approach with a proper batch q-EI method backed by a Modal serverless GP service. The existing local GPR + fantasy path is preserved as a named fallback.
+
+**New file: `backend/bo_pipeline/modal_bo.py`**
+Five focused functions — `fit_pca`, `project`, `dim_bounds`, `call_modal_api`, `snap_to_pool` — plus `modal_bo_enabled()`. No new dependencies (sklearn already present; HTTP via `urllib.request`).
+
+**Modified: `backend/bo_pipeline/pipeline.py`**
+- `run_bo()` gains `method: str = "modal"` kwarg (default `"modal"`).
+- New `_run_modal_bo()`: builds full embedding pool → fits PCA (`MODAL_BO_PCA_DIMS` dims, default 64) on scored ∪ candidates → calls Modal API with q=2 → snaps each returned PCA point to nearest unvisited candidate. Returns picks with `selection_type="modal_q_ei"`.
+- Old code extracted into `_run_local_bo()`, unchanged; still reachable via `method="local"`.
+- Graceful fallback: if `MODAL_BO_API_URL` unset or API call fails → warns and runs local path.
+
+**New file: `backend/tests/test_modal_bo.py`**
+12 unit tests (`TestModalBOUnit`, no network) + 3 live smoke tests (`TestModalBOLive`, hits real Modal endpoint, verified passing at ~29s).
+
+**Modified: `backend/.env.example`**
+Added `MODAL_BO_API_URL` and `MODAL_BO_PCA_DIMS=64`.
+
+**Docs updated:** `CLAUDE.md`, `AD.md`, `README.md`, `DEV_QUICKSTART.md`, `backend/TEST.md`.
+
+---
+
 ## 2026-05-04
+
+### NGROK_SETUP.md — Google OAuth added to URL-change checklist
+
+Section 5 "Checklist When ngrok URL Changes" now has three subsections: Frontend + backend config, Meta OAuth, and Google OAuth. The Google section adds the two steps that were missing: update `GOOGLE_REDIRECT_URI` in `backend/.env` and update the Authorized redirect URI in Google Cloud Console.
+
+### all_markdown_combined.md — regenerated
+
+Rebuilt from the 9 current top-level reference docs (AD.md, CLAUDE.md, DEV_QUICKSTART.md, NGROK_SETUP.md, QUICK_START.md, README.md, SCHEMAS.md, STAGING_POLICY.md, TEST.md). Previous version was stale and incorrectly included itself.
+
+### QUICK_START.md — full rewrite for both platforms
+
+Reorganized from a 6-step Meta-only walkthrough into a structured dual-platform guide
+with numbered sections (§1–§5 + Appendix) so users can jump to any step and immediately
+see what they need to have done first.
+
+- §1 Sign up — unchanged, minor expansion
+- §2 Connect — Meta (§2.1) and Google (§2.2) with account picker, MCC login-customer-id, and manual customer ID details
+- §3 Meta Ads (§3.1–§3.5) — deep sequential workflow: import metrics, ingest structure, generate variants (static text + dynamic AI), run BO, push to Meta
+- §4 Google Ads (§4.1–§4.5) — parallel structure to §3: view campaigns, ingest (with creative type table), generate RSA text, run BO, push (with pinning explanation)
+- §5 Ad Library — standalone, delete behavior for ingested vs generated ads
+- Appendix — Meta ↔ Google concept map (Campaign, Ad Set/Group, Dynamic/RSA, primary_text gap, image/video slots, Advantage+/pMax, with "future release" notes on open equivalences)
+
+### README.md — external-facing docs updated for Google Ads
+
+- Intro: mentions Meta and Google Ads
+- System architecture: shows Google provider layer alongside Meta
+- AI module descriptions: text gen notes platform-aware slots; combiner notes `image_vec=None` zero-padding
+- BO endpoints: lists both `/api/bo/run` (Meta) and `/api/google/bo/run` (Google)
+- Prerequisites: added Google OAuth client + developer token
+- API keys table: added Google Ads row
+- Feature Walkthrough: added "Connect Google Ads" and "Google Campaigns" sections with full flow description
+- API Reference: reorganized into Meta and Google subsections; added all Google routes (campaigns, ingest, text gen, BO, push)
+- Masking/Demo Mode: added Google masking table; noted `APP_MODE=demo` enables both platforms
+- Notes: updated Meta token note; added Google token note; added "new ads are always PAUSED" note; added Google RSA BO note
+
+### Documentation sweep — all internal .md files
+
+Updated all internal documentation to reflect the completed Google Ads integration (Chunks 1–10). External-facing docs (`README.md`, `QUICK_START.md`) deferred.
+
+- `SCHEMAS.md`: added `users.tier`, `oauth_states.provider`, `ad_insights.platform`, `ad_creative_structures.platform`, `dynamic_generation_jobs.seed_ad_id/adset_id/meta_ad_id/images_generated`, `bo_selections.google_ad_resource_name`; added `google_connections`, `google_pending_connections`, and `ad_image_embeddings` table sections (the last was missing entirely); expanded `creative_type` values to include Google types (`rsa`, `display`, `video`, `pmax`, `shopping`, `unknown`).
+- `backend/TEST.md`: added full catalog entries for all 10 Google test files with per-test descriptions and run commands.
+- `TEST.md` (root): added Google test table, fixed `tests/` path prefix throughout, added pointer to `backend/TEST.md`.
+- `GOOGLE_INTEGRATION_PLAN.md`: marked Chunks 1–10 as ✅ Complete, Chunk 11 as ⬜ Not started; updated intro from "Work has not started yet".
+- `AD.md`: added "Google RSA support" section covering NULL image_vec embedding, BO over text-only combinations, and pMax/Shopping handling.
+- `DEV_QUICKSTART.md`: added Google Ads env vars section (client ID/secret, redirect URI, developer token, API version).
+- `backend/ad_text_generation/README.md`: documented `platform` parameter, `GOOGLE_RSA_SLOTS`, `slots_for_platform()`, `GOOGLE_RSA_SLOT_HINTS`, and `get_generated_slots_for_source()`; fixed test paths.
+- `backend/embeddings/README.md`: fixed test paths to use `tests/` prefix.
+- `backend/ad_combination_embeddings/README.md`: added RSA slots note (`slots=('headline','description')`), example for Google RSA, fixed test paths.
+- `NGROK_SETUP.md`: updated Vite proxy config block to match actual `vite.config.js` (added `/auth/google`, `/images`, `/ad-images`; noted `VITE_PORT` and `VITE_BACKEND_URL` env vars).
 
 ### Chunk 10 — Google demo/masking layer
 

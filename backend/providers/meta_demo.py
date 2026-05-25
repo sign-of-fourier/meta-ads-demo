@@ -138,7 +138,7 @@ class DemoMetaProvider(PlatformProvider):
     ):
         demo_structure = {
             "demo_camp_1": (
-                [{"id": "demo_adset_1", "name": "Demo Adset 1", "status": "ACTIVE", "campaign_id": "demo_camp_1"}],
+                [{"id": "demo_adset_1", "name": "Demo Adset 1", "status": "ACTIVE", "campaign_id": "demo_camp_1", "targeting": {"publisher_platforms": ["facebook", "instagram"], "facebook_positions": ["feed", "story"], "instagram_positions": ["stream", "story"]}}],
                 [
                     {
                         "id": "demo_ad_1",
@@ -157,7 +157,7 @@ class DemoMetaProvider(PlatformProvider):
                 ],
             ),
             "demo_camp_2": (
-                [{"id": "demo_adset_2", "name": "Demo Adset 2", "status": "ACTIVE", "campaign_id": "demo_camp_2"}],
+                [{"id": "demo_adset_2", "name": "Demo Adset 2", "status": "ACTIVE", "campaign_id": "demo_camp_2", "targeting": {"publisher_platforms": ["facebook", "instagram"], "facebook_positions": ["feed"], "instagram_positions": ["stream", "explore"]}}],
                 [
                     {
                         "id": "demo_ad_2",

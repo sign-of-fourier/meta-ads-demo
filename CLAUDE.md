@@ -167,17 +167,24 @@ Public entry points: `embed_all_combinations(source_id, components, slots=TEXT_S
 
 ## Embedding combiner (`backend/ad_embedding_combiner/`)
 
-Standalone pure module. Truncates text and image embeddings to fixed dimensions (`TEXT_DIM=128`, `IMAGE_DIM=128`) and concatenates them into a single feature vector for GPR/BO. Separated because the combination strategy may change independently of the BO logic.
+Standalone pure module. Concatenates the full text and image embeddings into a single feature vector for GPR/BO — no truncation. `TEXT_DIM=1536`, `IMAGE_DIM=1536`, output is 3072-dim. PCA in the BO pipeline then reduces this to the working dimension (default 64). Separated because the combination strategy may change independently of the BO logic.
 
 Public entry points: `combine(text_vec, image_vec)`, `truncate_pad(vec, dim)`, `output_dim()`, `TEXT_DIM`, `IMAGE_DIM` from `ad_embedding_combiner/combiner.py`. `image_vec` may be `None` — the image half of the combined vector is zero-padded. This allows RSA (text-only) ads to participate in BO without image embeddings.
 
 ## Bayesian Optimisation pipeline (`backend/bo_pipeline/`)
 
-Standalone sync module. Fits a GPR on scored image variants, then selects two candidate text+image combinations via Expected Improvement (pick 1) and a fantasy step (pick 2, batch BO). Operates strictly per-ad — scored variants and text candidates must share the same seed ad. See **`backend/bo_pipeline/`** for implementation details.
+Standalone sync module. Selects two candidate text+image combinations to test next. Operates strictly per-ad — scored variants and text candidates must share the same seed ad. See **`backend/bo_pipeline/`** for implementation details.
 
-Public entry points: `run_bo(seed_ad_id, text_source_id, user_id, db_path)` → list of up to 2 picks; `save_bo_run(...)`, `get_latest_bo_run(...)` for persistence.
+**Two methods — controlled by `method` kwarg to `run_bo()` and by env vars:**
 
-Key design: `selector.py` is the only file that knows the DB schema; `gpr.py` is pure numpy/sklearn; `pipeline.py` orchestrates. Falls back to random selection when fewer than 2 scored observations exist.
+| Method | How it works | Activated when |
+|---|---|---|
+| `"modal"` (default) | PCA-reduces 3072-dim embeddings to `MODAL_BO_PCA_DIMS` dims (default 64), calls the Modal GP service (stateless q-EI endpoint, proper batch BO), snaps returned PCA coords to nearest unvisited candidate | `MODAL_BO_API_URL` is set |
+| `"local"` | Fits a local sklearn GPR, picks highest EI (pick 1), re-fits with a fantasy observation to pick a diverse second candidate | Always available; automatic fallback when Modal is unconfigured or fails |
+
+Public entry points: `run_bo(seed_ad_id, text_source_id, user_id, db_path, method="modal")` → list of up to 2 picks; `save_bo_run(...)`, `get_latest_bo_run(...)` for persistence.
+
+Key design: `selector.py` is the only file that knows the DB schema; `gpr.py` is pure numpy/sklearn (local path only); `modal_bo.py` contains PCA helpers, the Modal HTTP call, and nearest-pool snap; `pipeline.py` orchestrates both paths. Falls back to random selection when fewer than 2 scored observations exist.
 
 Scored combinations: `ad_generation_variants` (score IS NOT NULL, status != defunct) joined via `ad_embeddings` using convention `ad_id = gen_{job_id}_{variant_id}`.
 Candidate combinations: **N_text × N_images cross-product** — all rows in `ad_text_combination_embeddings` for `text_source_id`, each paired with every row in `ad_image_embeddings` for the seed ad. Falls back to the seed ad's single `image_vector` from `ad_embeddings` if no per-image embeddings exist. Each pick's `combination` dict includes `image_url` (the local `/ad-images/...` URL) for display. With 64 text combos and 4 image embeddings → 256 candidates.
@@ -293,9 +300,9 @@ Used by: `embeddings/embedder.py` → `embed_image_url()`
 | `AZURE_OPENAI_KEY` | Azure OpenAI API key |
 | `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource endpoint (e.g. `https://your-resource.openai.azure.com/`) |
 | `AZURE_OPENAI_API_VERSION` | Defaults to `2024-12-01-preview` |
-| `AZURE_ANALYSIS_DEPLOYMENT` | GPT-4o deployment for image analysis (default `gpt-4o`) |
-| `AZURE_SCORING_DEPLOYMENT` | Fine-tuned scorer deployment (default `gpt-4-04-14`) |
-| `AZURE_TEXT_GEN_DEPLOYMENT` | GPT-4o deployment for text generation (default `gpt-4o`) |
+| `AZURE_ANALYSIS_DEPLOYMENT` | Deployment for image analysis (default `gpt-4.1-nano`) |
+| `MODAL_SCORING_ENDPOINT` | Modal endpoint for fine-tuned Qwen2-VL ad scorer (default is the `bad-ads-qwen2vl` deployment) |
+| `AZURE_TEXT_GEN_DEPLOYMENT` | Deployment for text generation (default `gpt-4.1-nano`) |
 
 Used by: `ad_generation/` pipeline (analyze, score, QA, text gen steps)
 
@@ -306,6 +313,14 @@ Used by: `ad_generation/` pipeline (analyze, score, QA, text gen steps)
 | `IMAGES_SERVE_BASE_URL` | Base URL for serving generated images (default `http://localhost:8000/images`). Must be a full URL with scheme — used by the ad generation pipeline for scoring/QA and by `_upload_image_to_meta` to resolve local file paths. |
 
 Used by: `ad_generation/` pipeline (generate + poll steps)
+
+#### 5. Modal GP service — Bayesian Optimisation
+| Variable | Description |
+|---|---|
+| `MODAL_BO_API_URL` | Full URL of the Modal GP q-EI endpoint. Leave blank to fall back to local sklearn GPR. |
+| `MODAL_BO_PCA_DIMS` | PCA components to reduce 3072-dim embeddings to before the API call (default `64`). Lower = faster; higher = more fidelity. |
+
+Used by: `bo_pipeline/modal_bo.py` → `call_modal_api()`. When unset, `run_bo()` silently uses the local `"local"` (GPR + fantasy) path.
 
 ### Masking layer env vars
 
@@ -377,6 +392,6 @@ See `DEV_QUICKSTART.md` for full curl examples covering auth, ingest, embeddings
 
 ## Known technical notes
 
-- `combined_vector` stored in `ad_embeddings` is the **raw concatenation** of text (1536-dim) + image (1536-dim) = 3072-dim float32 blob. The BO pipeline's `_build_X()` truncates via `ad_embedding_combiner` to 256-dim at inference time. The stored blob is not used directly by the BO; it is informational only.
+- `combined_vector` stored in `ad_embeddings` is the **raw concatenation** of text (1536-dim) + image (1536-dim) = 3072-dim float32 blob. `_build_X()` now uses the full 3072-dim vectors (no truncation) via `ad_embedding_combiner` (`TEXT_DIM=1536`, `IMAGE_DIM=1536`); PCA in `_run_modal_bo` / `_run_local_bo` reduces to the working dimension at inference time. The stored blob is not used directly by the BO; it is informational only.
 - The `embed_ad` fallback path uses image_vector slot from `ad_embeddings` (the seed ad's combined_vector image slot), not from `ad_image_embeddings`. Per-image BO uses `ad_image_embeddings` directly in `selector.get_candidate_combinations`.
 - Google RSA ads produce `image_vector = NULL` in `ad_embeddings` (no image URL available from GAQL). The BO combiner zero-pads the image half of the combined vector when `image_vec=None`. RSA BO therefore optimises over text combinations only, with a constant zero image component — this is intentional for RSA ads.

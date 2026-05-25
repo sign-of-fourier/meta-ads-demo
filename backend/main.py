@@ -325,6 +325,118 @@ _AD_IMAGES_DIR.mkdir(exist_ok=True)
 app.mount("/ad-images", StaticFiles(directory=str(_AD_IMAGES_DIR)), name="ad_images")
 
 
+_PLACEMENT_RATIOS: dict[tuple[str, str], tuple[int, int]] = {
+    ("facebook", "feed"):              (1, 1),
+    ("facebook", "right_hand_column"): (191, 100),
+    ("facebook", "story"):             (9, 16),
+    ("facebook", "reels"):             (9, 16),
+    ("facebook", "video_feeds"):       (16, 9),
+    ("facebook", "marketplace"):       (1, 1),
+    ("facebook", "instant_article"):   (191, 100),
+    ("instagram", "stream"):           (1, 1),
+    ("instagram", "story"):            (9, 16),
+    ("instagram", "explore"):          (1, 1),
+    ("instagram", "reels"):            (9, 16),
+}
+
+_PLACEMENT_LABELS: dict[tuple[str, str], str] = {
+    ("facebook", "feed"):              "FB Feed",
+    ("facebook", "right_hand_column"): "FB Right Column",
+    ("facebook", "story"):             "FB Story",
+    ("facebook", "reels"):             "FB Reels",
+    ("facebook", "video_feeds"):       "FB Video",
+    ("facebook", "marketplace"):       "FB Marketplace",
+    ("facebook", "instant_article"):   "FB Article",
+    ("instagram", "stream"):           "IG Feed",
+    ("instagram", "story"):            "IG Story",
+    ("instagram", "explore"):          "IG Explore",
+    ("instagram", "reels"):            "IG Reels",
+}
+
+
+def _parse_placements(targeting: dict) -> list[dict]:
+    """Convert a Meta targeting dict into a deduplicated list of placement descriptors."""
+    seen_ratios: set[tuple[int, int]] = set()
+    result = []
+    for platform in targeting.get("publisher_platforms", []):
+        if platform == "facebook":
+            positions = targeting.get("facebook_positions", ["feed"])
+        elif platform == "instagram":
+            positions = targeting.get("instagram_positions", ["stream"])
+        else:
+            continue
+        for pos in positions:
+            key = (platform, pos)
+            ratio = _PLACEMENT_RATIOS.get(key)
+            if ratio is None:
+                continue
+            if ratio not in seen_ratios:
+                seen_ratios.add(ratio)
+                result.append({
+                    "platform": platform,
+                    "position": pos,
+                    "label": _PLACEMENT_LABELS.get(key, f"{platform} {pos}"),
+                    "ratio_w": ratio[0],
+                    "ratio_h": ratio[1],
+                })
+    return result
+
+
+def _image_dimensions(image_url: str) -> tuple[int | None, int | None]:
+    """Return (width, height) for a local image URL, or (None, None) if unresolvable."""
+    if not image_url:
+        return None, None
+    try:
+        if "/ad-images/" in image_url:
+            filename = image_url.split("/ad-images/")[-1]
+            path = _AD_IMAGES_DIR / filename
+        elif "/images/" in image_url:
+            filename = image_url.split("/images/")[-1]
+            path = _GENERATED_IMAGES_DIR / filename
+        else:
+            return None, None
+        if not path.exists():
+            return None, None
+        # Read PNG dimensions from IHDR chunk (bytes 16–24) without PIL dependency
+        import struct
+        with open(path, "rb") as f:
+            header = f.read(24)
+        if header[:8] == b"\x89PNG\r\n\x1a\n":
+            w, h = struct.unpack(">II", header[16:24])
+            return w, h
+        # JPEG: scan for SOF marker
+        with open(path, "rb") as f:
+            data = f.read()
+        i = 0
+        while i < len(data) - 9:
+            if data[i] == 0xFF and data[i + 1] in (0xC0, 0xC1, 0xC2):
+                h = (data[i + 5] << 8) | data[i + 6]
+                w = (data[i + 7] << 8) | data[i + 8]
+                return w, h
+            i += 1
+        return None, None
+    except Exception:
+        return None, None
+
+
+def _resolve_combination_image_url(combination: dict) -> dict:
+    """Replace expired CDN image URLs with local URLs; add image dimensions."""
+    image_url = combination.get("image_url")
+    if not image_url:
+        return combination
+    out = dict(combination)
+    if "localhost" not in image_url:
+        filename = image_url.split("?")[0].rsplit("/", 1)[-1]
+        if (_AD_IMAGES_DIR / filename).exists():
+            backend_base = os.getenv("IMAGES_SERVE_BASE_URL", "http://localhost:8000/images").replace("/images", "")
+            out["image_url"] = f"{backend_base}/ad-images/{filename}"
+    w, h = _image_dimensions(out["image_url"])
+    if w and h:
+        out["image_width"] = w
+        out["image_height"] = h
+    return out
+
+
 # ── JWT auth helpers ───────────────────────────────────────────────────────────
 def create_token(user_id: int) -> str:
     payload = {
@@ -516,6 +628,8 @@ class SuggestionResponse(BaseModel):
 # ── Auth routes (local) ───────────────────────────────────────────────────────
 @app.post("/auth/signup", response_model=TokenResponse)
 def signup(body: SignupLogin):
+    if len(body.password.encode()) > 72:
+        raise HTTPException(400, "Password must be 72 characters or fewer")
     db = get_db()
     existing = db.execute("SELECT id FROM users WHERE email = ?", (body.email,)).fetchone()
     if existing:
@@ -535,7 +649,12 @@ def login(body: SignupLogin):
     db = get_db()
     row = db.execute("SELECT id, pw_hash FROM users WHERE email = ?", (body.email,)).fetchone()
     db.close()
-    if not row or not pwd_ctx.verify(body.password, row["pw_hash"]):
+    try:
+        password_ok = row and pwd_ctx.verify(body.password, row["pw_hash"])
+    except ValueError:
+        # bcrypt rejects passwords > 72 bytes — treat as wrong password
+        password_ok = False
+    if not password_ok:
         raise HTTPException(401, "Invalid email or password")
     return TokenResponse(token=create_token(row["id"]))
 
@@ -1285,6 +1404,14 @@ async def ingest_campaign_structure(
             client, access_token, ad_account_id, campaign_id
         )
 
+    # Build adset_id → placements map from targeting data
+    adset_placements: dict[str, list[dict]] = {}
+    for adset in _adsets:
+        targeting = adset.get("targeting") or {}
+        parsed = _parse_placements(targeting)
+        if parsed:
+            adset_placements[adset["id"]] = parsed
+
     data_source, mask_profile = _current_data_provenance()
     db = get_db()
 
@@ -1340,6 +1467,25 @@ async def ingest_campaign_structure(
                 ),
             )
             components_saved += 1
+
+        # Store placement data for this ad if available from its adset's targeting
+        if adset_id in adset_placements:
+            db.execute(
+                """
+                INSERT INTO ad_creative_structures
+                    (user_id, ad_account_id, campaign_id, adset_id, ad_id,
+                     creative_type, slot, slot_index, value, ingested_at,
+                     lifecycle_status, data_source, mask_profile)
+                VALUES (?, ?, ?, ?, ?, ?, '_placements', 0, ?, ?, ?, ?, ?)
+                ON CONFLICT (user_id, ad_id, slot, slot_index)
+                DO UPDATE SET value = excluded.value, ingested_at = excluded.ingested_at
+                """,
+                (
+                    user_id, ad_account_id, campaign_id, adset_id, ad_id,
+                    creative_type, json.dumps(adset_placements[adset_id]),
+                    ingested_at, lifecycle_status, data_source, mask_profile,
+                ),
+            )
 
         ads_processed += 1
 
@@ -2004,6 +2150,7 @@ class BOPick(BaseModel):
     ei_score: float | None = None
     gpr_mean: float | None = None
     gpr_std: float | None = None
+    placements: list[dict] = []
 
 
 class BORunRequest(BaseModel):
@@ -2017,6 +2164,29 @@ class BORunResponse(BaseModel):
     picks: list[BOPick]
     scored_count: int
     candidate_count: int
+
+
+def _get_placements_for_ad(ad_id: str, user_id: int) -> list[dict]:
+    """Return parsed placements for an ad by reading its stored _placements slot."""
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT value FROM ad_creative_structures WHERE user_id=? AND ad_id=? AND slot='_placements' LIMIT 1",
+            (user_id, ad_id),
+        ).fetchone()
+        if row and row["value"]:
+            return json.loads(row["value"])
+    except Exception:
+        pass
+    finally:
+        db.close()
+    return []
+
+
+def _enrich_pick(p: dict, seed_ad_id: str, user_id: int) -> BOPick:
+    combo = _resolve_combination_image_url(p["combination"])
+    placements = _get_placements_for_ad(seed_ad_id, user_id)
+    return BOPick(**{**p, "combination": combo, "placements": placements})
 
 
 @app.post("/api/bo/run", response_model=BORunResponse)
@@ -2039,7 +2209,7 @@ def run_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_current_user_
     return BORunResponse(
         seed_ad_id=body.seed_ad_id,
         text_source_id=body.text_source_id,
-        picks=[BOPick(**p) for p in picks],
+        picks=[_enrich_pick(p, body.seed_ad_id, user_id) for p in picks],
         scored_count=len(scored),
         candidate_count=len(candidates),
     )
@@ -2049,7 +2219,7 @@ def run_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_current_user_
 def get_bo_results(ad_id: str, user_id: int = Depends(get_current_user_id)):
     """Return the most recent BO picks for an ad."""
     from bo_pipeline.storage import DB_PATH as BO_DB_PATH, get_latest_bo_run
-    return [BOPick(**p) for p in get_latest_bo_run(ad_id, ad_id, BO_DB_PATH)]
+    return [_enrich_pick(p, ad_id, user_id) for p in get_latest_bo_run(ad_id, ad_id, BO_DB_PATH)]
 
 
 @app.post("/api/google/bo/run", response_model=BORunResponse)
@@ -2086,7 +2256,7 @@ def run_google_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_curren
     return BORunResponse(
         seed_ad_id=body.seed_ad_id,
         text_source_id=body.text_source_id,
-        picks=[BOPick(**p) for p in picks],
+        picks=[_enrich_pick(p, body.seed_ad_id, user_id) for p in picks],
         scored_count=len(scored),
         candidate_count=len(candidates),
     )
@@ -2096,7 +2266,7 @@ def run_google_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_curren
 def get_google_bo_results(ad_id: str, user_id: int = Depends(get_current_user_id)):
     """Return the most recent BO picks for a Google ad."""
     from bo_pipeline.storage import DB_PATH as BO_DB_PATH, get_latest_bo_run
-    return [BOPick(**p) for p in get_latest_bo_run(ad_id, ad_id, BO_DB_PATH)]
+    return [_enrich_pick(p, ad_id, user_id) for p in get_latest_bo_run(ad_id, ad_id, BO_DB_PATH)]
 
 
 # ── Push to Meta ─────────────────────────────────────────────────────────────
