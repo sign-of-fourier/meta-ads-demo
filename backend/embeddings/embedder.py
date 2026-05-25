@@ -57,6 +57,11 @@ async def embed_image_url(image_url: str) -> np.ndarray | None:
     """Download image and embed via Azure AI Inference ImageEmbeddingsClient."""
     if not image_url:
         return None
+    # Relative paths (e.g. /ad-images/...) are served by the local FastAPI server.
+    # httpx requires an absolute URL, so resolve them against localhost.
+    if image_url.startswith("/"):
+        _port = int(os.getenv("PORT", "8000"))
+        image_url = f"http://localhost:{_port}{image_url}"
     try:
         import base64
         import httpx

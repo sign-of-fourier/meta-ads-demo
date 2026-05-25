@@ -4,7 +4,18 @@ from typing import Any, Dict, List, Tuple
 import httpx
 
 
-class MetaProvider(ABC):
+class PlatformProvider(ABC):
+    @property
+    @abstractmethod
+    def platform_name(self) -> str:
+        """Identifies the ad platform (e.g. 'meta', 'google')."""
+        ...
+
+    @abstractmethod
+    def normalize_creative(self, ad: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]]:
+        """Derive (creative_type, components) from a raw ad dict."""
+        ...
+
     @abstractmethod
     async def fetch_campaigns_and_insights(
         self,
@@ -66,3 +77,7 @@ class MetaProvider(ABC):
             ads: list of ad dicts with expanded creative fields
         """
         ...
+
+
+# Backward-compatible alias — existing imports of MetaProvider still work.
+MetaProvider = PlatformProvider

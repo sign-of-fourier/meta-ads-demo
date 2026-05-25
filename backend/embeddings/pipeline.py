@@ -170,7 +170,8 @@ async def embed_images(
         ref = comp["value"]
         if idx in existing:
             return
-        if not ref.startswith("http"):
+        if not ref.startswith(("http", "/")):
+            # Pure asset hash (e.g. Meta image hash) — no URL to fetch
             logger.info("embed_images: skipping hash-only image at slot %d for ad %s", idx, ad_id)
             return
         vec = await embed_image_url(ref)

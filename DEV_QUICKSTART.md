@@ -18,6 +18,17 @@ JWT_SECRET=any_random_string
 META_API_VERSION=v19.0
 ```
 
+### Required — Google Ads (optional until Google integration activated)
+```env
+GOOGLE_CLIENT_ID=your_google_oauth_client_id
+GOOGLE_CLIENT_SECRET=your_google_oauth_client_secret
+GOOGLE_REDIRECT_URI=https://<your-ngrok-subdomain>.ngrok-free.dev/auth/google/callback
+GOOGLE_DEVELOPER_TOKEN=your_google_developer_token
+GOOGLE_ADS_API_VERSION=v18
+```
+
+The Google OAuth callback follows the same flow as Meta but includes an account picker: after callback the user is redirected to `/app/settings?google_pick=<key>` to choose which Google Ads account to connect.
+
 ### AI services — four separate accounts, do not mix up keys
 
 | Service | What it does | Key var | Endpoint var |
@@ -41,9 +52,9 @@ AZURE_IMAGE_MODEL=embed-v-4-0
 AZURE_OPENAI_KEY=...
 AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
 AZURE_OPENAI_API_VERSION=2024-12-01-preview
-AZURE_ANALYSIS_DEPLOYMENT=gpt-4o
+AZURE_ANALYSIS_DEPLOYMENT=gpt-4.1-nano
 AZURE_SCORING_DEPLOYMENT=gpt-4-04-14
-AZURE_TEXT_GEN_DEPLOYMENT=gpt-4o
+AZURE_TEXT_GEN_DEPLOYMENT=gpt-4.1-nano
 
 # Image generation (deAPI / FLUX)
 DEAPI_API_KEY=...
@@ -229,21 +240,24 @@ Expected (with ≥2 scored observations):
       "gpr_std": 1.09
     },
     {
-      "selection_type": "fantasy",
+      "selection_type": "modal_q_ei",
       "combination": { "..." : "..." },
-      "ei_score": 0.085,
-      "gpr_mean": 5.614,
-      "gpr_std": 0.997
+      "ei_score": null,
+      "gpr_mean": null,
+      "gpr_std": null
     }
   ]
 }
 ```
 
-- `scored_count` — training observations used by GPR
+- `scored_count` — training observations used by the GP
 - `candidate_count` — unscored combinations evaluated (should be 64 minus scored)
-- `selection_type: "ei"` — highest Expected Improvement pick
-- `selection_type: "fantasy"` — diversity pick via fantasy GPR step
+- `selection_type: "modal_q_ei"` — both picks jointly selected by the Modal GP service via batch q-EI (default when `MODAL_BO_API_URL` is set)
+- `selection_type: "ei"` — pick 1 via local sklearn GPR Expected Improvement (local fallback path)
+- `selection_type: "fantasy"` — pick 2 via local GPR fantasy step (local fallback path)
 - With fewer than 2 scored observations → `selection_type: "random"`
+
+`ei_score`, `gpr_mean`, `gpr_std` are `null` for `modal_q_ei` picks (the Modal API does not return per-candidate GP stats in production mode).
 
 Get latest picks later:
 ```bash

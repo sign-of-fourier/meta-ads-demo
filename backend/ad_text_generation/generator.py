@@ -13,9 +13,17 @@ import os
 
 from openai import AzureOpenAI
 
-from ad_text_generation.prompts import GENERATE_SLOT_VARIANTS, SLOT_HINTS
+from ad_text_generation.prompts import GENERATE_SLOT_VARIANTS, GOOGLE_RSA_SLOT_HINTS, SLOT_HINTS
 
 TEXT_SLOTS = ("headline", "primary_text", "description", "cta")
+GOOGLE_RSA_SLOTS = ("headline", "description")
+
+
+def slots_for_platform(platform: str) -> tuple[str, ...]:
+    """Return the text slots that should be generated for a given platform."""
+    if platform == "google":
+        return GOOGLE_RSA_SLOTS
+    return TEXT_SLOTS
 
 
 def _make_client() -> AzureOpenAI:
@@ -30,6 +38,7 @@ async def generate_slot_variants(
     slot: str,
     existing_values: list[str],
     n_variants: int = 5,
+    platform: str = "meta",
 ) -> list[str]:
     """
     Generate n_variants new copy strings for one slot.
@@ -40,12 +49,13 @@ async def generate_slot_variants(
     underdelivers (caller should handle gracefully).
     """
     client = _make_client()
-    deployment = os.getenv("AZURE_TEXT_GEN_DEPLOYMENT", "gpt-4o")
+    deployment = os.getenv("AZURE_TEXT_GEN_DEPLOYMENT", "gpt-4.1-nano")
 
+    hints = GOOGLE_RSA_SLOT_HINTS if platform == "google" else SLOT_HINTS
     values_list = "\n".join(f"  - {v}" for v in existing_values if v)
     prompt = GENERATE_SLOT_VARIANTS.format(
         slot=slot,
-        slot_hint=SLOT_HINTS.get(slot, ""),
+        slot_hint=hints.get(slot, ""),
         existing_values_list=values_list or "  (none provided)",
         n_variants=n_variants,
     )
@@ -73,15 +83,17 @@ async def generate_all_slots(
     seed_components: list[dict],
     n_per_slot: int = 5,
     slots: list[str] | None = None,
+    platform: str = "meta",
 ) -> dict[str, list[str]]:
     """
     Generate text variants for all (or selected) text slots in parallel.
 
     seed_components — list of {slot, slot_index, value} dicts
-    slots           — which slots to generate; defaults to all TEXT_SLOTS present in seed
+    slots           — which slots to generate; defaults to platform-appropriate slots
+    platform        — 'meta' or 'google'; controls which slots and prompt hints to use
     Returns dict mapping slot → list of new variant strings.
     """
-    target_slots = slots or list(TEXT_SLOTS)
+    target_slots = slots or list(slots_for_platform(platform))
 
     # Collect existing values per slot from seed
     existing: dict[str, list[str]] = {s: [] for s in target_slots}
@@ -94,7 +106,7 @@ async def generate_all_slots(
     # Generate all slots in parallel; skip slots with no seed values only if
     # caller explicitly passed a restricted slot list — otherwise still generate
     tasks = {
-        slot: generate_slot_variants(slot, vals, n_per_slot)
+        slot: generate_slot_variants(slot, vals, n_per_slot, platform=platform)
         for slot, vals in existing.items()
         if slot in target_slots
     }

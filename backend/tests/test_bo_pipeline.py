@@ -103,6 +103,18 @@ CREATE TABLE IF NOT EXISTS ad_text_combination_embeddings (
     embedded_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (source_id, combination_key)
 );
+CREATE TABLE IF NOT EXISTS ad_image_embeddings (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    ad_id       TEXT NOT NULL,
+    campaign_id TEXT NOT NULL,
+    slot_index  INTEGER NOT NULL,
+    image_ref   TEXT NOT NULL,
+    vector      BLOB NOT NULL,
+    model       TEXT,
+    embedded_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (user_id, ad_id, slot_index)
+);
 """
 
 # Text combinations for the test: 8 combinations (headlines × primary_texts)
@@ -385,9 +397,14 @@ class TestSelector:
 
     def test_candidates_exclude_keys(self, test_db):
         from bo_pipeline.selector import get_candidate_combinations
-        exclude = {json.dumps(_TEXT_COMBOS[0], sort_keys=True, separators=(",", ":"))}
+        # Candidate combination_keys are compound: {"combo":{...},"image_slot":N}
+        # Exclusion must use the same compound format.
+        compound_key = json.dumps(
+            {"combo": _TEXT_COMBOS[0], "image_slot": 0},
+            sort_keys=True, separators=(",", ":"),
+        )
         candidates = get_candidate_combinations(
-            TEXT_SOURCE_ID, SEED_AD_ID, TEST_USER_ID, exclude_keys=exclude, db_path=test_db
+            TEXT_SOURCE_ID, SEED_AD_ID, TEST_USER_ID, exclude_keys={compound_key}, db_path=test_db
         )
         assert len(candidates) == len(_TEXT_COMBOS) - 1
 
@@ -426,7 +443,9 @@ class TestBOPipeline:
     @pytest.fixture(scope="class")
     def bo_result(self, test_db):
         from bo_pipeline import run_bo
-        return run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db)
+        # Pin method="local" so these tests always exercise the GPR+fantasy path
+        # regardless of whether MODAL_BO_API_URL is set in the environment.
+        return run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db, method="local")
 
     def test_returns_two_picks(self, bo_result):
         assert len(bo_result) == 2
@@ -509,7 +528,7 @@ class TestBOPipeline:
         conn.commit()
         conn.close()
 
-        picks = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=empty_db)
+        picks = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=empty_db, method="local")
         assert len(picks) == 2
         for pick in picks:
             assert pick["selection_type"] == "random"
@@ -547,7 +566,11 @@ class TestBOPipeline:
             print(f"  [{i+1}] score={s['score']:.2f}  combo={s['combination']}")
 
         assert n_scored == N_SCORED
-        assert n_candidates == len(_TEXT_COMBOS) - 1  # one combo key used for all scored variants
+        # Scored keys are plain text-combo JSON; candidate keys are compound
+        # {"combo":{...},"image_slot":N} — the formats don't overlap, so no
+        # candidates are excluded even though all scored variants share one
+        # text combo.  The full candidate pool (all 8 combos) is returned.
+        assert n_candidates == len(_TEXT_COMBOS)
 
         # ---- 2. Fit GPR ----
         from ad_embedding_combiner import combine
@@ -574,7 +597,7 @@ class TestBOPipeline:
         assert np.all(ei_scores >= 0)
 
         # ---- 4. Full pipeline run (EI pick + fantasy pick) ----
-        picks = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db)
+        picks = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db, method="local")
 
         pick1, pick2 = picks
         mu1, sig1 = predict_with_std(gpr, scaler, X_cands[[int(np.argmax(ei_scores))]])

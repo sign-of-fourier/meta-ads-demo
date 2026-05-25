@@ -15,17 +15,18 @@ DB_PATH = Path(__file__).parent.parent / "app.db"
 
 _CREATE = """
 CREATE TABLE IF NOT EXISTS bo_selections (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    seed_ad_id      TEXT NOT NULL,
-    text_source_id  TEXT NOT NULL,
-    pick_rank       INTEGER NOT NULL,
-    combination_key TEXT NOT NULL,
-    combination     TEXT NOT NULL,
-    selection_type  TEXT NOT NULL,
-    ei_score        REAL,
-    gpr_mean        REAL,
-    gpr_std         REAL,
-    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    seed_ad_id              TEXT NOT NULL,
+    text_source_id          TEXT NOT NULL,
+    pick_rank               INTEGER NOT NULL,
+    combination_key         TEXT NOT NULL,
+    combination             TEXT NOT NULL,
+    selection_type          TEXT NOT NULL,
+    ei_score                REAL,
+    gpr_mean                REAL,
+    gpr_std                 REAL,
+    google_ad_resource_name TEXT,
+    created_at              TEXT NOT NULL DEFAULT (datetime('now'))
 )
 """
 

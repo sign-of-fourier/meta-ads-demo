@@ -17,6 +17,7 @@ export default defineConfig(({ mode }) => {
         "/auth/signup": backendUrl,
         "/auth/login": backendUrl,
         "/auth/meta": backendUrl,
+        "/auth/google": backendUrl,
         "/me": backendUrl,
         "/images": backendUrl,
         "/ad-images": backendUrl,

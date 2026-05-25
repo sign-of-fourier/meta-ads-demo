@@ -14,6 +14,12 @@ SLOT_HINTS: dict[str, str] = {
     "cta":          "Call-to-action button text, typically 2–4 action words like 'Shop Now', 'Learn More', 'Get Started'. Match the intent of the ad.",
 }
 
+# Google RSA-specific hints — stricter character limits enforced by Google Ads
+GOOGLE_RSA_SLOT_HINTS: dict[str, str] = {
+    "headline":    "Google RSA headline. MUST be 30 characters or fewer. Concise, keyword-rich phrase. Count characters carefully.",
+    "description": "Google RSA description. MUST be 90 characters or fewer. One or two complete sentences that support the headline.",
+}
+
 # ---------------------------------------------------------------------------
 # Main text generation prompt
 # Used by: generator.py

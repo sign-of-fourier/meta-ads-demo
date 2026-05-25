@@ -28,8 +28,9 @@ export default function App() {
           {loggedIn && (
             <div className="nav-links">
               <Link to="/app/settings">Settings</Link>
-              <Link to="/app/campaigns">Campaigns</Link>
-              <Link to="/app/ads">Ads</Link>
+              <Link to="/app/campaigns">Meta Ads</Link>
+              <Link to="/app/google-campaigns">Google Ads</Link>
+              <Link to="/app/ads">Ad Library</Link>
               <Link to="/app/explore">Explorer</Link>
               <span className={`tier-badge tier-${user.tier}`}>{user.tier}</span>
               <button onClick={handleLogout} className="btn-link">

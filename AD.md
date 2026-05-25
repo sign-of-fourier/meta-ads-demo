@@ -147,7 +147,7 @@ image_vector (1536-dim)  ← Azure AI Inference embed-v-4-0 (raw model output)
 combined_vector (3072-dim) ← raw concat, stored as-is
 ```
 
-The combined_vector blob is informational — the BO pipeline does NOT use it directly. The BO applies its own truncation at inference time.
+The combined_vector blob is informational — the BO pipeline does NOT use it directly. The BO reads `text_vector` and `image_vector` separately and concatenates them at inference time via `ad_embedding_combiner`.
 
 **Smart skip:** Re-runs only if `text_snapshot` changed OR either vector is NULL. A past partial failure (e.g., image key missing) leaves a NULL column; the next ingest retries both.
 
@@ -191,17 +191,17 @@ During `_fetch_campaign_structure()`, `_download_ad_images(components)` is calle
 
 For locally generated images (from the AI image pipeline), images are already saved to `backend/generated_images/` and served at `/images/<filename>`, so no download step is needed.
 
-### Truncation for BO
+### Combination for BO
 
-The `ad_embedding_combiner` module (called only at BO inference time) truncates both vectors before passing them to the GPR:
+The `ad_embedding_combiner` module (called only at BO inference time) concatenates the full vectors from both modalities:
 
 ```
-text_vec  (1536-dim) → truncate to TEXT_DIM=128
-image_vec (1024-dim) → truncate to IMAGE_DIM=128
-combined  = [text_128 | image_128]  →  256-dim float32
+text_vec  (1536-dim) → TEXT_DIM=1536  (no truncation)
+image_vec (1536-dim) → IMAGE_DIM=1536 (no truncation)
+combined  = [text_1536 | image_1536]  →  3072-dim float32
 ```
 
-The leading dimensions of both OpenAI and Azure embeddings capture the bulk of semantic variance by design. 256 dimensions is a deliberate computational trade-off for fast GPR inference — see `backend/bo_pipeline/README.md` for the full rationale.
+PCA is then applied at BO inference time to reduce to `MODAL_BO_PCA_DIMS` (default 64) before the GP fits. Full embeddings are preserved in storage; PCA handles the dimensionality reduction that the GP requires.
 
 ---
 
@@ -218,9 +218,17 @@ Cross-product of:
 - All rows in `ad_image_embeddings` for the seed ad (up to 4 image embeddings)
 - Total: 64 × 4 = **256 candidates**
 
-Each candidate gets a 256-dim feature vector: `[text_combination_vector_128 | image_embedding_128]`.
+Each candidate gets a 3072-dim feature vector: `[text_combination_vector_1536 | image_embedding_1536]`.
 
-The GPR fits on scored observations, then Expected Improvement selects the two best unscored candidates. Pick 1 = highest EI. Pick 2 = highest EI after a "fantasy" refitting step that treats Pick 1 as already scored (encouraging diversity).
+Two selection methods are available (controlled by `MODAL_BO_API_URL`):
+
+**Modal GP q-EI (default when `MODAL_BO_API_URL` is set)**
+1. All 3072-dim combined vectors (scored ∪ candidates) are PCA-reduced to `MODAL_BO_PCA_DIMS` dims (default 64).
+2. A single POST to the Modal GP service fits a GP and jointly selects q=2 candidates via batch q-EI — proper batch BO, not a sequential approximation.
+3. Each returned PCA point is snapped to the nearest unvisited candidate in PCA space (greedy dedup).
+
+**Local GPR + fantasy step (fallback when Modal is unavailable)**
+The GP fits on scored observations, then Expected Improvement selects the two best unscored candidates. Pick 1 = highest EI. Pick 2 = highest EI after a "fantasy" refitting step that treats Pick 1 as already scored (encouraging diversity).
 
 ---
 
@@ -253,6 +261,43 @@ Both paths feed the same BO pipeline:
   + ad_generation_variants       (scored observations, training data)
   → bo_pipeline → 2 picks → bo_selections
 ```
+
+---
+
+## Google RSA support
+
+Google Responsive Search Ads (RSA) participate in the same embedding and BO pipeline as Meta ads, with one key difference: **no image**.
+
+### Embedding RSA ads
+
+`embed_ad` is called after Google structural ingest with no image component. The combiner handles a `None` image vector by zero-padding the image half of the feature vector:
+
+```
+text_vec  (1536-dim) → TEXT_DIM=1536  (no truncation)
+image_vec = None     → zeros (IMAGE_DIM=1536)
+combined  = [text_1536 | zeros_1536]  →  3072-dim float32
+```
+
+`embed_all_combinations` is called with `slots=('headline', 'description')` — no `primary_text` (RSA has no body equivalent). A RSA ad with 10 headlines and 4 descriptions produces 10 × 4 = 40 combination rows instead of 64.
+
+`embed_images` is **not** called for RSA ads — no URL images are available from GAQL.
+
+### BO on RSA
+
+The BO pipeline is platform-agnostic. For RSA:
+
+- The candidate pool is `ad_text_combination_embeddings` rows only — no per-image embeddings
+- The combined vector has a constant zero image component for all candidates
+- The GPR optimises over text combinations only; the image dimension contributes zero variance
+- `google_ad_resource_name` is written to `bo_selections` after a successful push to Google Ads
+
+The text generation route (`POST /api/google/generate/text/{campaign_id}`) uses `platform='google'` which restricts generated slots to `headline` and `description` with Google-specific character limits (headlines ≤ 30 chars, descriptions ≤ 90 chars).
+
+### pMax and Shopping
+
+- `creative_type='pmax'`: ingested with headline, description, image, and video slots from asset groups. Proceeds to text generation and BO (it has headline/description slots).
+- `creative_type='shopping'`: only a `final_url` slot. Returns 400 at text generation and BO endpoints — no creative template to optimize.
+- `creative_type='unknown'`: also returns 400 at text generation and BO endpoints.
 
 ---
 
