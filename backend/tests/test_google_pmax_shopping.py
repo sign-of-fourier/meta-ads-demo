@@ -144,7 +144,7 @@ def test_bo_proceeds_for_pmax(client, user_token, tmp_db):
     _seed_structure(tmp_db, user_id, "camp_1", "pmax_ad", "pmax", "headline", "Performance Headline")
 
     mock_picks = []
-    with patch("bo_pipeline.pipeline.run_bo", return_value=mock_picks), \
+    with patch("bo_pipeline.pipeline.run_bo", return_value=(mock_picks, None)), \
          patch("bo_pipeline.selector.get_scored_combinations", return_value=[]), \
          patch("bo_pipeline.selector.get_candidate_combinations", return_value=[]):
         resp = client.post(

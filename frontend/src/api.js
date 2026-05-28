@@ -237,3 +237,16 @@ export async function storeSuggestion(data) {
 export async function getDynamicGenStatus(jobId) {
   return request(`/api/generate/dynamic/status/${jobId}`);
 }
+
+// ── Cross-platform BO ─────────────────────────────────────────────────────────
+
+/**
+ * pairs: array of { platform, seed_ad_id, text_source_id }
+ * Returns { picks, group_stats }
+ */
+export async function runCrossPlatformBO(pairs) {
+  return request("/api/bo/cross-platform", {
+    method: "POST",
+    body: JSON.stringify({ pairs }),
+  });
+}

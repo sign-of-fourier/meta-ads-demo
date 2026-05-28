@@ -52,6 +52,41 @@ def _pca_dims() -> int:
         return 64
 
 
+def _google_pca_dims() -> int:
+    """
+    PCA output dimension for Google RSA groups (text-only, 1536-dim input).
+
+    Defaults to 32 — half of MODAL_BO_PCA_DIMS — because the input space is
+    half the size of Meta's combined (text + image) embedding.  Override via
+    GOOGLE_BO_PCA_DIMS env var.
+    """
+    raw = os.environ.get("GOOGLE_BO_PCA_DIMS", "32").strip()
+    try:
+        v = int(raw)
+        if v < 1:
+            raise ValueError
+        return v
+    except ValueError:
+        logger.warning("GOOGLE_BO_PCA_DIMS=%r is not a positive integer; using 32", raw)
+        return 32
+
+
+def pca_dims_for_platform(platform: str) -> int:
+    """
+    Return the configured PCA output dimension for a given platform.
+
+    "google"  → GOOGLE_BO_PCA_DIMS  (default 32)
+    all others → MODAL_BO_PCA_DIMS   (default 64)
+
+    Used by BOGroup.pca_dims to ensure Meta and Google groups are reduced to
+    different (smaller for Google) dimensions, reflecting their different input
+    space sizes (3072-dim combined vs 1536-dim text-only).
+    """
+    if platform == "google":
+        return _google_pca_dims()
+    return _pca_dims()
+
+
 # ---------------------------------------------------------------------------
 # PCA helpers
 # ---------------------------------------------------------------------------
@@ -96,36 +131,36 @@ def call_modal_api(
     api_url: str,
     X_train_pca: np.ndarray,
     y: np.ndarray,
-    bounds: list[tuple[float, float]],
+    X_cands_pca: np.ndarray,
     q: int = 2,
-    n_candidates: int = 512,
+    n_batches: int = 512,
     train_steps: int = 100,
     lr: float = 0.1,
     xi: float = 0.01,
     timeout: float = 120.0,
-) -> list[np.ndarray]:
+) -> list[dict]:
     """
-    POST to the Modal GP endpoint and return a list of q candidate vectors
-    in PCA space.
+    POST to the Modal GP endpoint and return a list of q candidate dicts.
 
     y convention: higher = better (the Modal API is a maximisation service).
     Pass scores directly; do NOT negate them.
 
-    Returns a list of q np.ndarray, each of shape (n_pca_dims,).
+    X_cands_pca: the discrete candidate pool in PCA space.  The API selects from
+    these actual vectors via q-EI — no continuous sampling or snap-to-pool needed.
+
+    Each returned dict has:
+      "index"  — int, index into X_cands_pca
+      "x"      — np.ndarray of shape (n_pca_dims,), the selected candidate PCA vector
+      "mu"     — float | None, GP posterior mean at that point (rank-transformed space)
+      "sigma"  — float | None, GP posterior std at that point
     Raises on HTTP error or JSON decode failure — caller should catch and fall back.
     """
-    n_dims = X_train_pca.shape[1]
-    search_space = [
-        {"name": f"pca_{i}", "type": "float", "low": bounds[i][0], "high": bounds[i][1]}
-        for i in range(n_dims)
-    ]
-
     payload: dict[str, Any] = {
         "X": X_train_pca.tolist(),
         "y": y.tolist(),
-        "search_space": search_space,
+        "candidates": X_cands_pca.tolist(),
         "q": q,
-        "n_candidates": n_candidates,
+        "n_batches": n_batches,
         "train_steps": train_steps,
         "lr": lr,
         "xi": xi,
@@ -139,14 +174,21 @@ def call_modal_api(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    logger.debug("call_modal_api: POST %s (n_obs=%d, n_dims=%d, q=%d)", api_url, len(y), n_dims, q)
+    logger.debug(
+        "call_modal_api: POST %s (n_obs=%d, n_cands=%d, n_dims=%d, q=%d)",
+        api_url, len(y), len(X_cands_pca), X_cands_pca.shape[1], q,
+    )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
 
-    candidates = data["candidates"]
     return [
-        np.array([float(c["x"][i]) for i in range(n_dims)], dtype=np.float32)
-        for c in candidates
+        {
+            "index": int(c["index"]),
+            "x": np.array(c["x"], dtype=np.float32),
+            "mu": c.get("mu"),
+            "sigma": c.get("sigma"),
+        }
+        for c in data["candidates"]
     ]
 
 

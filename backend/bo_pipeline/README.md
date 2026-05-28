@@ -149,7 +149,10 @@ Compound key format:
 
 | File | Role |
 |---|---|
-| `gpr.py` | Pure numpy/sklearn — `fit_gpr`, `predict_with_std`, `expected_improvement`, `fantasize` |
+| `gpr.py` | Pure numpy/sklearn — `fit_gpr`, `predict_with_std`, `expected_improvement`, `fantasize`, `transform_y` |
 | `selector.py` | DB access only — loads scored variants and candidate combinations as numpy arrays; cross-products text × image embeddings |
-| `pipeline.py` | Orchestration — calls selector → gpr → returns picks |
+| `pipeline.py` | Single-platform orchestration — calls selector → gpr/modal → returns picks; `method="modal"\|"local"` |
+| `modal_bo.py` | PCA helpers, Modal HTTP call (`call_modal_api`), nearest-pool snap (`snap_to_pool`), `pca_dims_for_platform` |
+| `ecdf.py` | `fit_ecdf(scores)` — empirical CDF → standard-normal transform; used by cross-platform path to normalise scores across platforms |
+| `cross_platform.py` | Cross-platform orchestration — shared ECDF, per-platform PCA+GPR, global EI ranking; `run_cross_platform_bo(pairs, ..., method="local"\|"modal")` |
 | `storage.py` | Persistence — `save_bo_run`, `get_latest_bo_run` |

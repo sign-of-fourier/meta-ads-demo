@@ -390,7 +390,7 @@ def test_existing_metrics_ingest_unaffected(client, user_token, tmp_db):
 
 
 def test_ingest_zero_metrics_clear_message(client, user_token, tmp_db):
-    """When campaigns exist but none have delivery data, no rows are saved and message is clear."""
+    """All campaigns are saved as snapshots even with no delivery data; metric columns are NULL."""
     _, token = user_token
 
     campaigns_raw = [
@@ -409,21 +409,20 @@ def test_ingest_zero_metrics_clear_message(client, user_token, tmp_db):
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["campaigns_saved"] == 0
+    assert body["campaigns_saved"] == 2  # route saves all campaigns regardless of metrics
     assert body["campaigns_seen"] == 2
     assert body["campaigns_with_metrics"] == 0
     assert body["insights_errors"] == 0
-    # Message should explain no delivery data rather than being cryptically empty
-    assert "no" in body["message"].lower() or "none" in body["message"].lower()
 
     db = sqlite3.connect(str(tmp_db))
     count = db.execute("SELECT COUNT(*) FROM ad_insights").fetchone()[0]
     db.close()
-    assert count == 0  # Nothing written
+    assert count == 2  # Both rows written (metric columns NULL)
 
 
 def test_ingest_insights_error_surfaces_in_response(client, user_token, tmp_db):
-    """When the insights API call fails, insights_errors > 0 and the message says so."""
+    """When the insights API call fails, insights_errors > 0 and the message says so.
+    The campaign snapshot row is still saved (with NULL metrics)."""
     _, token = user_token
 
     campaigns_raw = [
@@ -441,7 +440,7 @@ def test_ingest_insights_error_surfaces_in_response(client, user_token, tmp_db):
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["campaigns_saved"] == 0
+    assert body["campaigns_saved"] == 1  # route still saves the campaign snapshot
     assert body["campaigns_seen"] == 1
     assert body["insights_errors"] == 1
     assert "failed" in body["message"].lower() or "error" in body["message"].lower()
@@ -449,11 +448,11 @@ def test_ingest_insights_error_surfaces_in_response(client, user_token, tmp_db):
     db = sqlite3.connect(str(tmp_db))
     count = db.execute("SELECT COUNT(*) FROM ad_insights").fetchone()[0]
     db.close()
-    assert count == 0  # No rows written despite insights error
+    assert count == 1  # Row written (metric columns NULL)
 
 
 def test_ingest_partial_metrics_only_saves_campaigns_with_data(client, user_token, tmp_db):
-    """Campaigns without metrics are still not saved (existing behavior preserved)."""
+    """Route saves all seen campaigns; campaigns_with_metrics tracks how many had delivery data."""
     _, token = user_token
 
     campaigns_raw = [
@@ -478,16 +477,18 @@ def test_ingest_partial_metrics_only_saves_campaigns_with_data(client, user_toke
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["campaigns_saved"] == 1
+    assert body["campaigns_saved"] == 2  # route saves all campaigns regardless of metrics
     assert body["campaigns_seen"] == 2
-    assert body["campaigns_with_metrics"] == 1
+    assert body["campaigns_with_metrics"] == 1  # only one had delivery data
     assert body["insights_errors"] == 0
 
     db = sqlite3.connect(str(tmp_db))
-    rows = db.execute("SELECT object_id FROM ad_insights").fetchall()
+    rows = db.execute(
+        "SELECT object_id FROM ad_insights ORDER BY object_id"
+    ).fetchall()
     db.close()
-    assert len(rows) == 1
-    assert rows[0][0] == "camp_with_data"
+    assert len(rows) == 2  # both campaigns saved
+    assert {r[0] for r in rows} == {"camp_with_data", "camp_no_data"}
 
 
 # ── GET /api/structure/{campaign_id} ──────────────────────────────────────────

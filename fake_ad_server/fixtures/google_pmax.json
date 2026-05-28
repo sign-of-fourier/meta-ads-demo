@@ -1,0 +1,90 @@
+{
+  "9876543210": [],
+  "9876543211": [],
+  "9876543212": [
+    {
+      "assetGroup": {
+        "id": "5555000001",
+        "name": "Main Asset Group",
+        "status": "ENABLED"
+      },
+      "assetGroupAsset": {
+        "fieldType": "HEADLINE"
+      },
+      "asset": {
+        "resourceName": "customers/fake/assets/pmax_h1",
+        "textAsset": {"text": "Boost Your Business Today"}
+      }
+    },
+    {
+      "assetGroup": {
+        "id": "5555000001",
+        "name": "Main Asset Group",
+        "status": "ENABLED"
+      },
+      "assetGroupAsset": {
+        "fieldType": "HEADLINE"
+      },
+      "asset": {
+        "resourceName": "customers/fake/assets/pmax_h2",
+        "textAsset": {"text": "Reach New Customers"}
+      }
+    },
+    {
+      "assetGroup": {
+        "id": "5555000001",
+        "name": "Main Asset Group",
+        "status": "ENABLED"
+      },
+      "assetGroupAsset": {
+        "fieldType": "LONG_HEADLINE"
+      },
+      "asset": {
+        "resourceName": "customers/fake/assets/pmax_lh1",
+        "textAsset": {"text": "Grow your customer base with our proven marketing solutions"}
+      }
+    },
+    {
+      "assetGroup": {
+        "id": "5555000001",
+        "name": "Main Asset Group",
+        "status": "ENABLED"
+      },
+      "assetGroupAsset": {
+        "fieldType": "DESCRIPTION"
+      },
+      "asset": {
+        "resourceName": "customers/fake/assets/pmax_d1",
+        "textAsset": {"text": "Comprehensive tools to drive growth across all Google channels."}
+      }
+    },
+    {
+      "assetGroup": {
+        "id": "5555000001",
+        "name": "Main Asset Group",
+        "status": "ENABLED"
+      },
+      "assetGroupAsset": {
+        "fieldType": "DESCRIPTION"
+      },
+      "asset": {
+        "resourceName": "customers/fake/assets/pmax_d2",
+        "textAsset": {"text": "Trusted by thousands of businesses. Start your campaign today."}
+      }
+    },
+    {
+      "assetGroup": {
+        "id": "5555000001",
+        "name": "Main Asset Group",
+        "status": "ENABLED"
+      },
+      "assetGroupAsset": {
+        "fieldType": "MARKETING_IMAGE"
+      },
+      "asset": {
+        "resourceName": "customers/fake/assets/pmax_img1",
+        "textAsset": {"text": ""}
+      }
+    }
+  ]
+}

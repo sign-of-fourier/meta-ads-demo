@@ -18,7 +18,8 @@ picks = run_bo(
 save_bo_run(seed_ad_id, text_source_id, picks)
 """
 
+from bo_pipeline.cross_platform import run_cross_platform_bo
 from bo_pipeline.pipeline import run_bo
 from bo_pipeline.storage import get_latest_bo_run, save_bo_run
 
-__all__ = ["run_bo", "save_bo_run", "get_latest_bo_run"]
+__all__ = ["run_bo", "save_bo_run", "get_latest_bo_run", "run_cross_platform_bo"]

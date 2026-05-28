@@ -1,0 +1,20 @@
+[
+  {
+    "id": "120210001",
+    "name": "Fake Summer Sale — Prospecting",
+    "status": "ACTIVE",
+    "daily_budget": "4500"
+  },
+  {
+    "id": "120210002",
+    "name": "Fake Retargeting — Abandoned Cart",
+    "status": "ACTIVE",
+    "daily_budget": "2000"
+  },
+  {
+    "id": "120210003",
+    "name": "Fake Brand Awareness Q2",
+    "status": "PAUSED",
+    "daily_budget": "8000"
+  }
+]

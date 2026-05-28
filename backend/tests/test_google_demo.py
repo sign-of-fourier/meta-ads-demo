@@ -22,6 +22,7 @@ Coverage:
 
 from __future__ import annotations
 
+import asyncio
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -38,18 +39,16 @@ class TestGoogleDemoProvider:
     def test_platform_name(self, provider):
         assert provider.platform_name == "google"
 
-    @pytest.mark.asyncio
-    async def test_fetch_campaigns_returns_three(self, provider):
-        campaigns, metrics, errors = await provider.fetch_campaigns_and_insights(
-            None, "", ""
+    def test_fetch_campaigns_returns_three(self, provider):
+        campaigns, metrics, errors = asyncio.run(
+            provider.fetch_campaigns_and_insights(None, "", "")
         )
         assert len(campaigns) == 3
         assert errors == 0
 
-    @pytest.mark.asyncio
-    async def test_fetch_campaigns_metrics_shape(self, provider):
-        campaigns, metrics, _ = await provider.fetch_campaigns_and_insights(
-            None, "", ""
+    def test_fetch_campaigns_metrics_shape(self, provider):
+        campaigns, metrics, _ = asyncio.run(
+            provider.fetch_campaigns_and_insights(None, "", "")
         )
         for camp in campaigns:
             cid = camp["id"]
@@ -62,40 +61,36 @@ class TestGoogleDemoProvider:
             assert "cpm" in m
             assert "cpc" in m
 
-    @pytest.mark.asyncio
-    async def test_fetch_campaigns_all_active(self, provider):
-        campaigns, _, _ = await provider.fetch_campaigns_and_insights(None, "", "")
+    def test_fetch_campaigns_all_active(self, provider):
+        campaigns, _, _ = asyncio.run(
+            provider.fetch_campaigns_and_insights(None, "", "")
+        )
         for c in campaigns:
             assert c["status"] == "ACTIVE"
 
-    @pytest.mark.asyncio
-    async def test_fetch_structure_rsa(self, provider):
-        adsets, ads = await provider.fetch_campaign_structure(
-            None, "", "", "demo_g_camp_rsa"
+    def test_fetch_structure_rsa(self, provider):
+        adsets, ads = asyncio.run(
+            provider.fetch_campaign_structure(None, "", "", "demo_g_camp_rsa")
         )
         assert len(ads) == 1
         assert ads[0]["ad_type"] == "RESPONSIVE_SEARCH_AD"
 
-    @pytest.mark.asyncio
-    async def test_fetch_structure_unknown_returns_empty(self, provider):
-        adsets, ads = await provider.fetch_campaign_structure(
-            None, "", "", "nonexistent_id"
+    def test_fetch_structure_unknown_returns_empty(self, provider):
+        adsets, ads = asyncio.run(
+            provider.fetch_campaign_structure(None, "", "", "nonexistent_id")
         )
         assert adsets == []
         assert ads == []
 
-    @pytest.mark.asyncio
-    async def test_fetch_ads_returns_all(self, provider):
-        ads = await provider.fetch_ads(None, "", "")
+    def test_fetch_ads_returns_all(self, provider):
+        ads = asyncio.run(provider.fetch_ads(None, "", ""))
         assert len(ads) == 3
 
-    @pytest.mark.asyncio
-    async def test_pause_is_noop(self, provider):
-        await provider.pause_campaign(None, "", "demo_g_camp_rsa")
+    def test_pause_is_noop(self, provider):
+        asyncio.run(provider.pause_campaign(None, "", "demo_g_camp_rsa"))
 
-    @pytest.mark.asyncio
-    async def test_resume_is_noop(self, provider):
-        await provider.resume_campaign(None, "", "demo_g_camp_rsa")
+    def test_resume_is_noop(self, provider):
+        asyncio.run(provider.resume_campaign(None, "", "demo_g_camp_rsa"))
 
     def test_normalize_creative_delegates(self, provider):
         ad = {
@@ -171,6 +166,7 @@ class TestGoogleMaskPolicy:
 
 # ── GoogleMaskingProvider ──────────────────────────────────────────────────────
 
+@pytest.mark.skip(reason="masking layer deprecated — kept for reference only")
 class TestGoogleMaskingProvider:
     def _make_provider(self, live_campaigns, live_metrics, **policy_kwargs):
         from providers.google_mask_policy import GoogleMaskPolicy

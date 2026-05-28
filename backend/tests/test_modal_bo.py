@@ -178,100 +178,86 @@ class TestModalBOLive:
         ]
         return scored, candidates
 
-    def test_call_modal_api_returns_q_candidates(self):
-        """API returns exactly q=2 candidates, each with n_dims floats."""
-        from bo_pipeline.modal_bo import call_modal_api, dim_bounds, fit_pca
+    def _build_pca_arrays(self, scored, candidates):
+        from bo_pipeline.modal_bo import fit_pca
         from ad_embedding_combiner import combine
-
-        scored, candidates = self._make_synthetic_data()
-
         X_scored = np.vstack([combine(s["text_vector"], s["image_vector"]) for s in scored]).astype(np.float32)
         X_cands  = np.vstack([combine(c["text_vector"], c["image_vector"]) for c in candidates]).astype(np.float32)
         X_all    = np.vstack([X_scored, X_cands])
+        _, X_all_pca = fit_pca(X_all, n_components=self.PCA_DIM)
+        return X_all_pca[: len(scored)], X_all_pca[len(scored):]
 
-        pca, X_all_pca  = fit_pca(X_all, n_components=self.PCA_DIM)
-        X_train_pca = X_all_pca[: len(scored)]
+    def test_call_modal_api_returns_q_candidates(self):
+        """API returns exactly q=2 candidate dicts, each with a valid index and x vector."""
+        from bo_pipeline.modal_bo import call_modal_api
 
+        scored, candidates = self._make_synthetic_data()
+        X_train_pca, X_cands_pca = self._build_pca_arrays(scored, candidates)
         y = np.array([s["score"] for s in scored], dtype=np.float32)
-        bounds = dim_bounds(X_all_pca)
 
         suggestions = call_modal_api(
             api_url=MODAL_API_URL,
             X_train_pca=X_train_pca,
             y=y,
-            bounds=bounds,
+            X_cands_pca=X_cands_pca,
             q=2,
-            n_candidates=64,   # small for speed
+            n_batches=64,
             train_steps=20,
         )
 
         assert len(suggestions) == 2
         for s in suggestions:
-            assert isinstance(s, np.ndarray)
-            assert s.shape == (self.PCA_DIM,)
+            assert isinstance(s, dict)
+            assert "index" in s and "x" in s
+            assert 0 <= s["index"] < len(candidates)
+            assert s["x"].shape == (self.PCA_DIM,)
 
     def test_suggestions_within_bounds(self):
-        """Each returned PCA coordinate lies within the declared bounds."""
-        from bo_pipeline.modal_bo import call_modal_api, dim_bounds, fit_pca
-        from ad_embedding_combiner import combine
+        """Each returned candidate x vector lies within the range of the candidate pool."""
+        from bo_pipeline.modal_bo import call_modal_api
 
         scored, candidates = self._make_synthetic_data(seed=1)
-
-        X_scored = np.vstack([combine(s["text_vector"], s["image_vector"]) for s in scored]).astype(np.float32)
-        X_cands  = np.vstack([combine(c["text_vector"], c["image_vector"]) for c in candidates]).astype(np.float32)
-        X_all    = np.vstack([X_scored, X_cands])
-
-        pca, X_all_pca = fit_pca(X_all, n_components=self.PCA_DIM)
-        X_train_pca = X_all_pca[: len(scored)]
+        X_train_pca, X_cands_pca = self._build_pca_arrays(scored, candidates)
         y = np.array([s["score"] for s in scored], dtype=np.float32)
-        bounds = dim_bounds(X_all_pca)
 
         suggestions = call_modal_api(
             api_url=MODAL_API_URL,
             X_train_pca=X_train_pca,
             y=y,
-            bounds=bounds,
+            X_cands_pca=X_cands_pca,
             q=2,
-            n_candidates=64,
+            n_batches=64,
             train_steps=20,
         )
 
-        for suggestion in suggestions:
-            for i, (lo, hi) in enumerate(bounds):
-                # Allow a small tolerance: the API may return points at the boundary
-                assert lo - 0.01 <= float(suggestion[i]) <= hi + 0.01, (
-                    f"dim {i}: {suggestion[i]:.4f} outside [{lo:.4f}, {hi:.4f}]"
+        lo = X_cands_pca.min(axis=0)
+        hi = X_cands_pca.max(axis=0)
+        for s in suggestions:
+            for i in range(self.PCA_DIM):
+                assert lo[i] - 0.01 <= float(s["x"][i]) <= hi[i] + 0.01, (
+                    f"dim {i}: {s['x'][i]:.4f} outside [{lo[i]:.4f}, {hi[i]:.4f}]"
                 )
 
     def test_snap_produces_distinct_valid_candidates(self):
-        """End-to-end: API → snap → 2 distinct candidates from pool."""
-        from bo_pipeline.modal_bo import call_modal_api, dim_bounds, fit_pca, snap_to_pool
-        from ad_embedding_combiner import combine
+        """End-to-end: API returns 2 distinct valid candidate indices."""
+        from bo_pipeline.modal_bo import call_modal_api
 
         scored, candidates = self._make_synthetic_data(seed=2)
-
-        X_scored = np.vstack([combine(s["text_vector"], s["image_vector"]) for s in scored]).astype(np.float32)
-        X_cands  = np.vstack([combine(c["text_vector"], c["image_vector"]) for c in candidates]).astype(np.float32)
-        X_all    = np.vstack([X_scored, X_cands])
-
-        pca, X_all_pca = fit_pca(X_all, n_components=self.PCA_DIM)
-        X_train_pca = X_all_pca[: len(scored)]
-        X_cands_pca = X_all_pca[len(scored):]
+        X_train_pca, X_cands_pca = self._build_pca_arrays(scored, candidates)
         y = np.array([s["score"] for s in scored], dtype=np.float32)
-        bounds = dim_bounds(X_all_pca)
 
         suggestions = call_modal_api(
             api_url=MODAL_API_URL,
             X_train_pca=X_train_pca,
             y=y,
-            bounds=bounds,
+            X_cands_pca=X_cands_pca,
             q=2,
-            n_candidates=64,
+            n_batches=64,
             train_steps=20,
         )
-        picked_indices = snap_to_pool(suggestions, X_cands_pca, candidates)
 
-        assert len(picked_indices) == 2
-        assert picked_indices[0] != picked_indices[1]
-        for idx in picked_indices:
+        indices = [s["index"] for s in suggestions]
+        assert len(indices) == 2
+        assert indices[0] != indices[1]
+        for idx in indices:
             assert 0 <= idx < len(candidates)

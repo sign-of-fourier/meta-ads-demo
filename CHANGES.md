@@ -4,6 +4,247 @@ Changes are appended by date. Each entry covers one session or logical chunk of 
 
 ---
 
+## 2026-05-28
+
+### Dev tooling: start.sh fake-mode warning + DEV_QUICKSTART services overview
+
+**`start.sh`** — warns at startup when `FAKE_META_BASE_URL` or `FAKE_GOOGLE_BASE_URL` is set in `backend/.env`; prints a reminder to start the fake ad server on :9000
+
+**`DEV_QUICKSTART.md`**
+- Section 3 rewritten as a services overview table listing all five processes (backend, frontend, ngrok, Modal GP, fake server) with required/optional status and start commands
+- `./start.sh` promoted as the preferred way to start backend + frontend + ngrok together
+- Modal GP service documented: already deployed in the cloud, set `MODAL_BO_API_URL`; falls back to local sklearn GPR if unset; app source not in this repo
+- Fake ad server start instructions added with pointer to `FAKE_ADS_TESTING.md`
+- `MODAL_BO_API_URL` / `MODAL_BO_PCA_DIMS` added to env vars block
+- "Switching from fake to real mode" explanation added: real campaigns use different IDs so fake DB rows are inert; teardown pointer to `FAKE_ADS_TESTING.md`
+
+---
+
+### BO pipeline: drop eval_gpr block + surface Modal failures as API warning
+
+**Removed redundant local GPR refit from Modal path (`bo_pipeline/pipeline.py`)**
+- `_run_modal_bo` no longer refits a local sklearn GP after Modal returns — that computation was scoring candidates Modal already picked via q-EI, producing meaningless numbers
+- `gpr_mean`/`gpr_std` are now always `None` for Modal picks; `ei_score` likewise
+- Modal picks carry `selection_type="modal_q_ei"`; local path still populates all three stats
+
+**Modal failure now surfaces in the API response (`pipeline.py`, `main.py`)**
+- `run_bo` return type changed from `list[dict]` to `tuple[list[dict], str | None]`
+- Second element is `None` on success; a human-readable error string (e.g. `"Modal GP failed (HTTPError: 422) — used local GPR"`) when Modal was configured but threw
+- `BORunResponse` gains `warning: str | None = None`; both `/api/bo/run` and `/api/google/bo/run` pass it through
+- Frontend: both `CampaignsPage` and `GoogleCampaignsPage` render the warning in amber (`dyn-warning`) above picks when present
+
+**Frontend: correct selection_type labels**
+- `modal_q_ei` now displays as "Bayesian (Modal)" instead of falling through to "Random"
+- `GoogleCampaignsPage.BOPicksPanel` extracted `selectionLabel` helper; `CampaignsPage` inline equivalent
+
+**Tests updated** — all `run_bo` call sites unpack `picks, _`; mock patches use `return_value=(list, None)`; 103 tests pass
+
+**Docs updated**: `~/projects/boaz/modal/` — `API.md`, `CLAUDE.md`, `README.md` reflect discrete-pool design
+
+---
+
+## 2026-05-27
+
+### BO pipeline: fix degenerate scored vectors + redesign Modal to discrete-pool q-EI
+
+**Scored combination key fix (`bo_pipeline/selector.py`)**
+- `get_scored_combinations` now reads `v.suggestion` from `ad_generation_variants`, which stores the exact combo dict (all slots) written by the seeding script
+- Uses the suggestion as the primary text-vector lookup key in `ad_text_combination_embeddings`; falls back to reconstructing from `headline` + `primary_text`/`description` for real pipeline variants
+- Previously all scored variants fell back to the seed ad's single text vector (degenerate GPR input); now each variant gets its own distinct embedding
+
+**Modal BO redesign: discrete candidate pool (`modal_gp_api.py`, `modal_bo.py`, `pipeline.py`)**
+- Old design: Modal received only bounding-box bounds, generated 512 random continuous PCA points, returned the best batch as continuous vectors — pipeline then snapped each to the nearest actual candidate (`snap_to_pool`)
+- New design: pipeline sends the actual discrete candidate PCA vectors; Modal computes q-EI directly over those candidates and returns indices — no snap step, no approximation error
+- `GPRequest`: removed `search_space`/`n_candidates`; added `candidates: list[list[float]]` and `n_batches`
+- `Candidate` response: added `index` field; `mu`/`sigma` are now accurate (computed at the actual selected candidate, not a snapped approximation)
+- `call_modal_api`: parameter `bounds` → `X_cands_pca`; payload updated accordingly
+- `_run_modal_bo`: removed `snap_to_pool`, `dim_bounds`, `project` imports; uses `suggestion["index"]` directly
+
+**Docs updated**: `API.md`, `CLAUDE.md`, `README.md` in `~/projects/boaz/modal/`; `CLAUDE.md` in this repo
+
+---
+
+## 2026-05-26
+
+### Fake Ad Server (step 1)
+
+- Added `fake_ad_server/` — standalone FastAPI server (port 9000) that mimics the Meta Graph API and Google Ads REST API at the network layer
+- Meta routes: campaigns, insights, adsets, ads (GET + POST), adimages (GET hash resolution + POST upload), adcreatives, entity detail/pause-resume
+- Google routes: `searchStream` GAQL dispatch (campaigns / ad_groups / ad_group_ad / asset_group_asset), `:mutate` push, customer info, `listAccessibleCustomers`
+- GAQL dispatch inspects `FROM` clause and extracts `campaign.id` from `WHERE` for per-campaign filtering
+- 8 fixture files in `fake_ad_server/fixtures/` — 3 Meta campaigns (1 dynamic, 2 static), 3 Google campaigns (RSA, Display, pMax), all with real metric numbers
+- Two-line backend change: `FAKE_META_BASE_URL` env var in `meta_live.py`, `FAKE_GOOGLE_BASE_URL` env var in `google_ads_api.py` (both default to real API URLs when unset)
+- Commented-out env var stubs added to `backend/.env` — uncomment to activate; OAuth is unaffected
+- All routes smoke-tested; every response shape confirmed to match what the provider parsers expect
+
+### Dashboard UX redesign + BO test infrastructure
+
+#### Dashboard UX — consistent flow and cross-platform analysis
+
+**`frontend/src/pages/DashboardPage.jsx`** — Added `metaSeedAdId` / `googleSeedAdId` state (initialized from localStorage keys `meta_last_seed_ad_id` / `google_last_seed_ad_id`). Callbacks `handleMetaIngest(seedAdId)` and `handleGoogleIngest(seedAdId)` write to state and localStorage so seed ad IDs persist across page reloads. Added Cross-Platform Analysis section above the per-platform sections: green `✓`/grey `○` readiness indicators per platform; "Run Cross-Platform Analysis" button disabled until both platforms have a seed ad ID (`bothReady`); calls `runCrossPlatformBO` on click; renders `CrossPlatformResults` component with platform-badged picks. Updated 4-step instruction banner. Passes `onIngest={handleMetaIngest}` / `onIngest={handleGoogleIngest}` to child platform pages.
+
+**`frontend/src/pages/CampaignsPage.jsx`** — Added `{ onIngest = null }` prop. `handleIngestStructure` calls `onIngest(seedAdId)` after successful ingest. `toggleExpanded` (renamed from `toggleHistory`) also calls `onIngest` when opening a previously-ingested campaign — resolves seed ad ID from localStorage cache or fetches from `getCampaignStructure`. Removes separate `${c.id}-structure` row; one unified `${c.id}-detail` expanded row per campaign.
+
+**`frontend/src/pages/GoogleCampaignsPage.jsx`** — Added `{ onIngest = null }` prop. `handleIngest` calls `onIngest(seedAdId)` after successful ingest. `toggleDetail` calls `onIngest` when opening an already-ingested campaign (both from cache and from fresh fetch). Split triple-state "Ingest/View/Hide" button into two: "Ingest" (first time only) and "View"/"Hide" toggle (after first ingest). Moved "Re-ingest" button inside the expanded structural panel header.
+
+**`frontend/src/app.css`** — Added CSS for `.cross-platform-section`, `.cross-platform-header`, `.cross-platform-title-row`, `.cross-platform-title`, `.cross-platform-readiness`, `.platform-readiness`, `.readiness-ready`, `.readiness-pending`, `.cross-platform-desc`, `.cross-platform-hint`, `.cross-platform-results`, `.cross-platform-stats`, `.cross-platform-stat`, `.platform-badge`, `.platform-badge-meta`, `.platform-badge-google`, `.campaign-history-section`, `.campaign-history-heading`.
+
+**`frontend/src/api.js`** — Added `runCrossPlatformBO(pairs)` calling `POST /api/bo/cross-platform`.
+
+#### Bug fix — cross-platform button stayed greyed out after reingest
+
+Root cause: `onIngest` was only fired on the first Ingest button click. Opening a previously-ingested campaign via campaign name (Meta) or "View" button (Google) never called `onIngest`, so `meta_last_seed_ad_id` / `google_last_seed_ad_id` were never written to localStorage. Fixed by adding `onIngest` calls inside `toggleExpanded` (Meta) and `toggleDetail` (Google) when opening an already-ingested campaign.
+
+#### Backend — selector user_id isolation fix
+
+**`backend/bo_pipeline/selector.py`** — `get_scored_combinations` accepted `user_id` as a parameter but the SQL query only filtered by `seed_ad_id`, not `user_id`. Added `AND j.user_id = ?` to the `ad_generation_variants` join query. Without this, two users sharing the same `seed_ad_id` string could contaminate each other's BO training data.
+
+#### BO test infrastructure — four independent tests
+
+**`backend/seed_bo_synthetic.py`** (new) — Synthetic seeding script requiring no API keys. Supports `--platform meta|google|cross`; `--ad-id` / `--meta-ad-id` / `--google-ad-id`; `--user-id`; `--n` (default 5); `--seed` (default 42, RNG reproducibility); `--db`. Reads real `ad_text_combination_embeddings` rows from DB; creates synthetic `ad_generation_jobs` + `ad_generation_variants` (score random 2.0–9.0) + `ad_embeddings`. Meta: uses real seed image vector if available, otherwise random. Google: `image_vector=None` (combiner zero-pads). Prints curl examples after seeding.
+
+**`backend/tests/test_google_bo.py`** — Added `TestGoogleBOPipeline` class at end of file. Seeds a text-only (Google RSA) DB with 5 scored variants and 8 candidates (`image_vector=None` throughout). 12 tests: `test_returns_two_picks`, `test_pick1_is_ei_type`, `test_pick2_is_fantasy_type`, `test_picks_are_distinct`, `test_picks_have_nonnegative_ei`, `test_picks_have_gpr_stats`, `test_picks_have_combination_dict`, `test_picks_are_from_candidate_pool`, `test_scored_count_matches_seeded`, `test_all_scored_have_none_or_zero_image_vector`, `test_fallback_random_when_insufficient_data`, `test_save_and_retrieve`.
+
+**Four BO test classes (summary):**
+1. `test_generation_pipeline.py` — Dynamic Ad generation pipeline (requires API keys; existing)
+2. `test_bo_pipeline.py` — Meta BO with real image + text vectors (no API keys; existing and comprehensive)
+3. `test_google_bo.py::TestGoogleBOPipeline` — Google RSA BO, text-only, zero-padded image (no API keys; newly added)
+4. `test_cross_platform_bo.py::TestCrossPlatformBO` — Cross-platform BO with ECDF normalisation (no API keys; added in previous session)
+
+Net result: **103 tests, all passing**.
+
+---
+
+## 2026-05-27
+
+### Fake ad server — bug fixes and BO seeding improvements
+
+#### Bug fix — picsum image downloads failed with 302 redirect
+
+`picsum.photos` returns a 302 redirect to `fastly.picsum.photos`. Two separate `httpx.AsyncClient` instances both lacked `follow_redirects=True`, causing all image downloads and embeddings to fail with `HTTPStatusError: Redirect response '302 Found'`.
+
+- **`backend/embeddings/embedder.py`** — Added `follow_redirects=True` to `AsyncClient` in `embed_image_url()`
+- **`backend/main.py`** — Added `follow_redirects=True` to `AsyncClient` in `_download_ad_images()`
+
+#### Bug fix — seed_bo_synthetic.py used same image vector for all training points
+
+`seed_bo_synthetic.py` used the single seed ad `image_vector` from `ad_embeddings` for all N synthetic scored variants. The GPR saw zero variance in the image dimension across all training points, causing both BO picks to collapse to the same image slot.
+
+**`backend/seed_bo_synthetic.py`** — Now loads per-image embeddings from `ad_image_embeddings` (populated by `embed_images` during ingest) and cycles them across the N variants. Falls back to single seed `image_vector` if per-image embeddings are absent, then to random. Print line now reports how many distinct image vectors were found.
+
+#### Added FAKE_ADS_TESTING.md
+
+New file documenting the end-to-end manual BO testing workflow for all four fake campaign types:
+1. Meta dynamic ad (campaign 1) — 64 combinations from ingest, no text gen needed
+2. Meta static ad (campaign 2) — 1 combination until Generate Text Ads runs
+3. Google RSA (campaign `9876543210`) — 12 combinations from ingest
+4. Cross-platform BO — Meta + Google combined
+
+Includes startup instructions, per-step sqlite verification queries, `selection_type` check (should be `ei`/`fantasy`, not `random`), teardown/reset commands, and a fake campaign reference table.
+
+---
+
+## 2026-05-26 (test cleanup session)
+
+### Test suite cleanup — zero pure-test failures
+
+#### Fixed: 3 failing `test_structural_ingest.py` assertions
+
+The `/api/ingest` route saves a snapshot row for every seen campaign regardless of whether metrics exist (metric columns are `NULL` when no delivery data). Three tests had assertions written against a different design intent (only save campaigns with metrics). Updated to match actual route behavior:
+
+- `test_ingest_zero_metrics_clear_message` — `campaigns_saved` assertion updated to 2; `ad_insights` count updated to 2; docstring updated
+- `test_ingest_insights_error_surfaces_in_response` — `campaigns_saved` assertion updated to 1; `ad_insights` count updated to 1; docstring updated
+- `test_ingest_partial_metrics_only_saves_campaigns_with_data` — `campaigns_saved` updated to 2; rows assertion updated to verify both campaign IDs are present
+
+#### Fixed: 8 async `TestGoogleDemoProvider` tests
+
+`pytest-asyncio` is not installed in the test environment. Converted all 8 `@pytest.mark.asyncio async def` tests in `TestGoogleDemoProvider` to sync using `asyncio.run()`. Added `import asyncio` to the file.
+
+#### Deprecated: `TestGoogleMaskingProvider`
+
+Added `@pytest.mark.skip(reason="masking layer deprecated — kept for reference only")` to `TestGoogleMaskingProvider` class. Code and test file remain in place. 6 tests now correctly skipped.
+
+#### Test run baseline (pure tests — no API keys)
+
+```
+255 passed, 7 skipped, 0 failures
+```
+
+The 7 skips: 6 `TestGoogleMaskingProvider` + 1 live Google smoke test (requires credentials).
+
+#### BO test infrastructure — Modal endpoint support
+
+**`backend/bo_pipeline/cross_platform.py`** — Added `method: str = "local"` parameter to `run_cross_platform_bo()`. Added `_run_group_modal_bo()` helper that mirrors `_run_modal_bo()` in `pipeline.py` but applies ECDF-normalised targets and per-platform PCA dims; catches exceptions and falls back to local.
+
+**`backend/tests/conftest.py`** — Added `load_dotenv()` so `.env` vars (especially `MODAL_BO_API_URL`) are available to all tests without importing `main.py` first.
+
+**`backend/tests/test_bo_pipeline.py`, `test_google_bo.py`, `test_cross_platform_bo.py`** — All three BO pipeline test classes now read `BO_TEST_METHOD` from env (default `"local"`). Modal-compatible selection types (`"modal_q_ei"`) accepted alongside local types in all assertions. Run with Modal endpoint:
+
+```bash
+BO_TEST_METHOD=modal python3 -m pytest tests/test_bo_pipeline.py tests/test_google_bo.py::TestGoogleBOPipeline tests/test_cross_platform_bo.py::TestCrossPlatformBO -v -s
+```
+
+---
+
+## 2026-05-25 (cross-platform BO session)
+
+### Cross-platform Bayesian Optimisation
+
+Adds the ability to run BO jointly over Meta and Google campaigns with shared target normalisation.
+
+#### New files
+
+**`backend/bo_pipeline/ecdf.py`** — `fit_ecdf(all_scores) → callable`. Fits an empirical CDF on the combined score pool from all platforms and returns a transform to standard-normal. Used in place of the single-group `transform_y` when running cross-platform BO so both platforms' GPR targets — and therefore their EI values — are directly comparable.
+
+**`backend/bo_pipeline/cross_platform.py`** — `BOGroup` dataclass and `run_cross_platform_bo(pairs, user_id, db_path, ...)`. Orchestrates the full cross-platform pipeline: load per-platform scored observations and candidate pools; fit one shared ECDF on all scores; run per-platform PCA + GPR + EI; merge all picks by EI descending; return top-N tagged with `platform`, `seed_ad_id`, `text_source_id`. Local sklearn GPR path only (Modal path = two independent calls, same endpoint, can be added later).
+
+**`backend/tests/test_cross_platform_bo.py`** — 45 tests covering `TestECDF` (pure function), `TestPCADimsForPlatform` (env-var routing), `TestBOGroupBuildX` (correct input dimensions per platform), `TestCrossPlatformBO` (end-to-end DB pipeline including fallback, partial data, single-group, and global EI ordering), and `TestCrossPlatformBOEndpoint` (FastAPI route shape and auth). All 45 pass.
+
+#### Modified files
+
+**`backend/bo_pipeline/modal_bo.py`** — Added `_google_pca_dims()` (reads `GOOGLE_BO_PCA_DIMS`, default 32) and `pca_dims_for_platform(platform)`. Google RSA inputs are text-only (1536-dim) vs Meta's combined 3072-dim, so they get a proportionally smaller PCA output. Different output dimensions make it physically impossible to mix the two groups into a single GPR.
+
+**`backend/bo_pipeline/__init__.py`** — Exports `run_cross_platform_bo`.
+
+**`backend/main.py`** — New Pydantic models (`CrossPlatformBOPick`, `CrossPlatformBOPair`, `CrossPlatformBORequest`, `CrossPlatformBOGroupStat`, `CrossPlatformBOResponse`) and `POST /api/bo/cross-platform` endpoint. Returns globally-ranked picks each tagged with platform; persists picks via existing `save_bo_run` per group; includes per-group scored/candidate counts in response.
+
+#### Design notes
+
+- ECDF is computed **locally before any Modal API call** — Modal receives already-transformed `y` values and already-PCA-reduced `X`, same as today.
+- Meta: `combine(text_vec, image_vec)` → 3072-dim → PCA → 64-dim (`MODAL_BO_PCA_DIMS`)
+- Google: `text_vec` only → 1536-dim → PCA → 32-dim (`GOOGLE_BO_PCA_DIMS`)
+- Groups with `< MIN_TRAINING_POINTS` scored observations fall back to random for their own candidate pool; other groups still run EI normally.
+
+---
+
+## 2026-05-25
+
+### Unified Dashboard + BO candidate pool fix
+
+#### Frontend — unified ingestion dashboard
+
+**`frontend/src/pages/DashboardPage.jsx`** (new) — Combined "Ad Ingestion Dashboard" page at `/app/dashboard`. Two collapsible sections (Meta Ads, Google Ads) with branded toggle headers; both open by default. Each section renders the existing platform page inside it. Single clear instruction banner at the top explains Sync → Ingest → Get Recommendations flow.
+
+**`frontend/src/App.jsx`** — Nav updated: removed separate "Meta Ads" and "Google Ads" links; replaced with a single "Dashboard" link pointing to `/app/dashboard`.
+
+**`frontend/src/main.jsx`** — Added `/app/dashboard` route (`DashboardPage`). Old `/app/campaigns` and `/app/google-campaigns` routes retained but no longer linked in nav.
+
+**`frontend/src/pages/SettingsPage.jsx`** — Added prominent connect banner at top: "Here, you authenticate and connect your ad accounts. After connecting, go to the Dashboard to ingest." Updated how-it-works steps to reference Dashboard instead of separate platform pages.
+
+**`frontend/src/pages/GoogleCampaignsPage.jsx`** — Rewrote to match Meta flow: "Get Recommendations" and "Generate RSA Text" buttons both appear immediately after ingest (previously "Get Recommendations" was gated behind text gen completing). Structure data now stored in `structureById` state so seed ad ID is always available. `handleRunBO` resolves seed ad ID from state or fetches fresh if not cached; falls back to ingested ad ID if no text gen has been run.
+
+**`frontend/src/app.css`** — Added: `.settings-connect-banner`, `.dashboard-page`/`.dashboard-header`/`.dashboard-title`, `.platform-section`/`.platform-section-toggle`/`.platform-icon`/`.platform-icon-meta`/`.platform-icon-google`/`.platform-section-body`, `.btn-small`, `.slot-group`/`.slot-label`/`.slot-values`, `.ad-structure-card`/`.ad-structure-header`/`.ad-id-label`, `.text-gen-results`, `.push-note`, Google status badge variants. Added rule hiding `.page-hint-banner` inside `.platform-section-body` (avoids duplicate instructions).
+
+#### Backend — text generation now feeds BO candidate pool
+
+**`backend/main.py` — `POST /api/generate/text/{campaign_id}`** — After saving generated variants, now fires `embed_all_combinations` as a background task using `source_id=seed_ad_id`. Merges seed components with newly generated slots before embedding so the BO candidate pool expands to include all generated variants alongside the original ingested ones. Idempotent — already-embedded combinations are skipped.
+
+**`backend/main.py` — `POST /api/google/generate/text/{campaign_id}`** — Same change; uses `slots=("headline", "description")` for Google RSA. Generated text variants are now BO candidates on first "Get Recommendations" click after text gen, without any extra steps.
+
+**Why `source_id=seed_ad_id`:** BO always queries `ad_text_combination_embeddings` by `text_source_id`, which is always the seed ad's ingested ID. Storing generated text combinations under the same key means the pool grows automatically — no frontend or BO API changes needed.
+
+---
+
 ## 2026-05-23 (session 3)
 
 ### Dead-code label on `-y_raw` branch

@@ -59,11 +59,57 @@ AZURE_TEXT_GEN_DEPLOYMENT=gpt-4.1-nano
 # Image generation (deAPI / FLUX)
 DEAPI_API_KEY=...
 IMAGES_SERVE_BASE_URL=/images   # use relative path — absolute localhost URLs break when accessed via ngrok
+
+# Modal GP service — Bayesian Optimisation (optional; falls back to local sklearn GPR if unset)
+# The Modal app is deployed separately (not in this repo). Set this to the deployed endpoint URL.
+MODAL_BO_API_URL=https://markshipman4273--bo-gp-service-gp-suggest.modal.run
+MODAL_BO_PCA_DIMS=64
 ```
 
 ---
 
-## 2 — Start the servers
+## 2 — First-time setup (clean clone)
+
+Skip this section if you've already done it on this machine.
+
+```bash
+# Backend — create virtualenv and install Python deps
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # then fill in your values per Section 1
+
+# Frontend — install Node deps
+cd ../frontend
+npm install
+cp .env.example .env   # VITE_API_URL defaults to http://localhost:8000
+```
+
+---
+
+## 3 — Services overview
+
+The app has up to five processes. Two are required; the others are optional or pre-deployed.
+
+| Process | Required | How to start |
+|---|---|---|
+| Backend (FastAPI) | Yes | `cd backend && source .venv/bin/activate && python main.py` → :8000 |
+| Frontend (React/Vite) | Yes | `cd frontend && npm run dev` → :5173 |
+| ngrok | Yes for OAuth | `ngrok http 5173` — required so Meta/Google OAuth callbacks reach localhost |
+| Modal GP service | No | Already deployed in the cloud; set `MODAL_BO_API_URL` in `.env`. BO falls back to local sklearn GPR if unset. The Modal app source is not in this repo — deploy once via Modal's CLI if you need to redeploy. |
+| Fake ad server | No | `cd fake_ad_server && uvicorn server:app --port 9000 --reload` — only needed for fake data testing. See `FAKE_ADS_TESTING.md`. |
+
+### Preferred: start backend + frontend + ngrok together
+
+```bash
+./start.sh            # prod: backend :8000, frontend :5173, then ngrok on :5173
+./start.sh staging    # staging: backend :8001, frontend :5174
+```
+
+`start.sh` warns at startup if fake ad server mode is active (`FAKE_META_BASE_URL` / `FAKE_GOOGLE_BASE_URL` set in `backend/.env`).
+
+### Manual: separate terminals
 
 ```bash
 # Terminal 1 — Backend (auto-reloads on file save)
@@ -75,19 +121,37 @@ python main.py        # → http://localhost:8000
 cd frontend
 npm run dev           # → http://localhost:5173
 
-# Terminal 3 — ngrok tunnel (required for Meta OAuth)
+# Terminal 3 — ngrok tunnel (required for Meta/Google OAuth)
 ngrok http 5173
 # Copy the https://*.ngrok-free.dev URL
-# Update META_REDIRECT_URI and FRONTEND_URL in backend/.env
+# Update META_REDIRECT_URI, GOOGLE_REDIRECT_URI, and FRONTEND_URL in backend/.env
 # Update allowedHosts in frontend/vite.config.js
 # Restart both servers
 ```
 
 See `NGROK_SETUP.md` for the full checklist when the ngrok URL changes.
 
+### Fake ad server (optional — replaces live Meta/Google data calls)
+
+```bash
+# Terminal 4 (only when testing with fake data)
+cd fake_ad_server
+uvicorn server:app --port 9000 --reload
+```
+
+Then uncomment in `backend/.env`:
+```
+FAKE_META_BASE_URL=http://localhost:9000/meta/v19.0
+FAKE_GOOGLE_BASE_URL=http://localhost:9000/google
+```
+
+`start.sh` will warn if these are set. OAuth still hits real Google/Meta. See `FAKE_ADS_TESTING.md` for the full walkthrough including BO seeding.
+
+**Switching from fake to real mode:** comment out both `FAKE_*` lines and restart the backend. The campaigns list is live API data (not from the DB), so real campaigns appear immediately. Fake rows remain in the DB keyed on fake IDs (`120210001`, `120212001`, etc.) — they are inert since real campaigns use different IDs. Any synthetic BO observations seeded via `seed_bo_synthetic.py` also remain but don't affect real campaigns. To wipe fake data, use the teardown queries in `FAKE_ADS_TESTING.md`.
+
 ---
 
-## 3 — Get a JWT for curl testing
+## 4 — Get a JWT for curl testing
 
 ```bash
 curl -s -X POST http://localhost:8000/auth/login \
@@ -100,7 +164,7 @@ TOKEN=eyJ...   # paste token here
 
 ---
 
-## 4 — Ingest campaign metrics
+## 5 — Ingest campaign metrics
 
 ```bash
 curl -s -X POST http://localhost:8000/api/ingest \
@@ -125,7 +189,7 @@ sqlite3 backend/app.db "SELECT ad_account_id, object_id, date, impressions, clic
 
 ---
 
-## 5 — Ingest creative structure (triggers embeddings)
+## 6 — Ingest creative structure (triggers embeddings)
 
 ```bash
 curl -s -X POST http://localhost:8000/api/ingest/structure/<campaign_id> \
@@ -159,7 +223,7 @@ sqlite3 backend/app.db "SELECT source_id, COUNT(*) AS combinations FROM ad_text_
 
 ---
 
-## 6 — Generate a Dynamic Ad (AI Images)
+## 7 — Generate a Dynamic Ad (AI Images)
 
 In the UI: click a campaign name to expand it → click **Dynamic Ad (AI Images)**. This starts a background job that:
 1. Analyzes the seed ad image with GPT-4o and produces 10 edit suggestions
@@ -187,7 +251,7 @@ sqlite3 backend/app.db "SELECT slot, slot_index, value FROM ad_creative_structur
 
 ---
 
-## 8 — Seed synthetic BO training data (first time / testing only)
+## 9 — Seed synthetic BO training data (first time / testing only)
 
 The BO pipeline needs scored observations to fit the GPR. Use the seed script to insert synthetic ones:
 
@@ -211,7 +275,7 @@ Done. Run BO via POST /api/bo/run
 
 ---
 
-## 9 — Run Bayesian Optimisation
+## 10 — Run Bayesian Optimisation
 
 ```bash
 curl -s -X POST http://localhost:8000/api/bo/run \
@@ -267,7 +331,7 @@ curl -s http://localhost:8000/api/bo/results/<ad_id> \
 
 ---
 
-## 10 — Explorer (debug)
+## 11 — Explorer (debug)
 
 ```bash
 curl -s http://localhost:8000/api/explore \

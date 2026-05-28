@@ -113,15 +113,25 @@ export default function SettingsPage() {
         <div className="error" style={{ marginBottom: "1rem" }}>{googleErrorParam}</div>
       )}
 
+      <section className="settings-connect-banner">
+        <p className="settings-connect-headline">
+          👋 Here, you authenticate and connect your ad accounts.
+        </p>
+        <p className="settings-connect-sub">
+          Connect as many accounts as you need, then head to the{" "}
+          <strong>Dashboard</strong> to ingest your campaigns and get
+          AI-powered recommendations.
+        </p>
+      </section>
+
       <section className="card" style={{ background: "#f8f9ff", border: "1px solid #dde3f5" }}>
         <p style={{ margin: "0 0 0.5rem", fontWeight: 600, color: "#333" }}>How it works</p>
         <ol style={{ margin: 0, paddingLeft: "1.4rem", lineHeight: 1.9, color: "#444", fontSize: "0.9rem" }}>
           <li>Connect your Meta and/or Google Ads account below</li>
-          <li>Go to <strong>Meta Ads</strong> or <strong>Google Ads</strong> in the nav</li>
+          <li>Go to the <strong>Dashboard</strong> in the nav</li>
           <li>Click <strong>Sync</strong> to load your campaigns</li>
           <li>Click <strong>Ingest</strong> on any campaign row to read its ads</li>
-          <li>Click the <strong>campaign name</strong> to open it</li>
-          <li>Click <strong>Get Recommendations</strong> — Adstac.kr will tell you exactly what to test next</li>
+          <li>Click <strong>Get Recommendations</strong> — the AI suggests exactly what to test next</li>
         </ol>
       </section>
 

@@ -1,0 +1,47 @@
+[
+  {
+    "campaign": {
+      "id": "9876543210",
+      "name": "Fake Search — Brand Keywords",
+      "status": "ENABLED"
+    },
+    "campaignBudget": {
+      "amountMicros": "500000000"
+    },
+    "metrics": {
+      "impressions": "95000",
+      "clicks": "2850",
+      "costMicros": "1140000000"
+    }
+  },
+  {
+    "campaign": {
+      "id": "9876543211",
+      "name": "Fake Display — Prospecting",
+      "status": "ENABLED"
+    },
+    "campaignBudget": {
+      "amountMicros": "300000000"
+    },
+    "metrics": {
+      "impressions": "210000",
+      "clicks": "1470",
+      "costMicros": "588000000"
+    }
+  },
+  {
+    "campaign": {
+      "id": "9876543212",
+      "name": "Fake Performance Max",
+      "status": "PAUSED"
+    },
+    "campaignBudget": {
+      "amountMicros": "800000000"
+    },
+    "metrics": {
+      "impressions": "145000",
+      "clicks": "3625",
+      "costMicros": "1813000000"
+    }
+  }
+]

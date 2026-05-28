@@ -188,9 +188,13 @@ Embeddings + BO for Google RSA.
 - BO route auth guards (2 tests)
 - BO run shape, picks, empty-result fallback (3 tests)
 - BO results retrieval (2 tests)
+- `TestGoogleBOPipeline` — full end-to-end pipeline test with a pre-seeded text-only DB (Google RSA, `image_vector=None` throughout): EI pick, fantasy pick, distinct picks, picks from candidate pool, scored count, zero image vector assertion, random fallback when insufficient data, save and retrieve
 
 ```bash
 python -m pytest tests/test_google_bo.py -v
+
+# Pipeline math tests only (no FastAPI routes)
+python -m pytest tests/test_google_bo.py::TestGoogleBOPipeline -v
 ```
 
 ---
@@ -265,10 +269,28 @@ python -m pytest tests/test_google_login_customer_id.py -v
 
 ---
 
+### `tests/test_cross_platform_bo.py`
+Cross-platform Bayesian Optimisation — ECDF normalisation + global EI ranking. No API keys.
+
+- `TestECDF` — `fit_ecdf` pure function: returns callable, finite output, monotone, cross-group ordering preserved, median maps near zero, single-element pool, out-of-range clamping, output shape
+- `TestPCADimsForPlatform` — routing: Google gets smaller PCA dims than Meta, defaults, env-var override, unknown platform falls back to Meta dims
+- `TestBOGroupBuildX` — input matrix construction: Meta uses 3072-dim combined vectors, Google uses 1536-dim text-only, different dims prevent cross-group mixing, `None` image still works, dtype float32
+- `TestCrossPlatformBO` — full end-to-end DB pipeline with both Meta and Google groups seeded: returns list, top-N cap, at least one pick, platform tags, seed_ad_id/text_source_id fields, picks from correct pool, EI scores non-negative, first pick ≥ second by EI, no internal sort keys in result, `top_n=1`/`top_n=4`, random fallback when no scored data, partial fallback when one group has insufficient data, empty pairs returns empty, single Meta pair works, ECDF uses combined score pool
+- `TestCrossPlatformBOEndpoint` — FastAPI route: auth guard, 400 on empty pairs, 200 with mocked pipeline, response shape for picks and group_stats
+
+```bash
+python -m pytest tests/test_cross_platform_bo.py -v
+
+# Pure math only (no DB)
+python -m pytest tests/test_cross_platform_bo.py -v -k "TestECDF or TestPCADimsForPlatform or TestBOGroupBuildX"
+```
+
+---
+
 ### Run all Google tests at once
 
 ```bash
-python -m pytest tests/test_google_db.py tests/test_google_auth.py tests/test_google_campaigns.py tests/test_google_structural_ingest.py tests/test_google_text_pipeline.py tests/test_google_bo.py tests/test_google_push.py tests/test_google_pmax_shopping.py tests/test_google_demo.py tests/test_google_login_customer_id.py -v
+python -m pytest tests/test_google_db.py tests/test_google_auth.py tests/test_google_campaigns.py tests/test_google_structural_ingest.py tests/test_google_text_pipeline.py tests/test_google_bo.py tests/test_google_push.py tests/test_google_pmax_shopping.py tests/test_google_demo.py tests/test_google_login_customer_id.py tests/test_cross_platform_bo.py -v
 ```
 
 ---
@@ -308,7 +330,32 @@ python -m pytest tests/test_text_pipeline.py -v
 
 ## Standalone scripts (not pytest)
 
-These are run directly with Python, not via pytest. They require API keys and a loaded `.env`.
+These are run directly with Python, not via pytest.
+
+### `seed_bo_synthetic.py`
+Seeds synthetic scored observations into the DB for manual BO testing — **no API keys needed**. Writes to `ad_generation_jobs`, `ad_generation_variants`, and `ad_embeddings` using random scores (2.0–9.0). Reads real `ad_text_combination_embeddings` rows, so structural ingest must have been run first.
+
+```bash
+# Find your user_id and ad_id first:
+sqlite3 app.db "SELECT id, email FROM users;"
+sqlite3 app.db "SELECT DISTINCT ad_id, platform FROM ad_creative_structures;"
+
+# Seed Meta observations:
+python seed_bo_synthetic.py --platform meta --ad-id <meta_ad_id> --user-id <uid> --n 5
+
+# Seed Google observations:
+python seed_bo_synthetic.py --platform google --ad-id <google_ad_id> --user-id <uid> --n 5
+
+# Seed both at once (for cross-platform UI testing):
+python seed_bo_synthetic.py --platform cross \
+    --meta-ad-id <meta_ad_id> --google-ad-id <google_ad_id> --user-id <uid> --n 5
+```
+
+After seeding, click "Get Recommendations" in the UI — picks should show EI/fantasy selection types instead of random.
+
+---
+
+#### Legacy scripts — API keys required
 
 ### `tests/test_embed_text.py`
 Quick smoke test for `embed_ad` — embeds a hardcoded ad with a real CDN image URL. Prints the result.
@@ -326,12 +373,9 @@ python tests/test_finetune_embed.py
 
 ---
 
-## Known pre-existing failures
+## Known skipped tests
 
-Three tests in `test_structural_ingest.py` fail due to a logic mismatch in the `/api/ingest` route (campaigns are saved regardless of whether metrics exist). These predate the Google integration work and remain unresolved:
+- `tests/test_google_demo.py::TestGoogleMaskingProvider` — 6 tests skipped; masking layer deprecated, code kept for reference only.
+- `tests/test_google_campaigns.py::test_google_campaigns_live_smoke` — 1 test skipped; requires real Google credentials in `.env`.
 
-- `test_ingest_zero_metrics_clear_message`
-- `test_ingest_insights_error_surfaces_in_response`
-- `test_ingest_partial_metrics_only_saves_campaigns_with_data`
-
-All Google test files pass cleanly (1 skipped: the live smoke test in `test_google_campaigns.py` which requires real credentials).
+All other pure tests (no API keys needed) pass cleanly.

@@ -1,0 +1,100 @@
+{
+  "120210001": [
+    {
+      "id": "120212001",
+      "name": "Dynamic Prospecting Ad",
+      "status": "ACTIVE",
+      "effective_status": "ACTIVE",
+      "campaign_id": "120210001",
+      "adset_id": "120211001",
+      "creative": {
+        "id": "creative_120212001",
+        "name": "Dynamic Creative — Summer Sale",
+        "asset_feed_spec": {
+          "titles": [
+            {"text": "Shop Summer Deals Today"},
+            {"text": "Up to 50% Off — Limited Time"},
+            {"text": "New Arrivals Just Dropped"},
+            {"text": "Free Shipping on All Orders"}
+          ],
+          "bodies": [
+            {"text": "Discover our bestselling products at prices you'll love."},
+            {"text": "Shop the season's hottest styles before they sell out."},
+            {"text": "Quality you can trust, delivered fast to your door."},
+            {"text": "Join millions of happy customers. Start shopping now."}
+          ],
+          "descriptions": [
+            {"text": "Shop now and save big."},
+            {"text": "Free returns, always."},
+            {"text": "Exclusive member prices."},
+            {"text": "New deals added daily."}
+          ],
+          "images": [
+            {"url": "https://picsum.photos/seed/fakeads1/600/315", "hash": "fakehash001"},
+            {"url": "https://picsum.photos/seed/fakeads2/600/315", "hash": "fakehash002"},
+            {"url": "https://picsum.photos/seed/fakeads3/600/315", "hash": "fakehash003"},
+            {"url": "https://picsum.photos/seed/fakeads4/600/315", "hash": "fakehash004"}
+          ]
+        },
+        "object_story_spec": {
+          "page_id": "fake_page_999",
+          "link_data": {
+            "link": "https://example-store.com/summer-sale"
+          }
+        }
+      }
+    }
+  ],
+  "120210002": [
+    {
+      "id": "120212002",
+      "name": "Come Back Static Ad",
+      "status": "ACTIVE",
+      "effective_status": "ACTIVE",
+      "campaign_id": "120210002",
+      "adset_id": "120211003",
+      "creative": {
+        "id": "creative_120212002",
+        "title": "Complete Your Order — 10% Off Inside",
+        "body": "You left something in your cart. Finish your purchase today and save.",
+        "image_url": "https://picsum.photos/seed/retarget/600/315",
+        "thumbnail_url": "https://picsum.photos/seed/retarget/120/120",
+        "object_story_spec": {
+          "page_id": "fake_page_999",
+          "link_data": {
+            "name": "Complete Your Order — 10% Off Inside",
+            "description": "Limited time offer for returning visitors.",
+            "message": "You left something in your cart. Finish your purchase today and save.",
+            "link": "https://example-store.com/cart"
+          }
+        }
+      }
+    }
+  ],
+  "120210003": [
+    {
+      "id": "120212003",
+      "name": "Brand Static Ad",
+      "status": "PAUSED",
+      "effective_status": "PAUSED",
+      "campaign_id": "120210003",
+      "adset_id": "120211004",
+      "creative": {
+        "id": "creative_120212003",
+        "title": "The Brand You Can Trust",
+        "body": "Premium products. Honest prices. Fast delivery.",
+        "image_url": "https://picsum.photos/seed/brand/600/315",
+        "thumbnail_url": "https://picsum.photos/seed/brand/120/120",
+        "object_story_spec": {
+          "page_id": "fake_page_999",
+          "link_data": {
+            "name": "The Brand You Can Trust",
+            "description": "Premium quality at honest prices.",
+            "message": "Premium products. Honest prices. Fast delivery.",
+            "link": "https://example-store.com/"
+          }
+        }
+      }
+    }
+  ]
+}

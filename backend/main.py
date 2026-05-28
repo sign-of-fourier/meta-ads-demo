@@ -1365,7 +1365,7 @@ async def _download_ad_images(components: list[dict]) -> list[dict]:
     _backend_base = os.getenv("IMAGES_SERVE_BASE_URL", "http://localhost:8000/images").replace("/images", "")
 
     result = []
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
         for comp in components:
             if comp.get("slot") == "image" and comp.get("value", "").startswith("http"):
                 url = comp["value"]
@@ -2164,6 +2164,7 @@ class BORunResponse(BaseModel):
     picks: list[BOPick]
     scored_count: int
     candidate_count: int
+    warning: str | None = None
 
 
 def _get_placements_for_ad(ad_id: str, user_id: int) -> list[dict]:
@@ -2201,7 +2202,7 @@ def run_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_current_user_
 
     scored = get_scored_combinations(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
     candidates = get_candidate_combinations(body.text_source_id, body.seed_ad_id, user_id, db_path=BO_DB_PATH)
-    picks = run_bo(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
+    picks, warning = run_bo(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
 
     if picks:
         save_bo_run(body.seed_ad_id, body.text_source_id, picks, BO_DB_PATH)
@@ -2212,6 +2213,7 @@ def run_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_current_user_
         picks=[_enrich_pick(p, body.seed_ad_id, user_id) for p in picks],
         scored_count=len(scored),
         candidate_count=len(candidates),
+        warning=warning,
     )
 
 
@@ -2248,7 +2250,7 @@ def run_google_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_curren
 
     scored = get_scored_combinations(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
     candidates = get_candidate_combinations(body.text_source_id, body.seed_ad_id, user_id, db_path=BO_DB_PATH)
-    picks = run_bo(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
+    picks, warning = run_bo(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
 
     if picks:
         save_bo_run(body.seed_ad_id, body.text_source_id, picks, BO_DB_PATH)
@@ -2259,6 +2261,7 @@ def run_google_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_curren
         picks=[_enrich_pick(p, body.seed_ad_id, user_id) for p in picks],
         scored_count=len(scored),
         candidate_count=len(candidates),
+        warning=warning,
     )
 
 
@@ -2267,6 +2270,106 @@ def get_google_bo_results(ad_id: str, user_id: int = Depends(get_current_user_id
     """Return the most recent BO picks for a Google ad."""
     from bo_pipeline.storage import DB_PATH as BO_DB_PATH, get_latest_bo_run
     return [_enrich_pick(p, ad_id, user_id) for p in get_latest_bo_run(ad_id, ad_id, BO_DB_PATH)]
+
+
+# ── Cross-platform BO ─────────────────────────────────────────────────────────
+
+class CrossPlatformBOPick(BaseModel):
+    """A single BO pick from the cross-platform run, tagged with its originating platform."""
+    combination_key: str
+    combination: dict
+    selection_type: str
+    ei_score: float | None = None
+    gpr_mean: float | None = None
+    gpr_std: float | None = None
+    platform: str               # "meta" | "google"
+    seed_ad_id: str
+    text_source_id: str
+    placements: list[dict] = []
+
+
+class CrossPlatformBOPair(BaseModel):
+    platform: str       # "meta" | "google"
+    seed_ad_id: str
+    text_source_id: str
+
+
+class CrossPlatformBORequest(BaseModel):
+    pairs: list[CrossPlatformBOPair]
+
+
+class CrossPlatformBOGroupStat(BaseModel):
+    platform: str
+    seed_ad_id: str
+    scored_count: int
+    candidate_count: int
+
+
+class CrossPlatformBOResponse(BaseModel):
+    picks: list[CrossPlatformBOPick]
+    group_stats: list[CrossPlatformBOGroupStat]
+
+
+def _enrich_cross_platform_pick(p: dict, user_id: int) -> CrossPlatformBOPick:
+    """Resolve image URLs and attach placements for a cross-platform pick."""
+    combo = _resolve_combination_image_url(p["combination"])
+    placements = _get_placements_for_ad(p["seed_ad_id"], user_id)
+    return CrossPlatformBOPick(**{**p, "combination": combo, "placements": placements})
+
+
+@app.post("/api/bo/cross-platform", response_model=CrossPlatformBOResponse)
+def run_cross_platform_bo_endpoint(
+    body: CrossPlatformBORequest,
+    user_id: int = Depends(get_current_user_id),
+):
+    """
+    Run Bayesian Optimisation jointly across Meta and Google (or any platform mix).
+
+    Accepts a list of (platform, seed_ad_id, text_source_id) pairs.  A shared
+    ECDF normalises scores across platforms before per-platform GPRs compute EI.
+    Returns up to 2 globally-ranked picks, each tagged with its originating
+    platform.
+
+    Requires at least one pair; each pair must have ingested structure and text
+    combinations.  Falls back to random selection per platform when fewer than 2
+    scored observations exist for that platform.
+    """
+    from bo_pipeline.cross_platform import run_cross_platform_bo
+    from bo_pipeline.selector import get_candidate_combinations, get_scored_combinations
+    from bo_pipeline.storage import DB_PATH as BO_DB_PATH, save_bo_run
+
+    if not body.pairs:
+        raise HTTPException(400, "At least one pair is required.")
+
+    pairs_dicts = [p.model_dump() for p in body.pairs]
+
+    # Collect stats (scored / candidate counts) for the response
+    group_stats: list[CrossPlatformBOGroupStat] = []
+    for p in body.pairs:
+        scored = get_scored_combinations(p.seed_ad_id, p.text_source_id, user_id, BO_DB_PATH)
+        candidates = get_candidate_combinations(p.text_source_id, p.seed_ad_id, user_id, db_path=BO_DB_PATH)
+        group_stats.append(CrossPlatformBOGroupStat(
+            platform=p.platform,
+            seed_ad_id=p.seed_ad_id,
+            scored_count=len(scored),
+            candidate_count=len(candidates),
+        ))
+
+    picks = run_cross_platform_bo(pairs_dicts, user_id, BO_DB_PATH)
+
+    # Persist each pick under its own (seed_ad_id, text_source_id) via save_bo_run
+    from itertools import groupby
+    for (seed_ad_id, text_source_id), group_picks in groupby(
+        picks, key=lambda p: (p["seed_ad_id"], p["text_source_id"])
+    ):
+        group_list = list(group_picks)
+        if group_list:
+            save_bo_run(seed_ad_id, text_source_id, group_list, BO_DB_PATH)
+
+    return CrossPlatformBOResponse(
+        picks=[_enrich_cross_platform_pick(p, user_id) for p in picks],
+        group_stats=group_stats,
+    )
 
 
 # ── Push to Meta ─────────────────────────────────────────────────────────────
@@ -2590,6 +2693,19 @@ async def generate_text_ads(
     )
 
     slots = get_generated_ad(generated_ad_id)
+
+    # Fire embed_all_combinations under the seed ad's ID so BO automatically
+    # sees both original ingested combinations AND these new generated variants
+    # as one expanded candidate pool (idempotent — existing combos are skipped).
+    _gen_components = [
+        {"slot": s["slot"], "slot_index": s["slot_index"], "value": s["value"]}
+        for s in slots
+        if s.get("source") == "generated"
+    ]
+    _merged_meta = seed_components + _gen_components
+    from ad_combination_embeddings.pipeline import embed_all_combinations as _embed_combos
+    asyncio.create_task(_embed_combos(source_id=seed_ad_id, components=_merged_meta))
+
     return GenerateTextResponse(
         generated_ad_id=generated_ad_id,
         source_ad_id=seed_ad_id,
@@ -2653,6 +2769,24 @@ async def generate_google_text_ads(
     )
 
     slots = get_generated_ad(generated_ad_id)
+
+    # Fire embed_all_combinations under the seed ad's ID (Google RSA slots only)
+    # so BO sees ingested + generated variants as one expanded candidate pool.
+    _gen_components_g = [
+        {"slot": s["slot"], "slot_index": s["slot_index"], "value": s["value"]}
+        for s in slots
+        if s.get("source") == "generated"
+    ]
+    _merged_google = seed_components + _gen_components_g
+    from ad_combination_embeddings.pipeline import embed_all_combinations as _embed_combos_g
+    asyncio.create_task(
+        _embed_combos_g(
+            source_id=seed_ad_id,
+            components=_merged_google,
+            slots=("headline", "description"),
+        )
+    )
+
     return GenerateTextResponse(
         generated_ad_id=generated_ad_id,
         source_ad_id=seed_ad_id,

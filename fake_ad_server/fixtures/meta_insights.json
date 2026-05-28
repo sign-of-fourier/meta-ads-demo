@@ -1,0 +1,26 @@
+[
+  {
+    "campaign_id": "120210001",
+    "impressions": "42000",
+    "clicks": "1890",
+    "spend": "210.50",
+    "date_start": "2026-05-19",
+    "date_stop": "2026-05-25"
+  },
+  {
+    "campaign_id": "120210002",
+    "impressions": "18500",
+    "clicks": "1110",
+    "spend": "133.20",
+    "date_start": "2026-05-19",
+    "date_stop": "2026-05-25"
+  },
+  {
+    "campaign_id": "120210003",
+    "impressions": "3200",
+    "clicks": "96",
+    "spend": "19.20",
+    "date_start": "2026-05-19",
+    "date_stop": "2026-05-25"
+  }
+]

@@ -7,8 +7,10 @@ combinations to test next.
 Two methods are available (controlled by the `method` parameter to run_bo):
 
   "modal"  (default)
-    Reduces the combined embeddings to PCA space, then calls the Modal GP
-    service (stateless q-EI endpoint) to jointly select q=2 candidates.
+    Reduces the combined embeddings to PCA space, sends the actual discrete
+    candidate vectors to the Modal GP service (stateless q-EI endpoint), and
+    receives back the indices of the q=2 best candidates.  No snap-to-pool
+    step — the API selects directly from the real candidate pool.
     Requires MODAL_BO_API_URL to be set; silently falls back to "local" if
     the env var is absent or the API call fails.
 
@@ -135,11 +137,8 @@ def _run_modal_bo(
     """
     from bo_pipeline.modal_bo import (
         call_modal_api,
-        dim_bounds,
         fit_pca,
         modal_bo_enabled,
-        project,
-        snap_to_pool,
         _api_url,
     )
 
@@ -147,13 +146,9 @@ def _run_modal_bo(
 
     y_raw = np.array([s["score"] for s in scored], dtype=np.float32)
     # Modal API is a maximisation service (higher = better).
-    # If the caller wants minimisation, negate so the API still maximises the
-    # negated objective.
-    # NOTE: `higher_is_better=False` is NEVER passed by any current call site
-    # (both calls in main.py use the default True). The `-y_raw` branch is
-    # dead code kept as a hook for future "minimise metric" use cases (e.g.
-    # minimise CPC). Do not remove silently — if you add a minimisation path,
-    # this is where to activate it.
+    # NOTE: `higher_is_better=False` is NEVER passed by any current call site.
+    # The `-y_raw` branch is dead code kept as a hook for future "minimise metric"
+    # use cases (e.g. minimise CPC). Do not remove silently.
     y = y_raw if higher_is_better else -y_raw  # noqa: SIM210 (dead branch, intentional)
 
     # Build full embedding pool for PCA fitting (scored ∪ candidates)
@@ -166,23 +161,25 @@ def _run_modal_bo(
     X_train_pca = X_all_pca[: len(scored)]
     X_cands_pca = X_all_pca[len(scored) :]
 
-    bounds = dim_bounds(X_all_pca)
-
-    # Call Modal GP service — raises on failure
-    suggestions_pca = call_modal_api(
+    # Call Modal GP service — raises on failure.
+    # Sends the actual discrete candidate vectors; Modal selects via q-EI and
+    # returns indices directly — no snap-to-pool step needed.
+    suggestions = call_modal_api(
         api_url=api_url,
         X_train_pca=X_train_pca,
         y=y,
-        bounds=bounds,
+        X_cands_pca=X_cands_pca,
         q=min(2, len(candidates)),
         xi=xi,
     )
 
-    # Snap each GP-suggested PCA point to the nearest unvisited candidate
-    picked_indices = snap_to_pool(suggestions_pca, X_cands_pca, candidates)
-
     picks = []
-    for idx in picked_indices:
+    seen_indices: set[int] = set()
+    for suggestion in suggestions:
+        idx = suggestion["index"]
+        if idx in seen_indices:
+            continue
+        seen_indices.add(idx)
         picks.append(_make_pick(candidates[idx], _MODAL_TYPE))
 
     return picks
@@ -200,7 +197,7 @@ def run_bo(
     xi: float = 0.01,
     higher_is_better: bool = True,
     method: str = "modal",
-) -> list[dict]:
+) -> tuple[list[dict], str | None]:
     """
     Select up to 2 combinations to test next via Bayesian Optimisation.
 
@@ -209,13 +206,12 @@ def run_bo(
                                 MODAL_BO_API_URL is unset or the API call fails.
     method="local"            — local sklearn GPR + EI + fantasy step; no network.
 
-    Returns a list of 1 or 2 dicts, each with:
-      combination_key  — str
-      combination      — dict (text slot values + optional image_url)
-      selection_type   — 'modal_q_ei' | 'ei' | 'fantasy' | 'random'
-      ei_score         — float | None
-      gpr_mean         — float | None
-      gpr_std          — float | None
+    Returns (picks, warning) where:
+      picks   — list of 1 or 2 dicts, each with:
+                  combination_key, combination, selection_type,
+                  ei_score, gpr_mean, gpr_std
+      warning — non-None string when Modal was configured but failed and the
+                response fell back to the local GPR; None otherwise.
 
     Falls back to random selection when there are fewer than MIN_TRAINING_POINTS
     scored combinations available.
@@ -235,7 +231,7 @@ def run_bo(
 
     if not candidates:
         logger.warning("run_bo: no candidates available for seed_ad_id=%s", seed_ad_id)
-        return []
+        return [], None
 
     # --- Fallback: not enough data to fit a reliable model ---
     if len(scored) < MIN_TRAINING_POINTS:
@@ -245,21 +241,20 @@ def run_bo(
         )
         rng = np.random.default_rng()
         chosen = rng.choice(len(candidates), size=min(2, len(candidates)), replace=False)
-        return [_make_pick(candidates[i], _FALLBACK_TYPE) for i in chosen]
+        return [_make_pick(candidates[i], _FALLBACK_TYPE) for i in chosen], None
 
     # --- Route to Modal or local ---
     use_modal = (method == "modal") and modal_bo_enabled()
+    modal_warning: str | None = None
 
     if use_modal:
         try:
-            return _run_modal_bo(scored, candidates, xi=xi, higher_is_better=higher_is_better)
+            return _run_modal_bo(scored, candidates, xi=xi, higher_is_better=higher_is_better), None
         except Exception as exc:
-            logger.warning(
-                "run_bo: Modal BO failed (%s) — falling back to local GPR", exc
-            )
-            # Fall through to local below
+            logger.warning("run_bo: Modal BO failed (%s) — falling back to local GPR", exc)
+            modal_warning = f"Modal GP failed ({type(exc).__name__}: {exc}) — used local GPR"
 
-    return _run_local_bo(scored, candidates, xi=xi, higher_is_better=higher_is_better)
+    return _run_local_bo(scored, candidates, xi=xi, higher_is_better=higher_is_better), modal_warning
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ import CampaignsPage from "./pages/CampaignsPage.jsx";
 import GoogleCampaignsPage from "./pages/GoogleCampaignsPage.jsx";
 import AdsPage from "./pages/AdsPage.jsx";
 import ExplorerPage from "./pages/ExplorerPage.jsx";
+import DashboardPage from "./pages/DashboardPage.jsx";
 import LandingPage from "./pages/landingPage.jsx";
 import DashboardMock from "./pages/DashboardMock.jsx";
 import DocsPage from "./pages/DocsPage.jsx";
@@ -33,6 +34,14 @@ ReactDOM.createRoot(document.getElementById("root")).render(
             element={
               <ProtectedRoute>
                 <SettingsPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="dashboard"
+            element={
+              <ProtectedRoute>
+                <DashboardPage />
               </ProtectedRoute>
             }
           />

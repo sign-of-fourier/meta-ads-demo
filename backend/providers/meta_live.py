@@ -10,7 +10,10 @@ from fastapi import HTTPException
 from .meta_provider import PlatformProvider
 
 _META_API_VERSION = os.getenv("META_API_VERSION", "v19.0")
-META_GRAPH = f"https://graph.facebook.com/{_META_API_VERSION}"
+META_GRAPH = os.getenv(
+    "FAKE_META_BASE_URL",
+    f"https://graph.facebook.com/{_META_API_VERSION}",
+)
 
 logger = logging.getLogger(__name__)
 

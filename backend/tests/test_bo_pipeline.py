@@ -14,6 +14,7 @@ No ad creation — all variants/jobs/embeddings are inserted directly.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -250,7 +251,9 @@ class TestCombineEmbeddings:
 
     def test_truncates_long_vector(self):
         from ad_embedding_combiner import TEXT_DIM, truncate_pad
-        long_vec = _rand_vec(512)
+        # Use a vector genuinely longer than TEXT_DIM (1536) so truncation occurs.
+        # The original test used 512 which is shorter — it padded instead of truncated.
+        long_vec = _rand_vec(TEXT_DIM + 512)
         result = truncate_pad(long_vec, TEXT_DIM)
         assert result.shape == (TEXT_DIM,)
         assert np.allclose(result, long_vec[:TEXT_DIM])
@@ -443,18 +446,21 @@ class TestBOPipeline:
     @pytest.fixture(scope="class")
     def bo_result(self, test_db):
         from bo_pipeline import run_bo
-        # Pin method="local" so these tests always exercise the GPR+fantasy path
-        # regardless of whether MODAL_BO_API_URL is set in the environment.
-        return run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db, method="local")
+        # BO_TEST_METHOD env var selects the path: "local" (default) or "modal".
+        # "local" always exercises GPR+fantasy without any network calls.
+        # "modal" requires MODAL_BO_API_URL to be set and hits the live endpoint.
+        method = os.getenv("BO_TEST_METHOD", "local")
+        picks, _ = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db, method=method)
+        return picks
 
     def test_returns_two_picks(self, bo_result):
         assert len(bo_result) == 2
 
     def test_pick1_is_ei_type(self, bo_result):
-        assert bo_result[0]["selection_type"] == "ei"
+        assert bo_result[0]["selection_type"] in {"ei", "modal_q_ei"}
 
     def test_pick2_is_fantasy_type(self, bo_result):
-        assert bo_result[1]["selection_type"] == "fantasy"
+        assert bo_result[1]["selection_type"] in {"fantasy", "modal_q_ei"}
 
     def test_picks_have_combination(self, bo_result):
         for pick in bo_result:
@@ -466,14 +472,25 @@ class TestBOPipeline:
 
     def test_picks_have_ei_score(self, bo_result):
         for pick in bo_result:
-            assert pick["ei_score"] is not None
-            assert pick["ei_score"] >= 0.0
+            if pick["selection_type"] in ("ei", "fantasy"):
+                # Local path: explicit EI values are always present
+                assert pick["ei_score"] is not None
+                assert pick["ei_score"] >= 0.0
+            else:
+                # Modal path: batch q-EI doesn't return per-pick EI scores
+                assert pick["ei_score"] is None
 
     def test_picks_have_gpr_stats(self, bo_result):
         for pick in bo_result:
-            assert pick["gpr_mean"] is not None
-            assert pick["gpr_std"] is not None
-            assert pick["gpr_std"] >= 0.0
+            if pick["selection_type"] in ("ei", "fantasy"):
+                # Local path: GPR stats are always populated
+                assert pick["gpr_mean"] is not None
+                assert pick["gpr_std"] is not None
+                assert pick["gpr_std"] >= 0.0
+            else:
+                # Modal path: no per-pick GPR decomposition
+                assert pick["gpr_mean"] is None
+                assert pick["gpr_std"] is None
 
     def test_picks_are_from_candidate_pool(self, test_db, bo_result):
         from bo_pipeline.selector import get_candidate_combinations, get_scored_combinations
@@ -528,9 +545,11 @@ class TestBOPipeline:
         conn.commit()
         conn.close()
 
-        picks = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=empty_db, method="local")
+        method = os.getenv("BO_TEST_METHOD", "local")
+        picks, _ = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=empty_db, method=method)
         assert len(picks) == 2
         for pick in picks:
+            # Insufficient data → random fallback regardless of method
             assert pick["selection_type"] == "random"
 
     def test_full_bo_report(self, test_db):
@@ -573,14 +592,17 @@ class TestBOPipeline:
         assert n_candidates == len(_TEXT_COMBOS)
 
         # ---- 2. Fit GPR ----
+        # The pipeline applies transform_y before fitting (rank → standard-normal).
+        # The manual computation here must match so EI values are comparable.
         from ad_embedding_combiner import combine
+        from bo_pipeline.gpr import transform_y
         X_train = np.vstack([combine(s["text_vector"], s["image_vector"]) for s in scored]).astype(np.float64)
-        y_train = np.array([s["score"] for s in scored])
+        y_train = transform_y(np.array([s["score"] for s in scored]))
         gpr, scaler = fit_gpr(X_train, y_train)
 
         n_fit = len(y_train)
         y_best = float(y_train.max())
-        print(f"\nGPR fit on {n_fit} point(s)  |  best observed score: {y_best:.2f}")
+        print(f"\nGPR fit on {n_fit} point(s)  |  best transformed target: {y_best:.4f}")
         print(f"Optimized kernel: {gpr.kernel_}")
 
         assert n_fit == N_SCORED
@@ -596,41 +618,54 @@ class TestBOPipeline:
 
         assert np.all(ei_scores >= 0)
 
-        # ---- 4. Full pipeline run (EI pick + fantasy pick) ----
-        picks = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db, method="local")
+        # ---- 4. Full pipeline run ----
+        method = os.getenv("BO_TEST_METHOD", "local")
+        picks, _ = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db, method=method)
 
         pick1, pick2 = picks
-        mu1, sig1 = predict_with_std(gpr, scaler, X_cands[[int(np.argmax(ei_scores))]])
+
+        def _fmt(v, fmt):
+            return format(v, fmt) if v is not None else "N/A (modal)"
 
         print("\n" + "-" * 60)
         print(f"PICK 1  [{pick1['selection_type'].upper()}]")
         print(f"  Combination : {pick1['combination']}")
-        print(f"  GPR mean    : {pick1['gpr_mean']:.4f}")
-        print(f"  GPR std     : {pick1['gpr_std']:.4f}")
-        print(f"  EI score    : {pick1['ei_score']:.6f}")
+        print(f"  GPR mean    : {_fmt(pick1['gpr_mean'], '.4f')}")
+        print(f"  GPR std     : {_fmt(pick1['gpr_std'],  '.4f')}")
+        print(f"  EI score    : {_fmt(pick1['ei_score'], '.6f')}")
 
         print(f"\nPICK 2  [{pick2['selection_type'].upper()}]")
         print(f"  Combination : {pick2['combination']}")
-        print(f"  GPR mean    : {pick2['gpr_mean']:.4f}")
-        print(f"  GPR std     : {pick2['gpr_std']:.4f}")
-        print(f"  EI score    : {pick2['ei_score']:.6f}")
+        print(f"  GPR mean    : {_fmt(pick2['gpr_mean'], '.4f')}")
+        print(f"  GPR std     : {_fmt(pick2['gpr_std'],  '.4f')}")
+        print(f"  EI score    : {_fmt(pick2['ei_score'], '.6f')}")
 
         print("\nSummary")
         print(f"  n_scored    : {n_scored}")
         print(f"  n_fit       : {n_fit}")
         print(f"  n_candidates: {n_candidates}")
         print(f"  best_obs    : {y_best:.2f}")
-        print(f"  pick1_ei    : {pick1['ei_score']:.6f}")
-        print(f"  pick2_ei    : {pick2['ei_score']:.6f}")
+        print(f"  method      : {method}")
+        print(f"  pick1_ei    : {_fmt(pick1['ei_score'], '.6f')}")
+        print(f"  pick2_ei    : {_fmt(pick2['ei_score'], '.6f')}")
         print("=" * 60)
 
-        # ---- Assertions ----
-        assert pick1["selection_type"] == "ei"
-        assert pick2["selection_type"] == "fantasy"
+        # ---- Assertions (common to all methods) ----
         assert pick1["combination_key"] != pick2["combination_key"]
-        assert pick1["ei_score"] >= 0
-        assert pick2["ei_score"] >= 0
-        assert pick1["gpr_std"] >= 0
-        assert pick2["gpr_std"] >= 0
-        # pick1 must have the highest EI in the pool
-        assert pick1["ei_score"] == pytest.approx(float(ei_scores.max()), rel=1e-3)
+
+        if method == "modal":
+            # Modal path: picks carry selection_type="modal_q_ei" and no per-pick stats
+            assert pick1["selection_type"] == "modal_q_ei"
+            assert pick2["selection_type"] == "modal_q_ei"
+            assert pick1["ei_score"] is None
+            assert pick2["ei_score"] is None
+        else:
+            # Local path: explicit selection types and non-negative EI/GPR stats
+            assert pick1["selection_type"] == "ei"
+            assert pick2["selection_type"] == "fantasy"
+            assert pick1["ei_score"] >= 0
+            assert pick2["ei_score"] >= 0
+            assert pick1["gpr_std"] >= 0
+            assert pick2["gpr_std"] >= 0
+            # pick1 must have the highest EI in the pool
+            assert pick1["ei_score"] == pytest.approx(float(ei_scores.max()), rel=1e-3)

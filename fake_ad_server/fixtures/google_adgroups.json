@@ -1,0 +1,37 @@
+{
+  "9876543210": [
+    {
+      "adGroup": {
+        "id": "8765432100",
+        "name": "Brand — Exact Match",
+        "status": "ENABLED"
+      },
+      "campaign": {
+        "id": "9876543210"
+      }
+    },
+    {
+      "adGroup": {
+        "id": "8765432101",
+        "name": "Brand — Phrase Match",
+        "status": "ENABLED"
+      },
+      "campaign": {
+        "id": "9876543210"
+      }
+    }
+  ],
+  "9876543211": [
+    {
+      "adGroup": {
+        "id": "8765432102",
+        "name": "Display — Affinity Audiences",
+        "status": "ENABLED"
+      },
+      "campaign": {
+        "id": "9876543211"
+      }
+    }
+  ],
+  "9876543212": []
+}

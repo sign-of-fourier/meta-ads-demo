@@ -95,18 +95,19 @@ def get_scored_combinations(
     """
     c = _conn(db_path)
 
-    # All scored, non-defunct variants for this seed ad
+    # All scored, non-defunct variants for this seed ad, scoped to this user
     variants = c.execute(
         """
-        SELECT v.id, v.job_id, v.score
+        SELECT v.id, v.job_id, v.score, v.suggestion
         FROM ad_generation_variants v
         JOIN ad_generation_jobs j ON v.job_id = j.id
         WHERE j.seed_ad_id = ?
+          AND j.user_id = ?
           AND v.score IS NOT NULL
           AND COALESCE(v.status, '') != 'defunct'
         ORDER BY v.id
         """,
-        (seed_ad_id,),
+        (seed_ad_id, user_id),
     ).fetchall()
 
     if not variants:
@@ -134,7 +135,10 @@ def get_scored_combinations(
         image_vec = _vec(emb_row["image_vector"]) if emb_row else None
         # None image_vec is allowed — combiner will zero-pad that slot
 
-        # Text vector — prefer exact combination match in ad_text_combination_embeddings
+        # Text vector — prefer exact combination match in ad_text_combination_embeddings.
+        # Strategy: try the full combo dict from v.suggestion first (the seeding script stores
+        # the exact combination there), then fall back to reconstructing from headline+short_text
+        # for real pipeline variants where suggestion is an image prompt string, not JSON.
         job_row = c.execute(
             "SELECT headline, short_text FROM ad_generation_jobs WHERE id = ?",
             (job_id,),
@@ -142,16 +146,37 @@ def get_scored_combinations(
         text_vec = None
         combo_key = None
         combo = None
-        if job_row:
-            combo = {"headline": job_row["headline"], "primary_text": job_row["short_text"]}
-            combo_key = json.dumps(combo, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+        def _try_combo_lookup(candidate_combo: dict) -> bool:
+            nonlocal text_vec, combo_key, combo
+            candidate_key = json.dumps(candidate_combo, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
             tce_row = c.execute(
                 """SELECT vector FROM ad_text_combination_embeddings
                    WHERE source_id = ? AND combination_key = ?""",
-                (text_source_id, combo_key),
+                (text_source_id, candidate_key),
             ).fetchone()
             if tce_row:
                 text_vec = _vec(tce_row["vector"])
+                combo_key = candidate_key
+                combo = candidate_combo
+                return True
+            return False
+
+        # 1. Try suggestion field — seeding script stores the full combo dict (all slots).
+        suggestion_str = v["suggestion"]
+        if suggestion_str:
+            try:
+                suggestion_combo = json.loads(suggestion_str)
+                if isinstance(suggestion_combo, dict) and "headline" in suggestion_combo:
+                    _try_combo_lookup(suggestion_combo)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # 2. Fall back to reconstructing from headline + short_text with platform-native slot names.
+        if text_vec is None and job_row:
+            for slot_name in ("primary_text", "description"):
+                if _try_combo_lookup({"headline": job_row["headline"], slot_name: job_row["short_text"]}):
+                    break
 
         # Fallback: seed ad text_vector
         if text_vec is None:

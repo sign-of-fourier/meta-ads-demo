@@ -1375,3 +1375,356 @@ body {
   transform: translateY(-1px);
   transition: box-shadow 0.15s, transform 0.15s;
 }
+
+/* ── Settings connect banner ─────────────────────────────────────────────── */
+.settings-connect-banner {
+  background: linear-gradient(135deg, #e7f5ff 0%, #f0fff4 100%);
+  border: 1px solid #74c0fc;
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.settings-connect-headline {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: #1864ab;
+  margin: 0 0 0.5rem;
+}
+
+.settings-connect-sub {
+  font-size: 0.92rem;
+  color: #344054;
+  margin: 0;
+  line-height: 1.6;
+}
+
+/* ── Dashboard page ──────────────────────────────────────────────────────── */
+.dashboard-page {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.dashboard-header {
+  margin-bottom: 0.25rem;
+}
+
+.dashboard-title {
+  margin: 0 0 0.3rem;
+  font-size: 1.5rem;
+}
+
+.dashboard-subtitle {
+  font-size: 0.9rem;
+  color: #6b7280;
+  margin: 0;
+}
+
+/* ── Platform collapsible sections ───────────────────────────────────────── */
+.platform-section {
+  background: #fff;
+  border: 1px solid #dee2e6;
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.07);
+}
+
+.platform-section-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.85rem 1.25rem;
+  background: #f8f9fa;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s;
+  border-bottom: 1px solid transparent;
+}
+
+.platform-section-toggle:hover {
+  background: #f1f3f5;
+}
+
+.platform-section[aria-expanded="true"] .platform-section-toggle,
+.platform-section-toggle[aria-expanded="true"] {
+  border-bottom-color: #dee2e6;
+}
+
+.platform-section-toggle-left {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.platform-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.platform-icon-meta {
+  background: #1877f2;
+  font-size: 1.1rem;
+  font-family: Georgia, serif;
+}
+
+.platform-icon-google {
+  background: linear-gradient(135deg, #4285f4 0%, #34a853 50%, #ea4335 100%);
+  font-size: 0.95rem;
+}
+
+.platform-section-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: #212529;
+}
+
+.platform-section-chevron {
+  font-size: 0.75rem;
+  color: #6b7280;
+  transition: transform 0.15s;
+}
+
+.platform-section-body {
+  padding: 1.25rem;
+}
+
+/* Hide per-page instruction banners when nested inside the dashboard sections */
+.platform-section-body .page-hint-banner {
+  display: none;
+}
+
+/* ── btn-small (used by Google Ads page) ─────────────────────────────────── */
+.btn-small {
+  padding: 0.3rem 0.7rem;
+  background: #e9ecef;
+  color: #343a40;
+  border: 1px solid #ced4da;
+  border-radius: 5px;
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.btn-small:hover:not(:disabled) {
+  background: #dee2e6;
+}
+
+.btn-small:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ── Google slot groups (used by GoogleCampaignsPage) ────────────────────── */
+.slot-group {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+  font-size: 0.82rem;
+}
+
+.slot-label {
+  width: 90px;
+  flex-shrink: 0;
+  font-weight: 600;
+  color: #868e96;
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  padding-top: 0.1rem;
+}
+
+.slot-values {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.ad-structure-card {
+  background: #fff;
+  border: 1px solid #dee2e6;
+  border-radius: 6px;
+  padding: 0.65rem 0.9rem;
+  margin-bottom: 0.65rem;
+}
+
+.ad-structure-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.ad-id-label {
+  font-size: 0.75rem;
+  color: #9ca3af;
+  margin-left: auto;
+}
+
+.text-gen-results {
+  background: #f8f9fa;
+  border: 1px solid #dee2e6;
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  margin-top: 0.75rem;
+}
+
+.text-gen-results h4 {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: #343a40;
+  margin: 0 0 0.6rem;
+}
+
+.push-note {
+  font-size: 0.85rem;
+  color: #7c5c00;
+  background: #fffbe6;
+  border: 1px solid #ffe58f;
+  border-radius: 4px;
+  padding: 0.25rem 0.6rem;
+}
+
+/* status-active / status-paused / status-enabled / status-removed variants */
+.status-badge.status-active,
+.status-badge.status-enabled {
+  background: #d3f9d8;
+  color: #2b8a3e;
+}
+
+.status-badge.status-paused,
+.status-badge.status-removed {
+  background: #ffe3e3;
+  color: #c92a2a;
+}
+
+/* ── Cross-platform section (Dashboard) ──────────────────────────────────── */
+.cross-platform-section {
+  background: #fff;
+  border: 1px solid #dee2e6;
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.07);
+}
+
+.cross-platform-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.cross-platform-title-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.cross-platform-title {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: #212529;
+}
+
+.cross-platform-readiness {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.platform-readiness {
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 0.2rem 0.6rem;
+  border-radius: 12px;
+}
+
+.readiness-ready {
+  background: #d3f9d8;
+  color: #2b8a3e;
+}
+
+.readiness-pending {
+  background: #f1f3f5;
+  color: #868e96;
+}
+
+.cross-platform-desc {
+  font-size: 0.88rem;
+  color: #495057;
+  margin: 0;
+  line-height: 1.6;
+}
+
+.cross-platform-hint {
+  color: #868e96;
+  font-style: italic;
+}
+
+.cross-platform-results {
+  margin-top: 1rem;
+  border-top: 1px solid #dee2e6;
+  padding-top: 1rem;
+}
+
+.cross-platform-stats {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+  font-size: 0.83rem;
+  color: #495057;
+}
+
+.cross-platform-stat {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/* Platform badges on cross-platform picks */
+.platform-badge {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding: 0.15rem 0.55rem;
+  border-radius: 10px;
+  line-height: 1.4;
+}
+
+.platform-badge-meta {
+  background: #e8f4fd;
+  color: #1877f2;
+}
+
+.platform-badge-google {
+  background: #e8f5e9;
+  color: #1a7f37;
+}
+
+/* ── Campaign history sub-heading ────────────────────────────────────────── */
+.campaign-history-section {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid #dee2e6;
+}
+
+.campaign-history-heading {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #495057;
+  margin: 0 0 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
