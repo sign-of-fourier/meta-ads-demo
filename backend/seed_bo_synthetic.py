@@ -2,8 +2,7 @@
 Seed synthetic scored observations for BO testing — no API keys required.
 
 Scores are random numbers in [2.0, 9.0].  Records are scoped to the given
-user_id so they never mix with another user's data (selector now filters
-ad_generation_jobs by user_id).
+user_id so they never mix with another user's data.
 
 Three modes
 -----------
@@ -55,49 +54,6 @@ def _conn(db_path: Path) -> sqlite3.Connection:
     return c
 
 
-def _variant_embedding_ad_id(job_id: int, variant_id: int) -> str:
-    return f"gen_{job_id}_{variant_id}"
-
-
-def _ensure_seed_embedding(
-    conn: sqlite3.Connection,
-    user_id: int,
-    ad_id: str,
-    campaign_id: str,
-    include_image: bool,
-    rng: np.random.Generator,
-) -> None:
-    """
-    Ensure ad_embeddings has a row for this user + seed ad.
-    If a row already exists (from the real ingest pipeline), leave it.
-    If not (e.g. different user_id), create a synthetic one.
-    """
-    existing = conn.execute(
-        "SELECT id FROM ad_embeddings WHERE ad_id = ? AND user_id = ?",
-        (ad_id, user_id),
-    ).fetchone()
-    if existing:
-        return
-
-    txt_vec = rng.random(TEXT_EMBED_DIM).astype(np.float32)
-    img_vec = rng.random(IMAGE_EMBED_DIM).astype(np.float32) if include_image else None
-
-    from ad_embedding_combiner import combine
-    combined = combine(txt_vec, img_vec)
-
-    conn.execute(
-        """INSERT OR IGNORE INTO ad_embeddings
-           (user_id, ad_id, campaign_id, text_vector, image_vector, combined_vector)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (
-            user_id, ad_id, campaign_id,
-            txt_vec.tobytes(),
-            img_vec.tobytes() if img_vec is not None else None,
-            combined.tobytes(),
-        ),
-    )
-
-
 def seed_platform(
     conn: sqlite3.Connection,
     user_id: int,
@@ -113,7 +69,6 @@ def seed_platform(
     """
     include_image = platform != "google"
 
-    # ── 1. Verify text combination embeddings exist ───────────────────────────
     rows = conn.execute(
         """SELECT combination_key, vector
            FROM ad_text_combination_embeddings
@@ -131,14 +86,6 @@ def seed_platform(
         )
         return False
 
-    # ── 2. Ensure seed ad has an ad_embeddings row for this user ─────────────
-    _ensure_seed_embedding(conn, user_id, ad_id, campaign_id, include_image, rng)
-
-    # ── 3. Build image vector pool for Meta ───────────────────────────────────
-    # Prefer per-image embeddings (ad_image_embeddings) so each scored variant
-    # gets a distinct image vector — this gives the GPR real variance in the
-    # image dimension and prevents all picks collapsing to the same image.
-    # Falls back to the single seed image_vector, then to random.
     image_pool: list[np.ndarray] = []
     if include_image:
         per_image_rows = conn.execute(
@@ -153,7 +100,6 @@ def seed_platform(
             if r["vector"] is not None
         ]
         if not image_pool:
-            # Fall back to single seed image_vector
             seed_row = conn.execute(
                 "SELECT image_vector FROM ad_embeddings WHERE ad_id = ? AND user_id = ?",
                 (ad_id, user_id),
@@ -167,48 +113,10 @@ def seed_platform(
         f"({'%d image vectors' % len(image_pool) if image_pool else 'no image vectors — zero-padded'})"
     )
 
-    from ad_embedding_combiner import combine
-
     for i, row in enumerate(rows):
         combo = json.loads(row["combination_key"])
-        headline = combo.get("headline", f"Synthetic headline {i + 1}")
-        # Meta uses primary_text; Google uses description — store whichever is present
-        short_text = (
-            combo.get("primary_text")
-            or combo.get("description")
-            or f"Synthetic copy {i + 1}"
-        )
-
-        # ── 3a. Create a generation job ───────────────────────────────────────
-        cur = conn.execute(
-            """INSERT INTO ad_generation_jobs
-               (user_id, campaign_id, adset_id, seed_ad_id,
-                seed_image_url, headline, short_text, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'done')""",
-            (
-                user_id, campaign_id, "synthetic_adset", ad_id,
-                f"http://synthetic.test/{ad_id}.png",
-                headline, short_text,
-            ),
-        )
-        job_id = cur.lastrowid
-
-        # ── 3b. Scored variant with a random quality score ────────────────────
-        score = round(float(rng.uniform(2.0, 9.0)), 2)
-        cur2 = conn.execute(
-            """INSERT INTO ad_generation_variants
-               (job_id, suggestion, status, score)
-               VALUES (?, ?, 'scored', ?)""",
-            (job_id, json.dumps(combo), score),
-        )
-        variant_id = cur2.lastrowid
-
-        # ── 3c. Embedding for this variant ────────────────────────────────────
-        emb_ad_id = _variant_embedding_ad_id(job_id, variant_id)
         text_vec = np.frombuffer(row["vector"], dtype=np.float32)
 
-        # Cycle through the image pool so each variant gets a distinct image vec.
-        # Google: None (zero-padded by combiner).
         if not include_image:
             image_vec = None
         elif image_pool:
@@ -216,21 +124,23 @@ def seed_platform(
         else:
             image_vec = rng.random(IMAGE_EMBED_DIM).astype(np.float32)
 
-        combined = combine(text_vec, image_vec)
+        score = round(float(rng.uniform(2.0, 9.0)), 2)
 
         conn.execute(
-            """INSERT OR REPLACE INTO ad_embeddings
-               (user_id, ad_id, campaign_id, text_vector, image_vector, combined_vector)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+            """INSERT OR REPLACE INTO scored_observations
+               (user_id, seed_ad_id, combination_key, combination,
+                score, metric, source, text_vector, image_vector)
+               VALUES (?, ?, ?, ?, ?, 'synthetic', 'seed_script', ?, ?)""",
             (
-                user_id, emb_ad_id, campaign_id,
+                user_id, ad_id,
+                row["combination_key"],
+                row["combination_key"],
+                score,
                 text_vec.tobytes(),
                 image_vec.tobytes() if image_vec is not None else None,
-                combined.tobytes(),
             ),
         )
-
-        print(f"    [{i + 1}/{len(rows)}] score={score:.2f}  headline='{headline[:50]}'")
+        print(f"    [{i + 1}/{len(rows)}] score={score:.2f}  headline='{combo.get('headline', '')[:50]}'")
 
     conn.commit()
     return True
@@ -298,6 +208,9 @@ def main() -> None:
     if not db_path.exists():
         print(f"DB not found: {db_path}")
         return
+
+    from bo_pipeline.storage import ensure_scored_observations_table
+    ensure_scored_observations_table(db_path)
 
     rng = np.random.default_rng(args.seed)
     conn = _conn(db_path)

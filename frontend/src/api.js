@@ -222,6 +222,26 @@ export async function pushGoogleAds() {
   return request("/api/google/push", { method: "POST" });
 }
 
+export async function pushPick({ platform, seedAdId, combinationKey, combination, name }) {
+  return request("/api/push/pick", {
+    method: "POST",
+    body: JSON.stringify({
+      platform,
+      seed_ad_id: seedAdId,
+      combination_key: combinationKey,
+      combination,
+      name,
+    }),
+  });
+}
+
+export async function activatePick({ platform, platformAdId }) {
+  return request("/api/activate", {
+    method: "POST",
+    body: JSON.stringify({ platform, platform_ad_id: platformAdId }),
+  });
+}
+
 export async function startDynamicGeneration(campaignId, seedAdId) {
   const qs = seedAdId ? `?seed_ad_id=${encodeURIComponent(seedAdId)}` : "";
   return request(`/api/generate/dynamic/${campaignId}${qs}`, { method: "POST" });
@@ -248,5 +268,30 @@ export async function runCrossPlatformBO(pairs) {
   return request("/api/bo/cross-platform", {
     method: "POST",
     body: JSON.stringify({ pairs }),
+  });
+}
+
+/**
+ * Unified cross-platform BO: per-group PCA to same K-dim, single GP call.
+ * pairs: array of { platform, seed_ad_id, text_source_id }
+ * topN: number of recommendations to return (default 4)
+ * Returns { picks, group_stats }
+ */
+export async function runUnifiedCrossPlatformBO(pairs, topN = 4) {
+  return request("/api/bo/cross-platform/unified", {
+    method: "POST",
+    body: JSON.stringify({ pairs, top_n: topN }),
+  });
+}
+
+export async function seedScoredVariants(seedAdId, platform, n, textSourceId) {
+  return request("/api/bo/seed-scored-variants", {
+    method: "POST",
+    body: JSON.stringify({
+      seed_ad_id: seedAdId,
+      platform,
+      n,
+      text_source_id: textSourceId || null,
+    }),
   });
 }

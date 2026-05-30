@@ -9,31 +9,67 @@
       "adset_id": "120211001",
       "creative": {
         "id": "creative_120212001",
-        "name": "Dynamic Creative — Summer Sale",
+        "name": "Dynamic Creative \u2014 Summer Sale",
         "asset_feed_spec": {
           "titles": [
-            {"text": "Shop Summer Deals Today"},
-            {"text": "Up to 50% Off — Limited Time"},
-            {"text": "New Arrivals Just Dropped"},
-            {"text": "Free Shipping on All Orders"}
+            {
+              "text": "Shop Summer Deals Today"
+            },
+            {
+              "text": "Up to 50% Off \u2014 Limited Time"
+            },
+            {
+              "text": "New Arrivals Just Dropped"
+            },
+            {
+              "text": "Free Shipping on All Orders"
+            }
           ],
           "bodies": [
-            {"text": "Discover our bestselling products at prices you'll love."},
-            {"text": "Shop the season's hottest styles before they sell out."},
-            {"text": "Quality you can trust, delivered fast to your door."},
-            {"text": "Join millions of happy customers. Start shopping now."}
+            {
+              "text": "Discover our bestselling products at prices you'll love."
+            },
+            {
+              "text": "Shop the season's hottest styles before they sell out."
+            },
+            {
+              "text": "Quality you can trust, delivered fast to your door."
+            },
+            {
+              "text": "Join millions of happy customers. Start shopping now."
+            }
           ],
           "descriptions": [
-            {"text": "Shop now and save big."},
-            {"text": "Free returns, always."},
-            {"text": "Exclusive member prices."},
-            {"text": "New deals added daily."}
+            {
+              "text": "Shop now and save big."
+            },
+            {
+              "text": "Free returns, always."
+            },
+            {
+              "text": "Exclusive member prices."
+            },
+            {
+              "text": "New deals added daily."
+            }
           ],
           "images": [
-            {"url": "https://picsum.photos/seed/fakeads1/600/315", "hash": "fakehash001"},
-            {"url": "https://picsum.photos/seed/fakeads2/600/315", "hash": "fakehash002"},
-            {"url": "https://picsum.photos/seed/fakeads3/600/315", "hash": "fakehash003"},
-            {"url": "https://picsum.photos/seed/fakeads4/600/315", "hash": "fakehash004"}
+            {
+              "url": "https://picsum.photos/seed/fakeads1/600/315",
+              "hash": "fakehash001"
+            },
+            {
+              "url": "https://picsum.photos/seed/fakeads2/600/315",
+              "hash": "fakehash002"
+            },
+            {
+              "url": "https://picsum.photos/seed/fakeads3/600/315",
+              "hash": "fakehash003"
+            },
+            {
+              "url": "https://picsum.photos/seed/fakeads4/600/315",
+              "hash": "fakehash004"
+            }
           ]
         },
         "object_story_spec": {
@@ -55,14 +91,14 @@
       "adset_id": "120211003",
       "creative": {
         "id": "creative_120212002",
-        "title": "Complete Your Order — 10% Off Inside",
+        "title": "Complete Your Order \u2014 10% Off Inside",
         "body": "You left something in your cart. Finish your purchase today and save.",
         "image_url": "https://picsum.photos/seed/retarget/600/315",
         "thumbnail_url": "https://picsum.photos/seed/retarget/120/120",
         "object_story_spec": {
           "page_id": "fake_page_999",
           "link_data": {
-            "name": "Complete Your Order — 10% Off Inside",
+            "name": "Complete Your Order \u2014 10% Off Inside",
             "description": "Limited time offer for returning visitors.",
             "message": "You left something in your cart. Finish your purchase today and save.",
             "link": "https://example-store.com/cart"

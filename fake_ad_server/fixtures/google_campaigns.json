@@ -2,7 +2,7 @@
   {
     "campaign": {
       "id": "9876543210",
-      "name": "Fake Search — Brand Keywords",
+      "name": "Fake Search \u2014 Brand Keywords",
       "status": "ENABLED"
     },
     "campaignBudget": {
@@ -17,7 +17,7 @@
   {
     "campaign": {
       "id": "9876543211",
-      "name": "Fake Display — Prospecting",
+      "name": "Fake Display \u2014 Prospecting",
       "status": "ENABLED"
     },
     "campaignBudget": {

@@ -1,0 +1,10 @@
+{
+  "concept": "Specialty pour-over coffee subscription — single-origin beans roasted fresh weekly, delivered to your door",
+  "platform": "meta",
+  "campaign_id": "120210001",
+  "final_url": "https://example-coffee.com/subscribe",
+  "ad_name": "Coffee Sub — AI Ad",
+  "status": "PAUSED",
+  "generate_image": false,
+  "fake_server_dir": "fake_ad_server"
+}

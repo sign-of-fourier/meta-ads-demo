@@ -3,7 +3,7 @@
     {
       "adGroup": {
         "id": "8765432100",
-        "name": "Brand — Exact Match",
+        "name": "Brand \u2014 Exact Match",
         "status": "ENABLED"
       },
       "campaign": {
@@ -13,7 +13,7 @@
     {
       "adGroup": {
         "id": "8765432101",
-        "name": "Brand — Phrase Match",
+        "name": "Brand \u2014 Phrase Match",
         "status": "ENABLED"
       },
       "campaign": {
@@ -25,7 +25,7 @@
     {
       "adGroup": {
         "id": "8765432102",
-        "name": "Display — Affinity Audiences",
+        "name": "Display \u2014 Affinity Audiences",
         "status": "ENABLED"
       },
       "campaign": {

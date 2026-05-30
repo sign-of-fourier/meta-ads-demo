@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import BOPickCard from "../components/BOPickCard.jsx";
 import {
   getGoogleCampaigns,
   ingestGoogleStructure,
@@ -6,6 +7,7 @@ import {
   generateGoogleTextAds,
   runGoogleBO,
   pushGoogleAds,
+  seedScoredVariants,
 } from "../api.js";
 
 const STORAGE_KEY = "google_ingested_ids";
@@ -121,7 +123,7 @@ function TextGenResults({ data }) {
 }
 
 /* ── BO picks panel ───────────────────────────────────────────────────────── */
-function BOPicksPanel({ result }) {
+function BOPicksPanel({ result, campaignName, seedAdId, onPushed }) {
   if (!result.picks || result.picks.length === 0) {
     return (
       <div className="bo-results">
@@ -136,51 +138,33 @@ function BOPicksPanel({ result }) {
       </div>
     );
   }
-  const selectionLabel = (t) =>
-    t === "modal_q_ei" ? "Bayesian (Modal)" :
-    t === "ei"         ? "Best expected" :
-    t === "fantasy"    ? "Exploratory" : "Random";
   return (
     <div className="bo-results">
-      {result.warning && (
-        <p className="dyn-warning">{result.warning}</p>
-      )}
+      {result.warning && <p className="dyn-warning">{result.warning}</p>}
       <p className="bo-meta">
-        Based on <strong>{result.scored_count}</strong> scored variant
-        {result.scored_count !== 1 ? "s" : ""} across{" "}
-        <strong>{result.candidate_count}</strong> candidate combination
-        {result.candidate_count !== 1 ? "s" : ""}
+        <strong>{result.scored_count}</strong> scored variant{result.scored_count !== 1 ? "s" : ""} ·{" "}
+        <strong>{result.candidate_count}</strong> candidate{result.candidate_count !== 1 ? "s" : ""}
+        {result.scored_count === 0 && (
+          <span className="stat-random-note"> — no scored data yet, picks are random. Generate RSA Text first to build candidates.</span>
+        )}
       </p>
       {result.picks.map((pick, i) => (
-        <div key={i} className="bo-pick">
-          <div className="bo-pick-header">
-            <span className="bo-pick-label">Recommendation {i + 1}</span>
-            <span className="bo-pick-type">{selectionLabel(pick.selection_type)}</span>
-          </div>
-          <dl className="slot-list">
-            {Object.entries(pick.combination)
-              .filter(([k]) => k !== "image_url")
-              .map(([k, v]) => (
-                <div key={k} className="slot-row">
-                  <dt>{SLOT_LABELS[k] ?? k}</dt>
-                  <dd><span className="slot-value">{v || <em>—</em>}</span></dd>
-                </div>
-              ))}
-          </dl>
-          {pick.gpr_mean != null && (
-            <p className="bo-pick-score">
-              Predicted score: <strong>{pick.gpr_mean.toFixed(2)}</strong>
-              {pick.ei_score != null && <> &nbsp;·&nbsp; EI: {pick.ei_score.toFixed(4)}</>}
-            </p>
-          )}
-        </div>
+        <BOPickCard
+          key={pick.combination_key}
+          pick={pick}
+          index={i}
+          platform="google"
+          seedAdId={seedAdId}
+          campaignName={campaignName}
+          onPushed={onPushed}
+        />
       ))}
     </div>
   );
 }
 
 /* ── Main page ────────────────────────────────────────────────────────────── */
-export default function GoogleCampaignsPage({ onIngest = null }) {
+export default function GoogleCampaignsPage({ onIngest = null, batchedAdIds = [] }) {
   const [campaigns, setCampaigns] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -207,6 +191,8 @@ export default function GoogleCampaignsPage({ onIngest = null }) {
 
   const [syncing, setSyncing] = useState(false);
   const [syncNote, setSyncNote] = useState(null);
+  // seedStateById[id] = { n, loading, seeded, warning, error }
+  const [seedStateById, setSeedStateById] = useState({});
 
   useEffect(() => {
     getGoogleCampaigns()
@@ -214,6 +200,24 @@ export default function GoogleCampaignsPage({ onIngest = null }) {
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
   }, []);
+
+  // On mount, silently reload stored structure for any previously-ingested campaigns
+  // so getSeedAdId() works without requiring a manual Re-ingest click.
+  useEffect(() => {
+    if (campaigns.length === 0) return;
+    const toReload = campaigns.filter((c) => ingestedIds.includes(c.id) && !structureById[c.id]);
+    if (toReload.length === 0) return;
+    toReload.forEach(async (c) => {
+      try {
+        const structure = await getGoogleStructure(c.id);
+        if (structure?.length > 0) {
+          setStructureById((prev) => ({ ...prev, [c.id]: structure }));
+        }
+      } catch {
+        // silently ignore — user can still click Re-ingest manually
+      }
+    });
+  }, [campaigns]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function markIngested(id) {
     setIngestedIds((prev) => {
@@ -237,11 +241,6 @@ export default function GoogleCampaignsPage({ onIngest = null }) {
       setStructureById((prev) => ({ ...prev, [campaignId]: structure }));
       setOpenStructureId(campaignId);
 
-      // Notify parent (Dashboard) of the seed ad ID for cross-platform BO
-      const seedAdId = structure?.[0]?.ad_id;
-      if (onIngest && seedAdId) {
-        onIngest(seedAdId);
-      }
     } catch (err) {
       alert(`Ingest failed: ${err.message}`);
     } finally {
@@ -255,16 +254,9 @@ export default function GoogleCampaignsPage({ onIngest = null }) {
       setOpenStructureId(null);
     } else {
       if (!structureById[campaignId]) {
-        // Load structure and propagate seed ad ID to Dashboard
         getGoogleStructure(campaignId).then((s) => {
           setStructureById((prev) => ({ ...prev, [campaignId]: s }));
-          const seedAdId = s?.[0]?.ad_id;
-          if (onIngest && seedAdId) onIngest(seedAdId);
         });
-      } else {
-        // Structure already cached — still propagate seed ad ID
-        const seedAdId = structureById[campaignId]?.[0]?.ad_id;
-        if (onIngest && seedAdId) onIngest(seedAdId);
       }
       setOpenStructureId(campaignId);
     }
@@ -303,6 +295,19 @@ export default function GoogleCampaignsPage({ onIngest = null }) {
         ...prev,
         [campaignId]: { status: "error", error: err.message },
       }));
+    }
+  }
+
+  async function handleSeedTestData(campaignId) {
+    const seedAdId = getSeedAdId(campaignId);
+    if (!seedAdId) return;
+    const n = seedStateById[campaignId]?.n ?? 5;
+    setSeedStateById(prev => ({ ...prev, [campaignId]: { ...prev[campaignId], loading: true, seeded: null, error: null } }));
+    try {
+      const result = await seedScoredVariants(seedAdId, "google", n, seedAdId);
+      setSeedStateById(prev => ({ ...prev, [campaignId]: { ...prev[campaignId], loading: false, seeded: result.seeded, warning: result.warning } }));
+    } catch (err) {
+      setSeedStateById(prev => ({ ...prev, [campaignId]: { ...prev[campaignId], loading: false, error: err.message } }));
     }
   }
 
@@ -477,6 +482,54 @@ export default function GoogleCampaignsPage({ onIngest = null }) {
                             ? "Generating…"
                             : "Generate RSA Text"}
                         </button>
+                        {onIngest && (() => {
+                          const seedAdId = structureById[c.id]?.[0]?.ad_id;
+                          if (!seedAdId) return null;
+                          const inBatch = batchedAdIds.includes(seedAdId);
+                          return (
+                            <button
+                              className={inBatch ? "btn-batch-active" : "btn-batch"}
+                              onClick={() => onIngest({ platform: "google", seed_ad_id: seedAdId, text_source_id: seedAdId, label: c.name })}
+                              title={inBatch ? "Remove from cross-platform analysis batch" : "Add to cross-platform analysis batch"}
+                            >
+                              {inBatch ? "In Batch ✓" : "Add to Analysis"}
+                            </button>
+                          );
+                        })()}
+                      </div>
+
+                      {/* Seed test data */}
+                      <div className="seed-controls">
+                        <span className="seed-controls-label">Seed test data:</span>
+                        <input
+                          type="number"
+                          min={1} max={50}
+                          value={seedStateById[c.id]?.n ?? 5}
+                          onChange={e => setSeedStateById(prev => ({
+                            ...prev,
+                            [c.id]: { ...prev[c.id], n: Math.max(1, Math.min(50, parseInt(e.target.value) || 1)) },
+                          }))}
+                          className="seed-n-input"
+                          title="Number of fake scored variants to seed"
+                        />
+                        <span className="seed-controls-unit">variants</span>
+                        <button
+                          className="btn-small"
+                          onClick={() => handleSeedTestData(c.id)}
+                          disabled={seedStateById[c.id]?.loading || !getSeedAdId(c.id)}
+                          title="Seed fake scored observations so Get Recommendations has training data"
+                        >
+                          {seedStateById[c.id]?.loading ? "Seeding…" : "Seed"}
+                        </button>
+                        {seedStateById[c.id]?.seeded != null && (
+                          <span className="seed-success">✓ {seedStateById[c.id].seeded} seeded</span>
+                        )}
+                        {seedStateById[c.id]?.warning && (
+                          <span className="seed-warning">{seedStateById[c.id].warning}</span>
+                        )}
+                        {seedStateById[c.id]?.error && (
+                          <span className="error-inline">{seedStateById[c.id].error}</span>
+                        )}
                       </div>
 
                       {/* Text gen results */}
@@ -492,7 +545,27 @@ export default function GoogleCampaignsPage({ onIngest = null }) {
                         <p className="error">{boStateById[c.id].error}</p>
                       )}
                       {boStateById[c.id]?.status === "done" && (
-                        <BOPicksPanel result={boStateById[c.id].data} />
+                        <BOPicksPanel
+                          result={boStateById[c.id].data}
+                          campaignName={c.name}
+                          seedAdId={structureById[c.id]?.[0]?.ad_id}
+                          onPushed={(pick, platformAdId, adName) => {
+                            setBoStateById(prev => ({
+                              ...prev,
+                              [c.id]: {
+                                ...prev[c.id],
+                                data: {
+                                  ...prev[c.id].data,
+                                  picks: prev[c.id].data.picks.map(pk =>
+                                    pk.combination_key === pick.combination_key
+                                      ? { ...pk, already_pushed: true, push_status: "paused", ad_name: adName, platform_ad_id: platformAdId }
+                                      : pk
+                                  ),
+                                },
+                              },
+                            }));
+                          }}
+                        />
                       )}
                     </div>
                   </td>

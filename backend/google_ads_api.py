@@ -90,6 +90,7 @@ async def create_rsa(
     descriptions: list[str],
     final_url: str,
     login_customer_id: str | None = None,
+    ad_name: str | None = None,
 ) -> str:
     """Create a new PAUSED Responsive Search Ad via the Mutate API.
 
@@ -120,6 +121,7 @@ async def create_rsa(
                 "adGroupAdOperation": {
                     "create": {
                         "ad": {
+                            **({"name": ad_name} if ad_name else {}),
                             "responsiveSearchAd": {
                                 "headlines": headline_assets,
                                 "descriptions": description_assets,

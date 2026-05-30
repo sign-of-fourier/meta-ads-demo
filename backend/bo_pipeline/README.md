@@ -98,8 +98,7 @@ highest EI.
 
 ## Batch BO: the fantasy step
 
-We return **two** picks per BO call to allow a pair of variants to be tested in the
-next round. Naively choosing the top-2 EI would often select very similar combinations
+Single-platform `run_bo` returns **two** picks per call. The unified cross-platform `run_unified_cross_platform_bo` generalises this to `top_n` picks (default 4, configurable via API/UI). Naively choosing the top-2 EI would often select very similar combinations
 (the two highest-EI points tend to be neighbours in embedding space).
 
 Instead, we use a **fantasy step**:
@@ -151,8 +150,8 @@ Compound key format:
 |---|---|
 | `gpr.py` | Pure numpy/sklearn — `fit_gpr`, `predict_with_std`, `expected_improvement`, `fantasize`, `transform_y` |
 | `selector.py` | DB access only — loads scored variants and candidate combinations as numpy arrays; cross-products text × image embeddings |
-| `pipeline.py` | Single-platform orchestration — calls selector → gpr/modal → returns picks; `method="modal"\|"local"` |
+| `pipeline.py` | Single-platform orchestration — calls selector → gpr/modal → returns `(picks, warning, scored_count, candidate_count)`; `method="modal"\|"local"`, `platform="meta"\|"google"`. `_build_X` is platform-aware: Google uses 1536-dim text-only, Meta uses 3072-dim combined. |
 | `modal_bo.py` | PCA helpers, Modal HTTP call (`call_modal_api`), nearest-pool snap (`snap_to_pool`), `pca_dims_for_platform` |
-| `ecdf.py` | `fit_ecdf(scores)` — empirical CDF → standard-normal transform; used by cross-platform path to normalise scores across platforms |
-| `cross_platform.py` | Cross-platform orchestration — shared ECDF, per-platform PCA+GPR, global EI ranking; `run_cross_platform_bo(pairs, ..., method="local"\|"modal")` |
+| `ecdf.py` | `fit_ecdf(scores)` — empirical CDF → standard-normal transform; used by cross-platform paths to normalise scores across platforms |
+| `cross_platform.py` | Two cross-platform functions: `run_cross_platform_bo(pairs, ..., method="modal")` — original, per-platform PCA+GPR, global EI rank; returns `(picks, group_stats)`. `run_unified_cross_platform_bo(pairs, ..., top_n=4, method="modal")` — **single shared PCA** fit on pooled 3072-dim vectors from all groups (`BOGroup.build_X_unified()` zero-pads Google's image half via `combine(text_vec, None)`), then single GP/Modal call, generalised fantasy loop; returns `(picks, group_stats)`. Both build `group_stats` internally. |
 | `storage.py` | Persistence — `save_bo_run`, `get_latest_bo_run` |

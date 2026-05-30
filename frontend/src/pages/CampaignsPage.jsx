@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import BOPickCard from "../components/BOPickCard.jsx";
 import {
   getCampaigns,
   pauseCampaign,
@@ -15,6 +16,7 @@ import {
   generateTextAds,
   startDynamicGeneration,
   getDynamicGenStatus,
+  seedScoredVariants,
 } from "../api.js";
 import { useUser } from "../UserContext.js";
 
@@ -228,7 +230,7 @@ function StructurePanel({ data, onDismiss, onConfirmSuggestion, confirmingId, se
   );
 }
 
-export default function CampaignsPage({ onIngest = null }) {
+export default function CampaignsPage({ onIngest = null, batchedAdIds = [] }) {
   const { tier } = useUser();
   const [campaigns, setCampaigns] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -262,6 +264,8 @@ export default function CampaignsPage({ onIngest = null }) {
   const [confirmingId, setConfirmingId] = useState(null);
   const [selectedSeedAdById, setSelectedSeedAdById] = useState({});
   const [savingSuggestionKey, setSavingSuggestionKey] = useState({});
+  // seedStateById[id] = { n, loading, seeded, error }
+  const [seedStateById, setSeedStateById] = useState({});
 
   useEffect(() => {
     getCampaigns()
@@ -269,6 +273,27 @@ export default function CampaignsPage({ onIngest = null }) {
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
   }, []);
+
+  // On mount, silently reload stored structure for any previously-ingested campaigns
+  // so getSeedAdId() works without requiring a manual Reingest click.
+  useEffect(() => {
+    if (campaigns.length === 0) return;
+    const toReload = campaigns.filter((c) => ingestedIds.has(c.id));
+    if (toReload.length === 0) return;
+    toReload.forEach(async (c) => {
+      try {
+        const [ads, suggestions] = await Promise.all([
+          getCampaignStructure(c.id),
+          getCampaignSuggestions(c.id),
+        ]);
+        if (ads?.length > 0) {
+          setStructureById((prev) => ({ ...prev, [c.id]: { ads, suggestions } }));
+        }
+      } catch {
+        // silently ignore — user can still click Reingest manually
+      }
+    });
+  }, [campaigns]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Poll dynamic generation jobs while any are running
   useEffect(() => {
@@ -308,22 +333,6 @@ export default function CampaignsPage({ onIngest = null }) {
     }
     setExpandedId(campaignId);
     loadHistory(campaignId);
-
-    // Propagate seed ad ID to Dashboard whenever an ingested campaign is opened
-    if (onIngest && ingestedIds.has(campaignId)) {
-      const knownSeedAdId = getSeedAdId(campaignId);
-      if (knownSeedAdId) {
-        onIngest(knownSeedAdId);
-      } else {
-        // Structure not yet in state — fetch silently just to get the seed ad ID
-        getCampaignStructure(campaignId)
-          .then((ads) => {
-            const seedAdId = ads?.[0]?.ad_id;
-            if (seedAdId) onIngest(seedAdId);
-          })
-          .catch(() => {});
-      }
-    }
   }
 
   async function handleSyncCampaigns() {
@@ -397,11 +406,6 @@ export default function CampaignsPage({ onIngest = null }) {
         return next;
       });
 
-      // Notify parent (Dashboard) of the seed ad ID for cross-platform BO
-      const seedAdId = ads?.[0]?.ad_id;
-      if (onIngest && seedAdId) {
-        onIngest(seedAdId);
-      }
     } catch (err) {
       setStructureById((prev) => ({ ...prev, [campaignId]: { error: err.message } }));
     }
@@ -444,6 +448,19 @@ export default function CampaignsPage({ onIngest = null }) {
       setDynJobById((prev) => ({ ...prev, [campaignId]: { job_id, status: "running" } }));
     } catch (err) {
       setDynJobById((prev) => ({ ...prev, [campaignId]: { error: err.message } }));
+    }
+  }
+
+  async function handleSeedTestData(campaignId) {
+    const seedAdId = getSeedAdId(campaignId);
+    if (!seedAdId) return;
+    const n = seedStateById[campaignId]?.n ?? 5;
+    setSeedStateById(prev => ({ ...prev, [campaignId]: { ...prev[campaignId], loading: true, seeded: null, error: null } }));
+    try {
+      const result = await seedScoredVariants(seedAdId, "meta", n, seedAdId);
+      setSeedStateById(prev => ({ ...prev, [campaignId]: { ...prev[campaignId], loading: false, seeded: result.seeded, warning: result.warning } }));
+    } catch (err) {
+      setSeedStateById(prev => ({ ...prev, [campaignId]: { ...prev[campaignId], loading: false, error: err.message } }));
     }
   }
 
@@ -682,6 +699,54 @@ export default function CampaignsPage({ onIngest = null }) {
                                 ? "Generating…"
                                 : "Dynamic Ad (AI Images)"}
                             </button>
+                            {onIngest && (() => {
+                              const seedAdId = getSeedAdId(c.id);
+                              if (!seedAdId) return null;
+                              const inBatch = batchedAdIds.includes(seedAdId);
+                              return (
+                                <button
+                                  className={inBatch ? "btn-batch-active" : "btn-batch"}
+                                  onClick={() => onIngest({ platform: "meta", seed_ad_id: seedAdId, text_source_id: seedAdId, label: c.name })}
+                                  title={inBatch ? "Remove from cross-platform analysis batch" : "Add to cross-platform analysis batch"}
+                                >
+                                  {inBatch ? "In Batch ✓" : "Add to Analysis"}
+                                </button>
+                              );
+                            })()}
+                          </div>
+
+                          {/* Seed test data */}
+                          <div className="seed-controls">
+                            <span className="seed-controls-label">Seed test data:</span>
+                            <input
+                              type="number"
+                              min={1} max={50}
+                              value={seedStateById[c.id]?.n ?? 5}
+                              onChange={e => setSeedStateById(prev => ({
+                                ...prev,
+                                [c.id]: { ...prev[c.id], n: Math.max(1, Math.min(50, parseInt(e.target.value) || 1)) },
+                              }))}
+                              className="seed-n-input"
+                              title="Number of fake scored variants to seed"
+                            />
+                            <span className="seed-controls-unit">variants</span>
+                            <button
+                              className="btn-small"
+                              onClick={() => handleSeedTestData(c.id)}
+                              disabled={seedStateById[c.id]?.loading || !getSeedAdId(c.id)}
+                              title="Seed fake scored observations so Get Recommendations has training data"
+                            >
+                              {seedStateById[c.id]?.loading ? "Seeding…" : "Seed"}
+                            </button>
+                            {seedStateById[c.id]?.seeded != null && (
+                              <span className="seed-success">✓ {seedStateById[c.id].seeded} seeded</span>
+                            )}
+                            {seedStateById[c.id]?.warning && (
+                              <span className="seed-warning">{seedStateById[c.id].warning}</span>
+                            )}
+                            {seedStateById[c.id]?.error && (
+                              <span className="error-inline">{seedStateById[c.id].error}</span>
+                            )}
                           </div>
 
                           {/* Static text generation results */}
@@ -785,12 +850,10 @@ export default function CampaignsPage({ onIngest = null }) {
                                 <p className="dyn-warning">{boStateById[c.id].warning}</p>
                               )}
                               <p className="bo-meta">
-                                Based on <strong>{boStateById[c.id].scored_count}</strong> scored
-                                variant{boStateById[c.id].scored_count !== 1 ? "s" : ""} across{" "}
-                                <strong>{boStateById[c.id].candidate_count}</strong> candidate
-                                combination{boStateById[c.id].candidate_count !== 1 ? "s" : ""}
-                                {boStateById[c.id].seedAdId && (
-                                  <> · seed <code>{boStateById[c.id].seedAdId}</code></>
+                                <strong>{boStateById[c.id].scored_count}</strong> scored variant{boStateById[c.id].scored_count !== 1 ? "s" : ""} ·{" "}
+                                <strong>{boStateById[c.id].candidate_count}</strong> candidate{boStateById[c.id].candidate_count !== 1 ? "s" : ""}
+                                {boStateById[c.id].scored_count === 0 && (
+                                  <span className="stat-random-note"> — no scored data yet, picks are random. Run Dynamic Ad (AI Images) first to generate scored variants.</span>
                                 )}
                               </p>
                               {boStateById[c.id].picks.length === 0 ? (
@@ -798,56 +861,30 @@ export default function CampaignsPage({ onIngest = null }) {
                                   Not enough scored data yet — generate a Dynamic Ad first, then run BO again.
                                 </p>
                               ) : (
-                                boStateById[c.id].picks.map((pick, i) => {
-                                  const saveKey = `${c.id}-${i}`;
-                                  const isSaving = !!savingSuggestionKey[saveKey];
-                                  const selectionLabel =
-                                    pick.selection_type === "modal_q_ei" ? "Bayesian (Modal)" :
-                                    pick.selection_type === "ei"         ? "Best expected" :
-                                    pick.selection_type === "fantasy"    ? "Exploratory" : "Random";
-                                  return (
-                                    <div key={i} className="bo-pick">
-                                      <div className="bo-pick-header">
-                                        <span className="bo-pick-label">Recommendation {i + 1}</span>
-                                        <span className="bo-pick-type">{selectionLabel}</span>
-                                        <button
-                                          className="btn-success btn-save-suggestion"
-                                          onClick={() => handleSaveAsSuggestion(c.id, pick, i)}
-                                          disabled={isSaving}
-                                          title="Save as a suggestion you can confirm-create in Meta"
-                                        >
-                                          {isSaving ? "Saving…" : "Save as Suggestion"}
-                                        </button>
-                                      </div>
-                                      {pick.combination.image_url && (
-                                        <PlacementPreview
-                                          imageUrl={pick.combination.image_url}
-                                          imageWidth={pick.combination.image_width}
-                                          imageHeight={pick.combination.image_height}
-                                          placements={pick.placements}
-                                        />
-                                      )}
-                                      <dl className="slot-list">
-                                        {Object.entries(pick.combination)
-                                          .filter(([k]) => !["image_url", "image_width", "image_height"].includes(k))
-                                          .map(([k, v]) => (
-                                            <div key={k} className="slot-row">
-                                              <dt>{SLOT_LABELS[k] ?? k}</dt>
-                                              <dd><span className="slot-value">{v || <em>—</em>}</span></dd>
-                                            </div>
-                                          ))}
-                                      </dl>
-                                      {pick.gpr_mean != null && (
-                                        <p className="bo-pick-score">
-                                          Predicted score: <strong>{pick.gpr_mean.toFixed(2)}</strong>
-                                          {pick.ei_score != null && (
-                                            <> &nbsp;·&nbsp; EI: {pick.ei_score.toFixed(4)}</>
-                                          )}
-                                        </p>
-                                      )}
-                                    </div>
-                                  );
-                                })
+                                boStateById[c.id].picks.map((pick, i) => (
+                                  <BOPickCard
+                                    key={pick.combination_key}
+                                    pick={pick}
+                                    index={i}
+                                    platform="meta"
+                                    seedAdId={boStateById[c.id].seedAdId || getSeedAdId(c.id)}
+                                    campaignName={c.name}
+                                    onPushed={(p, platformAdId, adName) => {
+                                      // Optimistically update the pick in state
+                                      setBoStateById(prev => ({
+                                        ...prev,
+                                        [c.id]: {
+                                          ...prev[c.id],
+                                          picks: prev[c.id].picks.map(pk =>
+                                            pk.combination_key === p.combination_key
+                                              ? { ...pk, already_pushed: true, push_status: "paused", ad_name: adName, platform_ad_id: platformAdId }
+                                              : pk
+                                          ),
+                                        },
+                                      }));
+                                    }}
+                                  />
+                                ))
                               )}
 
                               {structureById[c.id]?.suggestions?.length > 0 && (

@@ -52,38 +52,6 @@ CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, pw_hash TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS ad_generation_jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    campaign_id TEXT NOT NULL,
-    adset_id TEXT NOT NULL,
-    seed_ad_id TEXT,
-    seed_image_url TEXT NOT NULL,
-    headline TEXT NOT NULL,
-    short_text TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    suggestions TEXT,
-    error TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS ad_generation_variants (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id INTEGER NOT NULL,
-    suggestion TEXT NOT NULL,
-    deapi_request_id TEXT,
-    status TEXT NOT NULL DEFAULT 'submitted',
-    result_url TEXT,
-    local_filename TEXT,
-    score REAL,
-    severity TEXT,
-    score_labels TEXT,
-    qa_status TEXT,
-    qa_corrections TEXT,
-    parent_variant_id INTEGER,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
 CREATE TABLE IF NOT EXISTS ad_embeddings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -116,6 +84,20 @@ CREATE TABLE IF NOT EXISTS ad_image_embeddings (
     embedded_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (user_id, ad_id, slot_index)
 );
+CREATE TABLE IF NOT EXISTS scored_observations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL,
+    seed_ad_id      TEXT NOT NULL,
+    combination_key TEXT NOT NULL,
+    combination     TEXT NOT NULL,
+    score           REAL NOT NULL,
+    metric          TEXT NOT NULL DEFAULT 'synthetic',
+    source          TEXT NOT NULL DEFAULT 'seed_script',
+    text_vector     BLOB,
+    image_vector    BLOB,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, seed_ad_id, combination_key, metric)
+);
 """
 
 # Text combinations for the test: 8 combinations (headlines × primary_texts)
@@ -138,6 +120,7 @@ _SCORED_SCORES = [3.5, 4.2, 2.8, 5.1, 4.7]  # one per scored variant
 
 def _seed_db(db_path: Path) -> None:
     conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
     conn.executescript(_DDL)
 
     # User
@@ -169,62 +152,25 @@ def _seed_db(db_path: Path) -> None:
             (TEXT_SOURCE_ID, key, vec.tobytes(), "embed-v-4-0"),
         )
 
-    # One generation job
-    cur = conn.execute(
-        """INSERT INTO ad_generation_jobs
-           (user_id, campaign_id, adset_id, seed_ad_id, seed_image_url, headline, short_text, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (TEST_USER_ID, "camp_bo_test", "adset_bo_test", SEED_AD_ID,
-         "http://example.com/seed.png", "Wool Socks", "Hand made in Switzerland.", "done"),
-    )
-    job_id = cur.lastrowid
-
-    # N_SCORED variants with scores — each matched to one of the first N_SCORED text combos
+    # Scored observations — write directly to scored_observations
     for i in range(N_SCORED):
-        cur2 = conn.execute(
-            """INSERT INTO ad_generation_variants
-               (job_id, suggestion, status, result_url, local_filename, score)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (job_id, f"suggestion_{i}", "scored",
-             f"http://deapi.example.com/result_{i}.png",
-             f"variant_{i}.png", _SCORED_SCORES[i]),
-        )
-        variant_id = cur2.lastrowid
-
-        # Image embedding for this variant (stored with variant_embedding_ad_id convention)
-        from bo_pipeline.selector import variant_embedding_ad_id
-        emb_ad_id = variant_embedding_ad_id(job_id, variant_id)
+        combo = _TEXT_COMBOS[i]
+        key = json.dumps(combo, sort_keys=True, separators=(",", ":"))
+        # text_vector: use the same vector that was stored in ad_text_combination_embeddings
+        tce_row = conn.execute(
+            "SELECT vector FROM ad_text_combination_embeddings WHERE source_id=? AND combination_key=?",
+            (TEXT_SOURCE_ID, key),
+        ).fetchone()
+        txt_vec_bytes = tce_row["vector"] if tce_row else _rand_vec().tobytes()
         img_vec = _rand_vec()
-        txt_vec = _rand_vec()
-        comb = np.concatenate([img_vec[:IMAGE_DIM], txt_vec[:TEXT_DIM]]).tobytes()
         conn.execute(
-            """INSERT OR REPLACE INTO ad_embeddings
-               (user_id, ad_id, campaign_id, text_vector, image_vector, combined_vector)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (TEST_USER_ID, emb_ad_id, "camp_bo_test",
-             txt_vec.tobytes(), img_vec.tobytes(), comb),
+            """INSERT OR REPLACE INTO scored_observations
+               (user_id, seed_ad_id, combination_key, combination,
+                score, metric, source, text_vector, image_vector)
+               VALUES (?, ?, ?, ?, ?, 'synthetic', 'seed_script', ?, ?)""",
+            (TEST_USER_ID, SEED_AD_ID, key, key,
+             _SCORED_SCORES[i], txt_vec_bytes, img_vec.tobytes()),
         )
-
-    # One defunct variant — should be excluded
-    cur3 = conn.execute(
-        """INSERT INTO ad_generation_variants
-           (job_id, suggestion, status, score)
-           VALUES (?, ?, ?, ?)""",
-        (job_id, "defunct_suggestion", "defunct", 1.0),
-    )
-    defunct_id = cur3.lastrowid
-    from bo_pipeline.selector import variant_embedding_ad_id
-    defunct_ad_id = variant_embedding_ad_id(job_id, defunct_id)
-    img_vec = _rand_vec()
-    txt_vec = _rand_vec()
-    comb = np.concatenate([img_vec[:IMAGE_DIM], txt_vec[:TEXT_DIM]]).tobytes()
-    conn.execute(
-        """INSERT OR REPLACE INTO ad_embeddings
-           (user_id, ad_id, campaign_id, text_vector, image_vector, combined_vector)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (TEST_USER_ID, defunct_ad_id, "camp_bo_test",
-         txt_vec.tobytes(), img_vec.tobytes(), comb),
-    )
 
     conn.commit()
     conn.close()
@@ -377,21 +323,11 @@ class TestSelector:
     def test_scored_has_required_fields(self, test_db):
         from bo_pipeline.selector import get_scored_combinations
         for row in get_scored_combinations(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, test_db):
-            assert "variant_id" in row
+            assert "combination_key" in row
+            assert "combination" in row
             assert "score" in row
             assert isinstance(row["text_vector"], np.ndarray)
-            assert isinstance(row["image_vector"], np.ndarray)
             assert row["text_vector"].dtype == np.float32
-            assert row["image_vector"].dtype == np.float32
-
-    def test_defunct_excluded_from_scored(self, test_db):
-        from bo_pipeline.selector import get_scored_combinations
-        scored = get_scored_combinations(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, test_db)
-        scores = [s["score"] for s in scored]
-        assert 1.0 not in scores or all(s["score"] != 1.0 or len([x for x in scored if x["score"] == 1.0]) == 0
-                                         for _ in [None]), \
-            "defunct variant (score=1.0 with status='defunct') should not appear"
-        assert all(s["score"] in _SCORED_SCORES for s in scored)
 
     def test_candidates_returns_all_text_combos(self, test_db):
         from bo_pipeline.selector import get_candidate_combinations
@@ -450,7 +386,7 @@ class TestBOPipeline:
         # "local" always exercises GPR+fantasy without any network calls.
         # "modal" requires MODAL_BO_API_URL to be set and hits the live endpoint.
         method = os.getenv("BO_TEST_METHOD", "local")
-        picks, _ = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db, method=method)
+        picks, *_ = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db, method=method)
         return picks
 
     def test_returns_two_picks(self, bo_result):
@@ -546,7 +482,7 @@ class TestBOPipeline:
         conn.close()
 
         method = os.getenv("BO_TEST_METHOD", "local")
-        picks, _ = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=empty_db, method=method)
+        picks, *_ = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=empty_db, method=method)
         assert len(picks) == 2
         for pick in picks:
             # Insufficient data → random fallback regardless of method
@@ -620,7 +556,7 @@ class TestBOPipeline:
 
         # ---- 4. Full pipeline run ----
         method = os.getenv("BO_TEST_METHOD", "local")
-        picks, _ = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db, method=method)
+        picks, *_ = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db, method=method)
 
         pick1, pick2 = picks
 

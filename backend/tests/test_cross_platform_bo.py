@@ -66,38 +66,6 @@ CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, pw_hash TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS ad_generation_jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    campaign_id TEXT NOT NULL,
-    adset_id TEXT NOT NULL,
-    seed_ad_id TEXT,
-    seed_image_url TEXT NOT NULL,
-    headline TEXT NOT NULL,
-    short_text TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    suggestions TEXT,
-    error TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS ad_generation_variants (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id INTEGER NOT NULL,
-    suggestion TEXT NOT NULL,
-    deapi_request_id TEXT,
-    status TEXT NOT NULL DEFAULT 'submitted',
-    result_url TEXT,
-    local_filename TEXT,
-    score REAL,
-    severity TEXT,
-    score_labels TEXT,
-    qa_status TEXT,
-    qa_corrections TEXT,
-    parent_variant_id INTEGER,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
 CREATE TABLE IF NOT EXISTS ad_embeddings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -130,6 +98,20 @@ CREATE TABLE IF NOT EXISTS ad_image_embeddings (
     embedded_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (user_id, ad_id, slot_index)
 );
+CREATE TABLE IF NOT EXISTS scored_observations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL,
+    seed_ad_id      TEXT NOT NULL,
+    combination_key TEXT NOT NULL,
+    combination     TEXT NOT NULL,
+    score           REAL NOT NULL,
+    metric          TEXT NOT NULL DEFAULT 'synthetic',
+    source          TEXT NOT NULL DEFAULT 'seed_script',
+    text_vector     BLOB,
+    image_vector    BLOB,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, seed_ad_id, combination_key, metric)
+);
 """
 
 _TEXT_COMBOS = [
@@ -152,8 +134,7 @@ def _seed_group(
     text_combos: list[dict],
     include_image_vec: bool = True,
 ) -> None:
-    """Seed one BO group (seed ad + text combos + scored variants) into conn."""
-    from bo_pipeline.selector import variant_embedding_ad_id
+    """Seed one BO group (seed ad + text combos + scored observations) into conn."""
 
     # Seed ad embedding
     txt_vec = _rand_vec(TEXT_EMBED_DIM)
@@ -181,46 +162,33 @@ def _seed_group(
             (text_source_id, key, vec.tobytes()),
         )
 
-    # One generation job
-    job_row = conn.execute(
-        """INSERT INTO ad_generation_jobs
-           (user_id, campaign_id, adset_id, seed_ad_id, seed_image_url, headline, short_text, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (TEST_USER_ID, campaign_id, f"adset_{campaign_id}", seed_ad_id,
-         f"http://example.com/{seed_ad_id}.png", "Headline 0", "Body copy 0.", "done"),
-    )
-    job_id = job_row.lastrowid
-
-    # Scored variants
+    # Scored observations — write directly to scored_observations
     for i, score in enumerate(scores):
-        var_row = conn.execute(
-            """INSERT INTO ad_generation_variants
-               (job_id, suggestion, status, result_url, score)
-               VALUES (?, ?, ?, ?, ?)""",
-            (job_id, f"suggestion_{i}", "scored",
-             f"http://example.com/result_{seed_ad_id}_{i}.png", score),
-        )
-        variant_id = var_row.lastrowid
-
-        # Per-variant embedding (text_vector always set; image_vector optional)
-        emb_ad_id = variant_embedding_ad_id(job_id, variant_id)
-        v_txt = _rand_vec(TEXT_EMBED_DIM)
+        combo = text_combos[i % len(text_combos)]
+        key = json.dumps(combo, sort_keys=True, separators=(",", ":"))
+        tce_row = conn.execute(
+            "SELECT vector FROM ad_text_combination_embeddings WHERE source_id=? AND combination_key=?",
+            (text_source_id, key),
+        ).fetchone()
+        txt_vec_bytes = tce_row["vector"] if tce_row else _rand_vec(TEXT_EMBED_DIM).tobytes()
         v_img = _rand_vec(IMAGE_EMBED_DIM) if include_image_vec else None
         conn.execute(
-            """INSERT OR REPLACE INTO ad_embeddings
-               (user_id, ad_id, campaign_id, text_vector, image_vector, combined_vector)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+            """INSERT OR REPLACE INTO scored_observations
+               (user_id, seed_ad_id, combination_key, combination,
+                score, metric, source, text_vector, image_vector)
+               VALUES (?, ?, ?, ?, ?, 'synthetic', 'seed_script', ?, ?)""",
             (
-                TEST_USER_ID, emb_ad_id, campaign_id,
-                v_txt.tobytes(),
+                TEST_USER_ID, seed_ad_id, key, key,
+                score,
+                txt_vec_bytes,
                 v_img.tobytes() if v_img is not None else None,
-                combined_stub.tobytes(),
             ),
         )
 
 
 def _seed_db(db_path: Path) -> None:
     conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
     conn.executescript(_DDL)
     conn.execute(
         "INSERT OR IGNORE INTO users (id, email, pw_hash) VALUES (?, ?, ?)",
@@ -442,7 +410,8 @@ class TestCrossPlatformBO:
         from bo_pipeline.cross_platform import run_cross_platform_bo
         # BO_TEST_METHOD env var selects the path: "local" (default) or "modal".
         method = os.getenv("BO_TEST_METHOD", "local")
-        return run_cross_platform_bo(_PAIRS, TEST_USER_ID, db_path=cp_db, method=method)
+        picks, _ = run_cross_platform_bo(_PAIRS, TEST_USER_ID, db_path=cp_db, method=method)
+        return picks
 
     # ── Basic shape ────────────────────────────────────────────────────────────
 
@@ -508,7 +477,7 @@ class TestCrossPlatformBO:
         from bo_pipeline.selector import get_candidate_combinations
 
         method = os.getenv("BO_TEST_METHOD", "local")
-        picks = run_cross_platform_bo(_PAIRS, TEST_USER_ID, db_path=cp_db, method=method)
+        picks, _ = run_cross_platform_bo(_PAIRS, TEST_USER_ID, db_path=cp_db, method=method)
 
         meta_cand_keys = {
             c["combination_key"]
@@ -553,13 +522,13 @@ class TestCrossPlatformBO:
     def test_top_n_1_returns_single_pick(self, cp_db):
         from bo_pipeline.cross_platform import run_cross_platform_bo
         method = os.getenv("BO_TEST_METHOD", "local")
-        picks = run_cross_platform_bo(_PAIRS, TEST_USER_ID, db_path=cp_db, top_n=1, method=method)
+        picks, _ = run_cross_platform_bo(_PAIRS, TEST_USER_ID, db_path=cp_db, top_n=1, method=method)
         assert len(picks) <= 1
 
     def test_top_n_4_returns_at_most_4(self, cp_db):
         from bo_pipeline.cross_platform import run_cross_platform_bo
         method = os.getenv("BO_TEST_METHOD", "local")
-        picks = run_cross_platform_bo(_PAIRS, TEST_USER_ID, db_path=cp_db, top_n=4, method=method)
+        picks, _ = run_cross_platform_bo(_PAIRS, TEST_USER_ID, db_path=cp_db, top_n=4, method=method)
         assert len(picks) <= 4
 
     # ── Fallback behaviour ─────────────────────────────────────────────────────
@@ -570,6 +539,7 @@ class TestCrossPlatformBO:
 
         empty_db = tmp_path / "empty_cp.db"
         conn = sqlite3.connect(str(empty_db))
+        conn.row_factory = sqlite3.Row
         conn.executescript(_DDL)
         conn.execute(
             "INSERT OR IGNORE INTO users (id, email, pw_hash) VALUES (?, ?, ?)",
@@ -599,7 +569,7 @@ class TestCrossPlatformBO:
         conn.close()
 
         method = os.getenv("BO_TEST_METHOD", "local")
-        picks = run_cross_platform_bo(_PAIRS, TEST_USER_ID, db_path=empty_db, method=method)
+        picks, _ = run_cross_platform_bo(_PAIRS, TEST_USER_ID, db_path=empty_db, method=method)
         assert len(picks) <= 2
         for pick in picks:
             # No scored data → random fallback regardless of method
@@ -614,6 +584,7 @@ class TestCrossPlatformBO:
 
         partial_db = tmp_path / "partial_cp.db"
         conn = sqlite3.connect(str(partial_db))
+        conn.row_factory = sqlite3.Row
         conn.executescript(_DDL)
         conn.execute(
             "INSERT OR IGNORE INTO users (id, email, pw_hash) VALUES (?, ?, ?)",
@@ -639,7 +610,7 @@ class TestCrossPlatformBO:
         conn.close()
 
         method = os.getenv("BO_TEST_METHOD", "local")
-        picks = run_cross_platform_bo(_PAIRS, TEST_USER_ID, db_path=partial_db, method=method)
+        picks, _ = run_cross_platform_bo(_PAIRS, TEST_USER_ID, db_path=partial_db, method=method)
 
         # At least the Meta pick should be EI-based
         meta_picks = [p for p in picks if p["platform"] == "meta"]
@@ -655,14 +626,14 @@ class TestCrossPlatformBO:
     def test_empty_pairs_returns_empty(self, cp_db):
         from bo_pipeline.cross_platform import run_cross_platform_bo
         method = os.getenv("BO_TEST_METHOD", "local")
-        picks = run_cross_platform_bo([], TEST_USER_ID, db_path=cp_db, method=method)
+        picks, _ = run_cross_platform_bo([], TEST_USER_ID, db_path=cp_db, method=method)
         assert picks == []
 
     def test_single_meta_pair_still_works(self, cp_db):
         """Single-group mode should behave like run_bo."""
         from bo_pipeline.cross_platform import run_cross_platform_bo
         method = os.getenv("BO_TEST_METHOD", "local")
-        picks = run_cross_platform_bo(
+        picks, _ = run_cross_platform_bo(
             [{"platform": "meta", "seed_ad_id": META_SEED_AD_ID, "text_source_id": META_TEXT_SOURCE_ID}],
             TEST_USER_ID, db_path=cp_db, method=method,
         )
@@ -756,9 +727,11 @@ class TestCrossPlatformBOEndpoint:
             }
         ]
 
-        with patch("bo_pipeline.cross_platform.run_cross_platform_bo", return_value=mock_picks), \
-             patch("bo_pipeline.selector.get_scored_combinations", return_value=[]), \
-             patch("bo_pipeline.selector.get_candidate_combinations", return_value=[]), \
+        mock_stats = [
+            {"platform": "meta",   "seed_ad_id": "meta_x",   "scored_count": 0, "candidate_count": 0},
+            {"platform": "google", "seed_ad_id": "google_x",  "scored_count": 0, "candidate_count": 0},
+        ]
+        with patch("bo_pipeline.cross_platform.run_cross_platform_bo", return_value=(mock_picks, mock_stats)), \
              patch("bo_pipeline.storage.save_bo_run", return_value=[1]):
             resp = self.client.post(
                 "/api/bo/cross-platform",
@@ -788,9 +761,11 @@ class TestCrossPlatformBOEndpoint:
             }
         ]
 
-        with patch("bo_pipeline.cross_platform.run_cross_platform_bo", return_value=mock_picks), \
-             patch("bo_pipeline.selector.get_scored_combinations", return_value=[{"score": 3.0}]), \
-             patch("bo_pipeline.selector.get_candidate_combinations", return_value=[{"x": 1}]), \
+        mock_stats = [
+            {"platform": "meta",   "seed_ad_id": "meta_x",   "scored_count": 1, "candidate_count": 1},
+            {"platform": "google", "seed_ad_id": "google_x",  "scored_count": 1, "candidate_count": 1},
+        ]
+        with patch("bo_pipeline.cross_platform.run_cross_platform_bo", return_value=(mock_picks, mock_stats)), \
              patch("bo_pipeline.storage.save_bo_run", return_value=[1]):
             resp = self.client.post(
                 "/api/bo/cross-platform",
@@ -809,9 +784,11 @@ class TestCrossPlatformBOEndpoint:
     def test_response_shape_group_stats(self):
         from unittest.mock import patch
 
-        with patch("bo_pipeline.cross_platform.run_cross_platform_bo", return_value=[]), \
-             patch("bo_pipeline.selector.get_scored_combinations", return_value=[{"s": 1}, {"s": 2}]), \
-             patch("bo_pipeline.selector.get_candidate_combinations", return_value=[{"x": i} for i in range(5)]), \
+        mock_stats = [
+            {"platform": "meta",   "seed_ad_id": "meta_x",   "scored_count": 2, "candidate_count": 5},
+            {"platform": "google", "seed_ad_id": "google_x",  "scored_count": 2, "candidate_count": 5},
+        ]
+        with patch("bo_pipeline.cross_platform.run_cross_platform_bo", return_value=([], mock_stats)), \
              patch("bo_pipeline.storage.save_bo_run", return_value=[]):
             resp = self.client.post(
                 "/api/bo/cross-platform",

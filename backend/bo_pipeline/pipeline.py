@@ -19,9 +19,9 @@ Two methods are available (controlled by the `method` parameter to run_bo):
     "fantasy step" (augmented refit) to pick a second candidate.  No network
     calls; works with no env vars.
 
-Scored observations come from ad_generation_variants (image variants that have
-been model-scored).  Candidates are text combinations from
-ad_text_combination_embeddings paired with the seed ad's image embedding.
+Scored observations come from scored_observations (written by the seed script,
+Qwen2-VL pipeline, or convergence checking).  Candidates are text combinations
+from ad_text_combination_embeddings paired with the seed ad's image embedding.
 
 Per-ad constraint: seed_ad_id and text_source_id must refer to the same ad.
 The caller is responsible for providing consistent identifiers.
@@ -50,8 +50,14 @@ _FANTASY_TYPE   = "fantasy"
 _MODAL_TYPE     = "modal_q_ei"
 
 
-def _build_X(combinations: list[dict]) -> np.ndarray:
-    """Stack combined embeddings for a list of combination dicts."""
+def _build_X(combinations: list[dict], platform: str = "meta") -> np.ndarray:
+    """Stack feature vectors for a list of combination dicts.
+
+    Google RSA ads have no image embeddings; use text-only (1536-dim).
+    All other platforms use combine(text_vec, image_vec) → 3072-dim.
+    """
+    if platform == "google":
+        return np.vstack([c["text_vector"] for c in combinations])
     return np.vstack([combine(c["text_vector"], c["image_vector"]) for c in combinations])
 
 
@@ -64,6 +70,7 @@ def _run_local_bo(
     candidates: list[dict],
     xi: float,
     higher_is_better: bool,
+    platform: str = "meta",
 ) -> list[dict]:
     """
     GPR + EI pick 1, fantasy-step pick 2.  Pure local sklearn — no network.
@@ -76,8 +83,8 @@ def _run_local_bo(
     y = transform_y(y_raw)
     y_best = float(y.max())
 
-    X_train = _build_X(scored).astype(np.float64)
-    X_cands = _build_X(candidates).astype(np.float64)
+    X_train = _build_X(scored, platform).astype(np.float64)
+    X_cands = _build_X(candidates, platform).astype(np.float64)
 
     gpr, scaler = fit_gpr(X_train, y)
 
@@ -97,8 +104,7 @@ def _run_local_bo(
     if len(candidates) == 1:
         return [pick1]
 
-    # Pick 2: fantasy step — pass transformed y so the augmented training set
-    # stays in the same (normal) space as the initial fit.
+    # Pick 2: fantasy step
     gpr2, scaler2 = fantasize(gpr, scaler, X_train, y, X_cands[[pick1_idx]])
     remaining_idx = [i for i in range(len(candidates)) if i != pick1_idx]
     X_remaining = X_cands[remaining_idx]
@@ -128,6 +134,7 @@ def _run_modal_bo(
     candidates: list[dict],
     xi: float,
     higher_is_better: bool,
+    platform: str = "meta",
 ) -> list[dict]:
     """
     PCA → Modal GP q-EI → nearest-pool-member snap.
@@ -152,8 +159,8 @@ def _run_modal_bo(
     y = y_raw if higher_is_better else -y_raw  # noqa: SIM210 (dead branch, intentional)
 
     # Build full embedding pool for PCA fitting (scored ∪ candidates)
-    X_scored = _build_X(scored).astype(np.float32)
-    X_cands  = _build_X(candidates).astype(np.float32)
+    X_scored = _build_X(scored, platform).astype(np.float32)
+    X_cands  = _build_X(candidates, platform).astype(np.float32)
     X_all    = np.vstack([X_scored, X_cands])
 
     # Fit PCA on the union so the projection captures the full space
@@ -197,7 +204,10 @@ def run_bo(
     xi: float = 0.01,
     higher_is_better: bool = True,
     method: str = "modal",
-) -> tuple[list[dict], str | None]:
+    platform: str = "meta",
+    additional_exclude_keys: set[str] | None = None,
+    target_metric: str | None = None,
+) -> tuple[list[dict], str | None, int, int]:
     """
     Select up to 2 combinations to test next via Bayesian Optimisation.
 
@@ -206,32 +216,37 @@ def run_bo(
                                 MODAL_BO_API_URL is unset or the API call fails.
     method="local"            — local sklearn GPR + EI + fantasy step; no network.
 
-    Returns (picks, warning) where:
-      picks   — list of 1 or 2 dicts, each with:
-                  combination_key, combination, selection_type,
-                  ei_score, gpr_mean, gpr_std
-      warning — non-None string when Modal was configured but failed and the
-                response fell back to the local GPR; None otherwise.
+    Returns (picks, warning, scored_count, candidate_count) where:
+      picks           — list of 1 or 2 dicts, each with:
+                          combination_key, combination, selection_type,
+                          ei_score, gpr_mean, gpr_std
+      warning         — non-None string when Modal was configured but failed and the
+                        response fell back to the local GPR; None otherwise.
+      scored_count    — number of scored combinations found
+      candidate_count — number of candidate combinations found
 
     Falls back to random selection when there are fewer than MIN_TRAINING_POINTS
     scored combinations available.
     """
     from bo_pipeline.modal_bo import modal_bo_enabled
 
-    scored = get_scored_combinations(seed_ad_id, text_source_id, user_id, db_path)
+    scored = get_scored_combinations(seed_ad_id, text_source_id, user_id, db_path, target_metric=target_metric)
     scored_keys = {s["combination_key"] for s in scored}
+    all_exclude = scored_keys | (additional_exclude_keys or set())
     candidates = get_candidate_combinations(
-        text_source_id, seed_ad_id, user_id, exclude_keys=scored_keys, db_path=db_path
+        text_source_id, seed_ad_id, user_id, exclude_keys=all_exclude, db_path=db_path
     )
+    scored_count = len(scored)
+    candidate_count = len(candidates)
 
     logger.info(
         "run_bo: seed_ad_id=%s scored=%d candidates=%d method=%s",
-        seed_ad_id, len(scored), len(candidates), method,
+        seed_ad_id, scored_count, candidate_count, method,
     )
 
     if not candidates:
         logger.warning("run_bo: no candidates available for seed_ad_id=%s", seed_ad_id)
-        return [], None
+        return [], None, scored_count, candidate_count
 
     # --- Fallback: not enough data to fit a reliable model ---
     if len(scored) < MIN_TRAINING_POINTS:
@@ -241,7 +256,7 @@ def run_bo(
         )
         rng = np.random.default_rng()
         chosen = rng.choice(len(candidates), size=min(2, len(candidates)), replace=False)
-        return [_make_pick(candidates[i], _FALLBACK_TYPE) for i in chosen], None
+        return [_make_pick(candidates[i], _FALLBACK_TYPE) for i in chosen], None, scored_count, candidate_count
 
     # --- Route to Modal or local ---
     use_modal = (method == "modal") and modal_bo_enabled()
@@ -249,12 +264,12 @@ def run_bo(
 
     if use_modal:
         try:
-            return _run_modal_bo(scored, candidates, xi=xi, higher_is_better=higher_is_better), None
+            return _run_modal_bo(scored, candidates, xi=xi, higher_is_better=higher_is_better, platform=platform), None, scored_count, candidate_count
         except Exception as exc:
             logger.warning("run_bo: Modal BO failed (%s) — falling back to local GPR", exc)
             modal_warning = f"Modal GP failed ({type(exc).__name__}: {exc}) — used local GPR"
 
-    return _run_local_bo(scored, candidates, xi=xi, higher_is_better=higher_is_better), modal_warning
+    return _run_local_bo(scored, candidates, xi=xi, higher_is_better=higher_is_better, platform=platform), modal_warning, scored_count, candidate_count
 
 
 # ---------------------------------------------------------------------------

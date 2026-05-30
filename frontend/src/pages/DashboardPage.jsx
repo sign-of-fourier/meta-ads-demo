@@ -1,122 +1,247 @@
-import { useState } from "react";
-import CampaignsPage from "./CampaignsPage.jsx";
-import GoogleCampaignsPage from "./GoogleCampaignsPage.jsx";
-import { runCrossPlatformBO } from "../api.js";
+import { useEffect, useState } from "react";
+import SyncBar from "../components/SyncBar.jsx";
+import UnifiedCampaignsTable from "../components/UnifiedCampaignsTable.jsx";
+import BatchPanel from "../components/BatchPanel.jsx";
+import {
+  getCampaigns,
+  runIngest,
+  pushGeneratedAds,
+  ingestCampaignStructure,
+  getCampaignStructure,
+  getGoogleCampaigns,
+  ingestGoogleStructure,
+  getGoogleStructure,
+  pushGoogleAds,
+  runUnifiedCrossPlatformBO,
+} from "../api.js";
 
-const SLOT_LABELS = {
-  headline: "Headline",
-  description: "Description",
-  primary_text: "Primary text",
-  final_url: "Final URL",
-};
+const META_LAST_SYNCED_KEY = "meta_last_synced";
+const INGESTED_KEY = "unified_ingested_keys"; // stored as array of "platform:id"
+const PAIRS_KEY = "cross_platform_pairs";
 
-const PLATFORM_LABELS = { meta: "Meta", google: "Google" };
-
-/* ── Cross-platform results panel ───────────────────────────────────────── */
-function CrossPlatformResults({ data }) {
-  const { picks, group_stats } = data;
-
-  return (
-    <div className="cross-platform-results">
-      {/* Per-platform stats */}
-      <div className="cross-platform-stats">
-        {group_stats.map((stat) => (
-          <span key={`${stat.platform}-${stat.seed_ad_id}`} className="cross-platform-stat">
-            <span className={`platform-badge platform-badge-${stat.platform}`}>
-              {PLATFORM_LABELS[stat.platform] || stat.platform}
-            </span>
-            {stat.scored_count} scored · {stat.candidate_count} candidates
-          </span>
-        ))}
-      </div>
-
-      {picks.length === 0 ? (
-        <p className="history-empty">
-          No candidates found — run per-campaign recommendations on each platform first to build
-          up scored data, then try cross-platform analysis again.
-        </p>
-      ) : (
-        picks.map((pick, i) => (
-          <div key={i} className="bo-pick">
-            <div className="bo-pick-header">
-              <span className="bo-pick-label">Recommendation {i + 1}</span>
-              <span className={`platform-badge platform-badge-${pick.platform}`}>
-                {PLATFORM_LABELS[pick.platform] || pick.platform}
-              </span>
-              <span className="bo-pick-type">
-                {pick.selection_type === "ei"
-                  ? "Best expected"
-                  : pick.selection_type === "fantasy"
-                  ? "Exploratory"
-                  : "Random"}
-              </span>
-            </div>
-            <dl className="slot-list">
-              {Object.entries(pick.combination)
-                .filter(([k]) => k !== "image_url")
-                .map(([k, v]) => (
-                  <div key={k} className="slot-row">
-                    <dt>{SLOT_LABELS[k] ?? k}</dt>
-                    <dd><span className="slot-value">{v || <em>—</em>}</span></dd>
-                  </div>
-                ))}
-            </dl>
-            {pick.gpr_mean != null && (
-              <p className="bo-pick-score">
-                Predicted score: <strong>{pick.gpr_mean.toFixed(2)}</strong>
-                {pick.ei_score != null && <> &nbsp;·&nbsp; EI: {pick.ei_score.toFixed(4)}</>}
-              </p>
-            )}
-          </div>
-        ))
-      )}
-    </div>
-  );
+function loadIngestedKeys() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(INGESTED_KEY) || "[]"));
+  } catch {
+    return new Set();
+  }
 }
 
-/* ── Main dashboard ─────────────────────────────────────────────────────── */
+function saveIngestedKeys(keys) {
+  localStorage.setItem(INGESTED_KEY, JSON.stringify([...keys]));
+}
+
+function loadSelectedAds() {
+  try {
+    return JSON.parse(localStorage.getItem(PAIRS_KEY) || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function saveSelectedAds(ads) {
+  localStorage.setItem(PAIRS_KEY, JSON.stringify(ads));
+}
+
 export default function DashboardPage() {
-  const [metaOpen, setMetaOpen] = useState(true);
-  const [googleOpen, setGoogleOpen] = useState(true);
-
-  // Seed ad IDs surfaced by child components after ingest
-  // Persisted to localStorage so they survive page refresh
-  const [metaSeedAdId, setMetaSeedAdId] = useState(
-    () => localStorage.getItem("meta_last_seed_ad_id") || null
+  const [metaCampaigns, setMetaCampaigns] = useState([]);
+  const [googleCampaigns, setGoogleCampaigns] = useState([]);
+  const [metaLoading, setMetaLoading] = useState(true);
+  const [googleLoading, setGoogleLoading] = useState(true);
+  const [metaError, setMetaError] = useState(null);
+  const [googleError, setGoogleError] = useState(null);
+  const [metaLastSynced, setMetaLastSynced] = useState(
+    () => localStorage.getItem(META_LAST_SYNCED_KEY)
   );
-  const [googleSeedAdId, setGoogleSeedAdId] = useState(
-    () => localStorage.getItem("google_last_seed_ad_id") || null
-  );
+  const [metaPushNote, setMetaPushNote] = useState(null);
+  const [googleSyncNote, setGoogleSyncNote] = useState(null);
 
-  // Cross-platform BO state
-  const [crossBoState, setCrossBoState] = useState(null); // null | { status, data?, error? }
+  // "platform:campaignId" — only one open at a time
+  const [expandedKey, setExpandedKey] = useState(null);
+  // structureByKey: { "platform:id": AdStructure[] }
+  const [structureByKey, setStructureByKey] = useState({});
+  const [ingestingKey, setIngestingKey] = useState(null);
+  const [ingestedKeys, setIngestedKeys] = useState(loadIngestedKeys);
 
-  function handleMetaIngest(seedAdId) {
-    localStorage.setItem("meta_last_seed_ad_id", seedAdId);
-    setMetaSeedAdId(seedAdId);
-  }
+  // Batch selection: [{ platform, seed_ad_id, label }]
+  const [selectedAds, setSelectedAds] = useState(loadSelectedAds);
+  const [topN, setTopN] = useState(4);
+  const [boState, setBoState] = useState(null);
 
-  function handleGoogleIngest(seedAdId) {
-    localStorage.setItem("google_last_seed_ad_id", seedAdId);
-    setGoogleSeedAdId(seedAdId);
-  }
+  // ── Load both platforms on mount ──────────────────────────────────────────
+  useEffect(() => {
+    getCampaigns()
+      .then(setMetaCampaigns)
+      .catch((err) => setMetaError(err.message))
+      .finally(() => setMetaLoading(false));
 
-  async function handleCrossPlatformBO() {
-    setCrossBoState({ status: "loading" });
+    getGoogleCampaigns()
+      .then(setGoogleCampaigns)
+      .catch((err) => setGoogleError(err.message))
+      .finally(() => setGoogleLoading(false));
+  }, []);
+
+  // ── Silently restore structure for previously-ingested campaigns ──────────
+  useEffect(() => {
+    if (metaCampaigns.length === 0 && googleCampaigns.length === 0) return;
+    for (const key of ingestedKeys) {
+      if (structureByKey[key] !== undefined) continue;
+      const colonIdx = key.indexOf(":");
+      const platform = key.slice(0, colonIdx);
+      const id = key.slice(colonIdx + 1);
+      const fetcher =
+        platform === "meta" ? getCampaignStructure : getGoogleStructure;
+      fetcher(id)
+        .then((ads) => {
+          if (ads?.length > 0) {
+            setStructureByKey((prev) => ({ ...prev, [key]: ads }));
+          }
+        })
+        .catch(() => {});
+    }
+  }, [metaCampaigns, googleCampaigns]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Sync handlers ──────────────────────────────────────────────────────────
+  async function handleMetaSync() {
+    setMetaLoading(true);
+    setMetaPushNote(null);
+    setMetaError(null);
     try {
-      const pairs = [
-        metaSeedAdId && { platform: "meta", seed_ad_id: metaSeedAdId, text_source_id: metaSeedAdId },
-        googleSeedAdId && { platform: "google", seed_ad_id: googleSeedAdId, text_source_id: googleSeedAdId },
-      ].filter(Boolean);
-
-      const result = await runCrossPlatformBO(pairs);
-      setCrossBoState({ status: "done", data: result });
+      let pushSummary = null;
+      try {
+        pushSummary = await pushGeneratedAds();
+      } catch {}
+      await runIngest();
+      const now = new Date().toLocaleString();
+      localStorage.setItem(META_LAST_SYNCED_KEY, now);
+      setMetaLastSynced(now);
+      const updated = await getCampaigns();
+      setMetaCampaigns(updated);
+      if (pushSummary?.pushed > 0) {
+        setMetaPushNote({
+          type: "success",
+          text: `Pushed ${pushSummary.pushed} ad${pushSummary.pushed !== 1 ? "s" : ""} to Meta`,
+        });
+      } else if (pushSummary?.failed > 0) {
+        setMetaPushNote({
+          type: "amber",
+          text: `${pushSummary.failed} ads ready to push — Meta app must be in Live mode`,
+        });
+      }
     } catch (err) {
-      setCrossBoState({ status: "error", error: err.message });
+      setMetaError(err.message);
+    } finally {
+      setMetaLoading(false);
     }
   }
 
-  const bothReady = !!(metaSeedAdId && googleSeedAdId);
+  async function handleGoogleSync() {
+    setGoogleLoading(true);
+    setGoogleSyncNote(null);
+    setGoogleError(null);
+    try {
+      const result = await pushGoogleAds();
+      if (result?.note) {
+        setGoogleSyncNote({ type: "amber", text: result.note });
+      } else if (result?.pushed > 0) {
+        setGoogleSyncNote({
+          type: "success",
+          text: `Pushed ${result.pushed} ad${result.pushed !== 1 ? "s" : ""} to Google Ads`,
+        });
+      }
+      const updated = await getGoogleCampaigns();
+      setGoogleCampaigns(updated);
+    } catch (err) {
+      setGoogleError(err.message);
+    } finally {
+      setGoogleLoading(false);
+    }
+  }
+
+  // ── Accordion: one row open at a time ─────────────────────────────────────
+  function handleToggle(compositeKey) {
+    setExpandedKey((prev) => (prev === compositeKey ? null : compositeKey));
+  }
+
+  // ── Ingest ─────────────────────────────────────────────────────────────────
+  async function handleIngest(campaignId, platform) {
+    const key = `${platform}:${campaignId}`;
+    setIngestingKey(key);
+    try {
+      if (platform === "meta") {
+        await ingestCampaignStructure(campaignId);
+        const ads = await getCampaignStructure(campaignId);
+        setStructureByKey((prev) => ({ ...prev, [key]: ads }));
+      } else {
+        await ingestGoogleStructure(campaignId);
+        const ads = await getGoogleStructure(campaignId);
+        setStructureByKey((prev) => ({ ...prev, [key]: ads }));
+      }
+      setIngestedKeys((prev) => {
+        const next = new Set(prev);
+        next.add(key);
+        saveIngestedKeys(next);
+        return next;
+      });
+    } catch (err) {
+      alert(`Ingest failed: ${err.message}`);
+    } finally {
+      setIngestingKey(null);
+    }
+  }
+
+  // ── Batch selection ────────────────────────────────────────────────────────
+  function handleToggleAd({ platform, seed_ad_id, label }) {
+    setSelectedAds((prev) => {
+      const already = prev.some(
+        (a) => a.platform === platform && a.seed_ad_id === seed_ad_id
+      );
+      const next = already
+        ? prev.filter(
+            (a) => !(a.platform === platform && a.seed_ad_id === seed_ad_id)
+          )
+        : [...prev, { platform, seed_ad_id, label }];
+      saveSelectedAds(next);
+      return next;
+    });
+  }
+
+  function handleRemoveAd(platform, seed_ad_id) {
+    setSelectedAds((prev) => {
+      const next = prev.filter(
+        (a) => !(a.platform === platform && a.seed_ad_id === seed_ad_id)
+      );
+      saveSelectedAds(next);
+      return next;
+    });
+  }
+
+  // ── Cross-platform BO ──────────────────────────────────────────────────────
+  async function handleRunBO() {
+    setBoState({ status: "loading" });
+    try {
+      const pairs = selectedAds.map(({ platform, seed_ad_id, text_source_id }) => ({
+        platform,
+        seed_ad_id,
+        text_source_id: text_source_id ?? seed_ad_id,
+      }));
+      const result = await runUnifiedCrossPlatformBO(pairs, topN);
+      setBoState({ status: "done", data: result });
+    } catch (err) {
+      setBoState({ status: "error", error: err.message });
+    }
+  }
+
+  // ── Derived state ──────────────────────────────────────────────────────────
+  const allCampaigns = [
+    ...metaCampaigns.map((c) => ({ ...c, platform: "meta" })),
+    ...googleCampaigns.map((c) => ({ ...c, platform: "google" })),
+  ];
+
+  // Set of "platform:seed_ad_id" for O(1) checkbox lookup in AdsPanel
+  const selectedAdIds = new Set(
+    selectedAds.map((a) => `${a.platform}:${a.seed_ad_id}`)
+  );
 
   return (
     <div className="dashboard-page">
@@ -124,120 +249,37 @@ export default function DashboardPage() {
         <h2 className="dashboard-title">Ad Ingestion Dashboard</h2>
       </div>
 
-      <div className="page-hint-banner">
-        <p style={{ margin: "0 0 0.4rem", fontWeight: 600, color: "#333" }}>How to use this page</p>
-        <ol style={{ margin: 0, paddingLeft: "1.4rem", lineHeight: 2, fontSize: "0.88rem" }}>
-          <li>
-            <strong>Sync</strong> — pulls your latest campaigns and metrics. Also pushes any
-            generated ads. Do this first on each platform.
-          </li>
-          <li>
-            <strong>Ingest</strong> a campaign — reads the individual ads inside it so Adstac.kr
-            can learn from them. The row expands automatically.
-          </li>
-          <li>
-            <strong>Get Recommendations</strong> (inside the row) — the AI suggests which ad
-            combinations to test next, for that specific campaign.
-          </li>
-          <li>
-            <strong>Cross-Platform Analysis</strong> (below) — once you've ingested at least one
-            campaign from each platform, run this to find the best opportunities across Meta
-            and Google together.
-          </li>
-        </ol>
-      </div>
+      <SyncBar
+        metaSyncing={metaLoading}
+        googleSyncing={googleLoading}
+        onMetaSync={handleMetaSync}
+        onGoogleSync={handleGoogleSync}
+        metaLastSynced={metaLastSynced}
+        metaError={metaError}
+        googleError={googleError}
+        metaPushNote={metaPushNote}
+        googleSyncNote={googleSyncNote}
+      />
 
-      {/* ── Cross-Platform Analysis ──────────────────────────────────────────── */}
-      <div className="cross-platform-section">
-        <div className="cross-platform-header">
-          <div className="cross-platform-title-row">
-            <h3 className="cross-platform-title">Cross-Platform Analysis</h3>
-            <div className="cross-platform-readiness">
-              <span className={`platform-readiness ${metaSeedAdId ? "readiness-ready" : "readiness-pending"}`}>
-                {metaSeedAdId ? "✓ Meta" : "○ Meta"}
-              </span>
-              <span className={`platform-readiness ${googleSeedAdId ? "readiness-ready" : "readiness-pending"}`}>
-                {googleSeedAdId ? "✓ Google" : "○ Google"}
-              </span>
-            </div>
-          </div>
-          <p className="cross-platform-desc">
-            Runs Bayesian Optimisation across both platforms using a shared scoring model — so a
-            Meta headline and a Google headline are ranked on the same scale. Returns the top
-            opportunities from either channel.{" "}
-            {!bothReady && (
-              <span className="cross-platform-hint">
-                Ingest at least one campaign from each platform to unlock this.
-              </span>
-            )}
-          </p>
-          <button
-            className="btn-primary"
-            onClick={handleCrossPlatformBO}
-            disabled={!bothReady || crossBoState?.status === "loading"}
-            title={
-              !bothReady
-                ? "Ingest a campaign on both Meta and Google first"
-                : "Run cross-platform Bayesian Optimisation"
-            }
-          >
-            {crossBoState?.status === "loading" ? "Analyzing…" : "Run Cross-Platform Analysis"}
-          </button>
-        </div>
+      <UnifiedCampaignsTable
+        campaigns={allCampaigns}
+        expandedKey={expandedKey}
+        onToggle={handleToggle}
+        structureByKey={structureByKey}
+        ingestingKey={ingestingKey}
+        onIngest={handleIngest}
+        selectedAdIds={selectedAdIds}
+        onToggleAd={handleToggleAd}
+      />
 
-        {crossBoState?.status === "error" && (
-          <p className="error" style={{ marginTop: "0.75rem" }}>{crossBoState.error}</p>
-        )}
-        {crossBoState?.status === "done" && (
-          <CrossPlatformResults data={crossBoState.data} />
-        )}
-      </div>
-
-      {/* ── Meta Ads ─────────────────────────────────────────────────────── */}
-      <div className="platform-section">
-        <button
-          className="platform-section-toggle"
-          onClick={() => setMetaOpen((o) => !o)}
-          aria-expanded={metaOpen}
-        >
-          <div className="platform-section-toggle-left">
-            <span className="platform-icon platform-icon-meta">f</span>
-            <span className="platform-section-title">Meta Ads</span>
-          </div>
-          <span className="platform-section-chevron">
-            {metaOpen ? "▲" : "▼"}
-          </span>
-        </button>
-
-        {metaOpen && (
-          <div className="platform-section-body">
-            <CampaignsPage onIngest={handleMetaIngest} />
-          </div>
-        )}
-      </div>
-
-      {/* ── Google Ads ───────────────────────────────────────────────────── */}
-      <div className="platform-section">
-        <button
-          className="platform-section-toggle"
-          onClick={() => setGoogleOpen((o) => !o)}
-          aria-expanded={googleOpen}
-        >
-          <div className="platform-section-toggle-left">
-            <span className="platform-icon platform-icon-google">G</span>
-            <span className="platform-section-title">Google Ads</span>
-          </div>
-          <span className="platform-section-chevron">
-            {googleOpen ? "▲" : "▼"}
-          </span>
-        </button>
-
-        {googleOpen && (
-          <div className="platform-section-body">
-            <GoogleCampaignsPage onIngest={handleGoogleIngest} />
-          </div>
-        )}
-      </div>
+      <BatchPanel
+        selectedAds={selectedAds}
+        onRemove={handleRemoveAd}
+        topN={topN}
+        onTopNChange={setTopN}
+        onRunBO={handleRunBO}
+        boState={boState}
+      />
     </div>
   );
 }

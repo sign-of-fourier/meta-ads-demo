@@ -1108,8 +1108,8 @@ body {
 }
 
 .bo-results {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
   gap: 0.75rem;
   margin-bottom: 1rem;
 }
@@ -1118,14 +1118,41 @@ body {
   background: #f8f9fa;
   border: 1px solid #dee2e6;
   border-radius: 8px;
-  padding: 0.75rem 1rem;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 8rem;
+}
+
+.bo-pick-clickable {
+  cursor: pointer;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+
+.bo-pick-clickable:hover {
+  border-color: #74c0fc;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.07);
+}
+
+.bo-pick-body {
+  padding: 0.65rem 0.9rem 0.4rem;
+  flex: 1;
+}
+
+.bo-pick-image-name {
+  margin: 0.15rem 0 0;
+  font-size: 0.72rem;
+  color: #868e96;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .bo-pick-header {
   display: flex;
   align-items: center;
   gap: 0.6rem;
-  margin-bottom: 0.5rem;
+  margin-bottom: 0.3rem;
 }
 
 .bo-pick-label {
@@ -1223,6 +1250,51 @@ body {
   font-weight: 700;
   color: #2f9e44;
   margin-bottom: 0.25rem;
+}
+
+/* ── Seed test data controls ─────────────────────────────────────────────── */
+.seed-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  background: #f8f9fa;
+  border: 1px dashed #adb5bd;
+  border-radius: 6px;
+  font-size: 0.8rem;
+}
+
+.seed-controls-label {
+  color: #868e96;
+  font-size: 0.78rem;
+}
+
+.seed-n-input {
+  width: 3.5rem;
+  padding: 0.15rem 0.3rem;
+  border: 1px solid #ced4da;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  text-align: center;
+}
+
+.seed-controls-unit {
+  color: #868e96;
+  font-size: 0.78rem;
+}
+
+.seed-success {
+  color: #2f9e44;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.seed-warning {
+  color: #e67700;
+  font-size: 0.78rem;
+  font-style: italic;
 }
 
 .upsell-note {
@@ -1693,6 +1765,20 @@ body {
   gap: 0.4rem;
 }
 
+.stat-ad-id {
+  font-size: 0.75rem;
+  color: #868e96;
+  background: #f1f3f5;
+  border-radius: 3px;
+  padding: 0.05rem 0.3rem;
+}
+
+.stat-random-note {
+  font-style: italic;
+  color: #e67700;
+  font-size: 0.8em;
+}
+
 /* Platform badges on cross-platform picks */
 .platform-badge {
   display: inline-block;
@@ -1713,6 +1799,102 @@ body {
   color: #1a7f37;
 }
 
+/* ── Batch controls ──────────────────────────────────────────────────────── */
+.cross-platform-batch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.25rem;
+}
+
+.batch-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: #f1f3f5;
+  border: 1px solid #dee2e6;
+  border-radius: 16px;
+  padding: 0.2rem 0.55rem 0.2rem 0.4rem;
+  font-size: 0.81rem;
+  color: #343a40;
+}
+
+.batch-chip-label {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-chip-remove {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: #868e96;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0;
+}
+
+.batch-chip-remove:hover {
+  color: #c92a2a;
+}
+
+.cross-platform-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.topn-label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: #495057;
+  font-weight: 500;
+}
+
+.topn-input {
+  width: 3.5rem;
+  padding: 0.25rem 0.4rem;
+  border: 1px solid #ced4da;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+.btn-batch {
+  padding: 0.3rem 0.65rem;
+  background: #fff3bf;
+  color: #e67700;
+  border: 1px solid #ffd43b;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+
+.btn-batch:hover {
+  background: #ffe066;
+}
+
+.btn-batch-active {
+  padding: 0.3rem 0.65rem;
+  background: #d3f9d8;
+  color: #2b8a3e;
+  border: 1px solid #8ce99a;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+
+.btn-batch-active:hover {
+  background: #b2f2bb;
+}
+
 /* ── Campaign history sub-heading ────────────────────────────────────────── */
 .campaign-history-section {
   margin-top: 1.25rem;
@@ -1727,4 +1909,255 @@ body {
   margin: 0 0 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+/* ── BOPickCard ──────────────────────────────────────────────────────────── */
+.bo-pick-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.85rem 0.5rem;
+  border-top: 1px solid #e9ecef;
+  background: #fff;
+}
+
+.btn-push-run {
+  font-size: 0.82rem;
+  padding: 0.3rem 0.75rem;
+}
+
+.push-status-badge {
+  font-size: 0.78rem;
+  padding: 0.2rem 0.55rem;
+  border-radius: 4px;
+  font-weight: 500;
+}
+.push-status-running {
+  background: #d3f9d8;
+  color: #2f9e44;
+}
+.push-status-testing {
+  background: #fff3bf;
+  color: #e67700;
+}
+.push-status-tested {
+  background: #d3f9d8;
+  color: #2f9e44;
+}
+
+.error-inline {
+  color: #e03131;
+  font-size: 0.8rem;
+}
+
+/* ── BOPickCard modals ───────────────────────────────────────────────────── */
+.modal-box {
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+  padding: 1.5rem;
+  width: 100%;
+  max-width: 540px;
+  max-height: 85vh;
+  overflow-y: auto;
+}
+
+.modal-hint {
+  font-size: 0.84rem;
+  color: #6c757d;
+  margin: 0 0 0.75rem;
+}
+
+.modal-preview-image {
+  width: 100%;
+  border-radius: 6px;
+  margin-bottom: 0.75rem;
+}
+
+.modal-slot-list { margin-bottom: 0.75rem; }
+.modal-slot-list-compact .slot-value-truncate {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.push-name-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #343a40;
+  margin-bottom: 0.75rem;
+}
+.push-name-input {
+  border: 1px solid #ced4da;
+  border-radius: 4px;
+  padding: 0.45rem 0.65rem;
+  font-size: 0.9rem;
+  width: 100%;
+}
+.push-name-input:focus {
+  outline: none;
+  border-color: #339af0;
+  box-shadow: 0 0 0 2px rgba(51,154,240,0.15);
+}
+
+/* ── Sync bar ────────────────────────────────────────────────────────────── */
+.sync-bar {
+  margin: 1rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.sync-bar-buttons {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.sync-bar-platform {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.sync-bar-error {
+  color: #f97373;
+  font-size: 0.88rem;
+}
+
+.sync-note {
+  font-size: 0.88rem;
+  padding: 0.3rem 0.6rem;
+  border-radius: 4px;
+}
+
+.sync-note-success { background: #d3f9d8; color: #2b8a3e; }
+.sync-note-amber   { background: #fff3cd; color: #7c5c00; }
+.sync-note-info    { background: #e7f5ff; color: #1c7ed6; }
+.sync-note-error   { background: #ffe3e3; color: #c92a2a; }
+
+/* ── Ads panel (inside expanded campaign row) ────────────────────────────── */
+.ads-panel-empty {
+  padding: 1rem 0;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.ads-panel-hint {
+  color: #868e96;
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.ads-panel-status {
+  padding: 0.75rem 0;
+  color: #868e96;
+  font-size: 0.9rem;
+}
+
+.ads-panel {
+  padding: 0.5rem 0;
+}
+
+.ads-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.ads-panel-count {
+  font-size: 0.85rem;
+  color: #495057;
+  font-weight: 600;
+}
+
+.ads-panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.ad-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: 5px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background 0.1s;
+}
+
+.ad-checkbox-row:hover:not(.ad-checkbox-row-disabled) {
+  background: #e7f5ff;
+}
+
+.ad-checkbox-row-selected {
+  background: #dbe4ff;
+  border-color: #4c6ef5;
+}
+
+.ad-checkbox-row-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ad-id-text {
+  font-family: monospace;
+  font-size: 0.85rem;
+  color: #343a40;
+}
+
+.ad-unsupported-note {
+  font-size: 0.78rem;
+  color: #868e96;
+  margin-left: auto;
+}
+
+/* ── Small button ────────────────────────────────────────────────────────── */
+.btn-small {
+  padding: 0.25rem 0.6rem;
+  background: #fff;
+  border: 1px solid #ced4da;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  cursor: pointer;
+  color: #495057;
+}
+
+.btn-small:hover {
+  background: #f1f3f5;
+}
+
+.btn-small:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ── Platform badge (extended) ───────────────────────────────────────────── */
+.platform-badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.platform-badge-meta   { background: #e7f5ff; color: #1864ab; }
+.platform-badge-google { background: #fff3e0; color: #e65100; }
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
 }

@@ -2,61 +2,72 @@
 #
 # Mimics the Meta Graph API for the endpoints called by meta_live.py.
 # All routes are handled by a single catch-all that dispatches on path parts.
-# Access tokens and account IDs are accepted but ignored — fixtures are returned
-# regardless of which real account is connected.
+# Access tokens and account IDs are accepted but ignored.
+#
+# Pushed ad state and evolving metrics live in state.py.
 
 import json
 import logging
-import uuid
-from pathlib import Path
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+import state
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-_FIXTURES = Path(__file__).parent.parent / "fixtures"
-
-
-def _load(name: str):
-    with open(_FIXTURES / name) as f:
-        return json.load(f)
 
 
 def _paging():
     return {"cursors": {"before": "fake_before", "after": "fake_after"}}
 
 
-def _fake_id(prefix: str = "fake") -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:12]}"
-
-
 # ---------------------------------------------------------------------------
-# Handlers — each returns a JSONResponse
+# Handlers
 # ---------------------------------------------------------------------------
 
 def _get_campaigns() -> JSONResponse:
-    campaigns = _load("meta_campaigns.json")
+    import json as _json
+    from pathlib import Path
+    campaigns = _json.loads((Path(__file__).parent.parent / "fixtures" / "meta_campaigns.json").read_text())
     return JSONResponse({"data": campaigns, "paging": _paging()})
 
 
 def _get_insights() -> JSONResponse:
-    insights = _load("meta_insights.json")
-    return JSONResponse({"data": insights, "paging": _paging()})
+    """Return live, slowly-evolving 7-day insights for each fixture campaign."""
+    from pathlib import Path
+    import json as _json
+    base_rows = _json.loads((Path(__file__).parent.parent / "fixtures" / "meta_insights.json").read_text())
+
+    data = []
+    for row in base_rows:
+        cid = row["campaign_id"]
+        m = state.campaign_metrics(cid, platform="meta")
+        data.append({
+            "campaign_id": cid,
+            "impressions": str(m["impressions"]),
+            "clicks": str(m["clicks"]),
+            "spend": str(m["spend"]),
+            "ctr": str(m["ctr"]),
+            "cpm": str(m["cpm"]),
+            "cpc": str(m["cpc"]),
+            "date_start": row.get("date_start", ""),
+            "date_stop": row.get("date_stop", ""),
+        })
+    return JSONResponse({"data": data, "paging": _paging()})
 
 
 def _get_adsets(request: Request) -> JSONResponse:
-    """Return adsets filtered by campaign.id from the `filtering` query param."""
-    all_adsets = _load("meta_adsets.json")  # dict keyed by campaign_id
+    from pathlib import Path
+    import json as _json
+    all_adsets = _json.loads((Path(__file__).parent.parent / "fixtures" / "meta_adsets.json").read_text())
 
     filtering_str = request.query_params.get("filtering", "")
     campaign_id = None
     if filtering_str:
         try:
-            filters = json.loads(filtering_str)
-            for f in filters:
+            for f in json.loads(filtering_str):
                 if f.get("field") == "campaign.id":
                     campaign_id = str(f.get("value", ""))
                     break
@@ -66,46 +77,55 @@ def _get_adsets(request: Request) -> JSONResponse:
     if campaign_id and campaign_id in all_adsets:
         data = all_adsets[campaign_id]
     else:
-        # No filter — return all adsets flat
         data = [adset for adsets in all_adsets.values() for adset in adsets]
 
     return JSONResponse({"data": data, "paging": _paging()})
 
 
 def _get_ads(request: Request) -> JSONResponse:
-    """Return ads filtered by campaign.id from the `filtering` query param."""
-    all_ads = _load("meta_ads.json")  # dict keyed by campaign_id
+    from pathlib import Path
+    import json as _json
+    all_fixture_ads = _json.loads((Path(__file__).parent.parent / "fixtures" / "meta_ads.json").read_text())
 
     filtering_str = request.query_params.get("filtering", "")
     campaign_id = None
     if filtering_str:
         try:
-            filters = json.loads(filtering_str)
-            for f in filters:
+            for f in json.loads(filtering_str):
                 if f.get("field") == "campaign.id":
                     campaign_id = str(f.get("value", ""))
                     break
         except (json.JSONDecodeError, TypeError):
             pass
 
-    if campaign_id and campaign_id in all_ads:
-        data = all_ads[campaign_id]
+    # Fixture ads
+    if campaign_id and campaign_id in all_fixture_ads:
+        data = list(all_fixture_ads[campaign_id])
+    elif campaign_id:
+        data = []
     else:
-        data = [ad for ads in all_ads.values() for ad in ads]
+        data = [ad for ads in all_fixture_ads.values() for ad in ads]
+
+    # Pushed ads from state — extract act_id from the request path
+    act_id = _extract_act_id(request)
+    if act_id:
+        pushed = state.get_meta_ads(act_id, campaign_id=campaign_id)
+        data = data + pushed
 
     return JSONResponse({"data": data, "paging": _paging()})
 
 
 def _get_adimages(request: Request) -> JSONResponse:
-    """Resolve image hashes to URLs. Returns placeholder URLs for any hash."""
+    from pathlib import Path
+    import json as _json
+    all_ads = _json.loads((Path(__file__).parent.parent / "fixtures" / "meta_ads.json").read_text())
+
     hashes_raw = request.query_params.get("hashes", "[]")
     try:
         hashes = json.loads(hashes_raw)
     except (json.JSONDecodeError, TypeError):
         hashes = []
 
-    # Also check fixture ads for pre-seeded hashes
-    all_ads = _load("meta_ads.json")
     hash_to_url: dict[str, str] = {}
     for ads in all_ads.values():
         for ad in ads:
@@ -124,47 +144,114 @@ def _get_adimages(request: Request) -> JSONResponse:
     return JSONResponse({"data": data, "paging": _paging()})
 
 
-def _post_adimages() -> JSONResponse:
-    """Fake image upload — returns a synthetic hash."""
-    fake_hash = _fake_id("imghash")
-    fake_name = "uploaded.png"
-    return JSONResponse({"images": {fake_name: {"hash": fake_hash, "url": ""}}})
+async def _post_adimages() -> JSONResponse:
+    from state import _fake_id  # not in state, use local
+    import uuid
+    fake_hash = f"imghash_{uuid.uuid4().hex[:12]}"
+    return JSONResponse({"images": {"uploaded.png": {"hash": fake_hash, "url": ""}}})
 
 
-def _post_adcreatives() -> JSONResponse:
-    """Fake creative creation — returns a synthetic ID."""
-    return JSONResponse({"id": _fake_id("creative")})
+async def _post_adcreatives(request: Request) -> JSONResponse:
+    """Store the creative and return a deterministic fake ID."""
+    try:
+        form = await request.form()
+        name = form.get("name", "unnamed creative")
+        oss_raw = form.get("object_story_spec", "{}")
+        creative_id = state.store_meta_creative(name, oss_raw)
+        logger.debug("Meta fake: stored creative %s (%s)", creative_id, name)
+    except Exception as exc:
+        logger.warning("Meta fake: adcreatives parse error: %s", exc)
+        import uuid
+        creative_id = f"fake_creative_{uuid.uuid4().hex[:10]}"
+    return JSONResponse({"id": creative_id})
 
 
-def _post_ads() -> JSONResponse:
-    """Fake ad creation — returns a synthetic ID."""
-    return JSONResponse({"id": _fake_id("ad")})
+async def _post_ads(request: Request) -> JSONResponse:
+    """Store the ad in state (linking to its creative) and return a fake ID."""
+    try:
+        form = await request.form()
+        name = form.get("name", "Unnamed pushed ad")
+        adset_id = form.get("adset_id", "unknown")
+        creative_raw = form.get("creative", "{}")
+        status = form.get("status", "PAUSED")
+        creative_obj = json.loads(creative_raw) if isinstance(creative_raw, str) else creative_raw
+        creative_id = creative_obj.get("creative_id", "")
+        act_id = _extract_act_id(request)
+        ad_id = state.store_meta_ad(act_id or "unknown", name, adset_id, creative_id, status)
+        logger.debug("Meta fake: stored ad %s (adset=%s creative=%s)", ad_id, adset_id, creative_id)
+    except Exception as exc:
+        logger.warning("Meta fake: ads parse error: %s", exc)
+        import uuid
+        ad_id = f"fake_ad_{uuid.uuid4().hex[:10]}"
+    return JSONResponse({"id": ad_id})
 
 
-def _entity_action(entity_id: str, request: Request) -> JSONResponse:
+def _get_entity_insights(entity_id: str) -> JSONResponse:
+    """GET /{ad_id}/insights — lifetime metrics for a pushed clone."""
+    m = state.pushed_meta_ad_metrics(entity_id)
+    if not m:
+        return JSONResponse({"data": [], "paging": _paging()})
+    return JSONResponse({
+        "data": [{
+            "impressions": str(m["impressions"]),
+            "clicks": str(m["clicks"]),
+            "spend": str(m["spend"]),
+            # Meta returns CTR as a percentage string (e.g. "4.5123")
+            "ctr": str(m["ctr"]),
+            "date_start": "2020-01-01",
+            "date_stop": "9999-12-31",
+        }],
+        "paging": _paging(),
+    })
+
+
+async def _entity_action(entity_id: str, request: Request) -> JSONResponse:
     """
-    Handles:
-      POST /{campaign_id}           → pause / resume (status in form body)
-      GET  /{ad_id}?fields=creative{...}  → fetch creative for push flow
+    GET  /{ad_id}?fields=creative{...}  — fetch creative for push / reingest
+    POST /{entity_id}                   — pause / resume / status update
     """
     method = request.method.upper()
+
     if method == "GET":
-        # Backend fetches creative details for a specific ad before push.
-        # Find the ad in fixtures and return it wrapped as Meta would.
-        all_ads = _load("meta_ads.json")
+        # Check fixture ads first
+        from pathlib import Path
+        import json as _json
+        all_ads = _json.loads((Path(__file__).parent.parent / "fixtures" / "meta_ads.json").read_text())
         for ads in all_ads.values():
             for ad in ads:
                 if str(ad.get("id")) == entity_id:
-                    creative = ad.get("creative", {})
-                    return JSONResponse({
-                        "id": entity_id,
-                        "creative": creative,
-                    })
-        # Not found — return minimal stub
+                    return JSONResponse({"id": entity_id, "creative": ad.get("creative", {})})
+
+        # Check pushed clones in state
+        pushed_ad = state.get_meta_ad_by_id(entity_id)
+        if pushed_ad:
+            return JSONResponse({"id": entity_id, "creative": pushed_ad.get("creative", {})})
+
         return JSONResponse({"id": entity_id, "creative": {}})
 
-    # POST → pause or resume
+    # POST — pause / resume / status update
+    try:
+        form = await request.form()
+        new_status = form.get("status")
+        if new_status:
+            updated = state.update_meta_ad_status(entity_id, new_status)
+            logger.debug("Meta fake: status update %s → %s (found=%s)", entity_id, new_status, updated)
+    except Exception as exc:
+        logger.warning("Meta fake: entity action parse error: %s", exc)
+
     return JSONResponse({"success": True})
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _extract_act_id(request: Request) -> str | None:
+    """Pull the act_XXXX identifier out of the request path."""
+    for part in request.url.path.split("/"):
+        if part.startswith("act_"):
+            return part
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +267,7 @@ async def meta_catch_all(path: str, request: Request) -> JSONResponse:
     Examples after stripping version segment:
       act_123456/campaigns         → GET campaigns
       act_123456/insights          → GET insights
-      act_123456/adsets            → GET adsets (with filtering param)
+      act_123456/adsets            → GET adsets
       act_123456/ads               → GET ads | POST create ad
       act_123456/adimages          → GET resolve hashes | POST upload image
       act_123456/adcreatives       → POST create creative
@@ -192,7 +279,7 @@ async def meta_catch_all(path: str, request: Request) -> JSONResponse:
     if not parts:
         return JSONResponse({"error": "not found"}, status_code=404)
 
-    # Strip version segment if present (e.g. "v19.0")
+    # Strip version segment (e.g. "v19.0")
     if parts[0].startswith("v") and "." in parts[0]:
         parts = parts[1:]
 
@@ -204,7 +291,6 @@ async def meta_catch_all(path: str, request: Request) -> JSONResponse:
 
     logger.debug("Meta fake: method=%s resource=%s endpoint=%s", method, resource_id, endpoint)
 
-    # Account-level endpoints (account IDs start with "act_")
     if resource_id.startswith("act_"):
         if endpoint == "campaigns":
             return _get_campaigns()
@@ -215,18 +301,20 @@ async def meta_catch_all(path: str, request: Request) -> JSONResponse:
         elif endpoint == "ads":
             if method == "GET":
                 return _get_ads(request)
-            else:  # POST
-                return _post_ads()
+            else:
+                return await _post_ads(request)
         elif endpoint == "adimages":
             if method == "GET":
                 return _get_adimages(request)
-            else:  # POST
-                return _post_adimages()
+            else:
+                return await _post_adimages()
         elif endpoint == "adcreatives":
-            return _post_adcreatives()
+            return await _post_adcreatives(request)
         else:
             logger.warning("Meta fake: unhandled account endpoint '%s'", endpoint)
             return JSONResponse({"error": f"unknown endpoint: {endpoint}"}, status_code=404)
 
-    # Entity-level: campaign_id or ad_id (pure numeric or fixture IDs)
-    return _entity_action(resource_id, request)
+    # Entity-level (ad_id or campaign_id)
+    if endpoint == "insights" and method == "GET":
+        return _get_entity_insights(resource_id)
+    return await _entity_action(resource_id, request)

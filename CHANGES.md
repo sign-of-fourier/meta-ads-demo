@@ -4,7 +4,152 @@ Changes are appended by date. Each entry covers one session or logical chunk of 
 
 ---
 
+## 2026-05-30 (ad_factory)
+
+### `ad_factory/` — standalone ad creation tool
+- New top-level module: `python -m ad_factory <config.json>` (or `python ad_factory/create_ad.py <config.json>`)
+- Config JSON specifies `concept`, `platform` (`meta`|`google`), optional `campaign_id`/`adset_id`, `final_url`, `status`, `generate_image`
+- `text_gen.py` — calls Azure OpenAI to generate Meta ad copy (headline/body/description/CTA) or Google RSA copy (8-15 headlines + 3-4 descriptions) from a plain-English concept
+- `image_gen.py` — deterministic picsum placeholder by default; `generate_image: true` calls deAPI FLUX img2img with a concept-based prompt
+- `fixtures.py` — reads/writes fake_ad_server fixture JSON files directly; creates campaigns/adsets/adgroups as needed; injected ads are immediately visible (fake server reads fixtures per-request)
+- Example configs in `ad_factory/examples/` for both platforms (existing campaign and new campaign variants)
+- No dependency on the backend FastAPI app or fake_ad_server — standalone, runnable from project root
+- `AD_FACTORY.md` documents the full design: config reference, env vars, text/image generation, fixture injection mechanics, how factory ads differ from pushed clones and generated ads, ingest behaviour, and limitations
+
+## 2026-05-30
+
+### BOPickCard UX fixes
+- Cards are now 2-per-row CSS grid; show image filename instead of thumbnail; click card to open preview modal (both modals use `createPortal` so they render at `document.body`, outside table/grid hierarchy)
+- Stats row in cross-platform results shows ad ID suffix and "(random — no scored variants yet)" when `scored_count=0`
+- Per-campaign BO result and Google BOPicksPanel both surface the same "no scored data" amber note
+
+### `scored_observations` refactor — decouple BO from generation pipeline
+- **New table `scored_observations`** (`bo_pipeline/storage.py`): single source of truth for BO training data; columns: `user_id`, `seed_ad_id`, `combination_key`, `combination`, `score`, `metric` (`synthetic`|`qwen`|`ctr`|`cvr`|`roas`), `source`, `text_vector`, `image_vector`
+- **`bo_pipeline/selector.py`**: `get_scored_combinations` rewritten to read from `scored_observations`; walks `METRIC_PREFERENCE = (ctr, cvr, roas, qwen, synthetic)` to pick the best available metric; accepts optional `target_metric` override; removes old `ad_generation_variants` join and `variant_embedding_ad_id`
+- **`bo_pipeline/pipeline.py`** + **`cross_platform.py`**: `run_bo`, `run_cross_platform_bo`, `run_unified_cross_platform_bo` all accept `target_metric: str | None`
+- **`ad_generation/pipeline.py`**: `_write_qwen_observation()` fires after Qwen2-VL scoring and writes `metric='qwen'` to `scored_observations`
+- **`main.py`**: `init_db()` creates `scored_observations`; `_write_convergence_observation()` helper writes `metric='ctr'` when a pushed clone converges (called from both `_check_meta_convergence` and `_check_google_convergence`); `BORunRequest` gains `target_metric` field; seed endpoint rewrites directly to `scored_observations` (no generation jobs)
+- **`seed_bo_synthetic.py`**: rewritten to write directly to `scored_observations`; removes `ad_generation_jobs/variants` inserts
+- **Tests** (`test_bo_pipeline.py`, `test_google_bo.py`, `test_cross_platform_bo.py`): DDL and seeding updated to use `scored_observations` directly; all 239 tests pass
+
+---
+
+## 2026-05-29
+
+### Unified dashboard — phase 1
+- **`frontend/src/pages/DashboardPage.jsx`**: rewritten as a clean orchestrator; owns all shared state (campaigns, expanded key, structure, batch selection, BO)
+- **`frontend/src/components/SyncBar.jsx`**: two independent sync buttons (Meta + Google) with per-platform loading/error/push notes
+- **`frontend/src/components/UnifiedCampaignsTable.jsx`**: single table merging Meta and Google campaigns; Platform column; each row keyed by `platform:id`
+- **`frontend/src/components/CampaignRow.jsx`**: one expandable campaign row; accordion (only one open at a time); delegates expanded content to AdsPanel
+- **`frontend/src/components/AdsPanel.jsx`**: shows Ingest button before first ingest, then list of ads with checkboxes; pMax/Shopping/Unknown ads disabled for BO
+- **`frontend/src/components/BatchPanel.jsx`**: selected-ad chips + top-N input + Run Cross-Platform Analysis button + results display (moved from DashboardPage)
+- **`frontend/src/app.css`**: new classes for sync bar, ads panel, ad checkbox rows, btn-small, platform badges
+
+### Bug fix: `META_GRAPH` now respects `FAKE_META_BASE_URL`
+- `backend/main.py`: `META_GRAPH` reads `FAKE_META_BASE_URL` env var when set; covers all Meta API calls including push and convergence insight fetches (previously only the provider layer used the fake URL)
+
+### Convergence: full end-to-end implementation
+**Backend**
+- `init_db()`: three new columns on `pushed_ad_combos` — `platform_ad_numeric_id TEXT`, `current_impressions INTEGER DEFAULT 0`, `days_running INTEGER DEFAULT 0`; ALTER TABLE migrations for existing DBs
+- New constants: `MIN_CONVERGENCE_IMPRESSIONS` (default 500), `MIN_CONVERGENCE_DAYS` (default 3), both env-configurable
+- `_check_meta_convergence(user_id, campaign_id, access_token)`: async helper; fetches lifetime impressions via `GET /{platform_ad_id}/insights` for each active unconverged pushed Meta clone; updates `current_impressions`/`days_running`; flips `converged=1` and locks in CTR when both thresholds met
+- `_check_google_convergence(user_id, campaign_id, access_token, customer_id, login_customer_id)`: same for Google; GAQL `SELECT metrics.impressions, metrics.ctr FROM ad_group_ad WHERE campaign.id = X`
+- Both helpers fire fire-and-forget via `asyncio.create_task` at the end of their respective ingest routes
+- `BOPick` model: new field `current_impressions: int = 0`
+- `_enrich_pick`: reads `current_impressions` from `pushed_ad_combos`
+
+**Google clone detection fix**
+- `push_pick` route: stores `platform_ad_numeric_id` — last path segment of resource name for Google (e.g. `customers/123/adGroupAds/456` → `456`), same as `platform_ad_id` for Meta
+- `POST /api/google/ingest/structure/{campaign_id}`: clone detection now matches `ad_id` against `platform_ad_numeric_id` instead of the full resource name string; `is_pushed_clone = 1` now works for Google
+
+**Fake ad server**
+- `state.py`: new `pushed_google_ad_metrics(resource_name)` — ramp metrics for pushed Google RSA clones
+- `routes/meta.py`: `GET /{ad_id}/insights` (entity-level insights) now returns ramp metrics for pushed Meta clones
+- `routes/google.py`: GAQL `FROM ad_group_ad` with `metrics.*` in SELECT returns per-ad ramp metrics for pushed clones; fixture ads return zero metrics
+
+**Frontend**
+- `components/BOPickCard.jsx`: two new lifecycle states — **Testing… N impr.** (amber, active below convergence) and **Running ✓ — Tested** (green, converged); `current_impressions` and `converged` read from server pick data
+- `app.css`: `.push-status-testing` (amber) and `.push-status-tested` (green) badge styles
+
+### Single shared PCA for unified cross-platform BO
+- `bo_pipeline/cross_platform.py`: `BOGroup.build_X_unified()` added — always returns 3072-dim using `combine(text_vec, image_vec_or_None)` for all platforms
+- `run_unified_cross_platform_bo`: replaced per-group PCA + padding with a single shared PCA fit on the pooled 3072-dim union of all groups' scored and candidate vectors; EI scores are now in one comparable latent space
+
+### Documentation
+- `WORKFLOW.md`: created; end-to-end recommendation workflow, lifecycle state table, design gaps (A–E)
+- `PUSH_STRATEGY.md`: deleted (content migrated to WORKFLOW.md and CLAUDE.md)
+- `CLAUDE.md`: updated `init_db`, new helpers, ingest routes, `BOPick`, `_enrich_pick`, `BOPickCard`, BO pipeline (unified PCA), env vars, fake server, "What's not implemented yet", open design decisions, known technical notes
+- `backend/bo_pipeline/README.md`: updated `cross_platform.py` module description
+
+---
+
 ## 2026-05-28
+
+### Stage 2: push tracking, naming, deduplication, lifecycle
+
+**Backend**
+- `init_db()`: new `pushed_ad_combos` table; `is_pushed_clone` column on `ad_creative_structures`
+- `bo_pipeline/pipeline.py`: `run_bo` accepts `additional_exclude_keys` — pushed combinations are excluded from the candidate space
+- `BOPick` model: new lifecycle fields `ad_name`, `already_pushed`, `push_status`, `converged`, `platform_ad_id`
+- `_enrich_pick`: queries `pushed_ad_combos` and annotates each pick with its lifecycle state
+- `POST /api/push/pick`: new unified per-pick push endpoint for Meta and Google; creates PAUSED ad on the platform, records in `pushed_ad_combos`
+- `POST /api/activate`: enables a PAUSED pushed clone on the platform; updates `push_status`
+- `_clone_dynamic_to_static_ad` / `_create_google_rsa_ad` / `google_ads_api.create_rsa`: accept optional `ad_name` parameter
+- Meta ingest (`POST /api/ingest/structure/{campaign_id}`): detects pushed clones by matching `platform_ad_id`, sets `is_pushed_clone = 1`
+- Helper `_get_pushed_exclude_keys`: fetches pushed keys for a seed ad; called by both BO run endpoints
+
+**Frontend**
+- `components/BOPickCard.jsx`: new shared component — name-first pick display, Preview modal (full content on click), Push and Run modal with name prompt, per-pick lifecycle action (Push / Activate / Testing / Running ✓)
+- `pages/CampaignsPage.jsx`: replaces inline pick rendering with `BOPickCard`; optimistic state update after push
+- `pages/GoogleCampaignsPage.jsx`: `BOPicksPanel` now delegates to `BOPickCard`; passes `campaignName`, `seedAdId`, `onPushed`
+- `api.js`: `pushPick()` and `activatePick()` functions added
+- `app.css`: styles for BOPickCard, Preview modal, Push modal, push-status badges
+
+### Stage 1: fake ad server — persistent state + evolving metrics
+- `fake_ad_server/state.py`: in-memory store for pushed Meta ads/creatives and Google RSAs; deterministic evolving metrics per entity_id × hour-bucket; ramp metrics for pushed clones
+- `fake_ad_server/routes/meta.py`: POST /ads and /adcreatives store in state; GET /ads merges fixture + state ads; GET insights returns live metrics; entity GET/POST check and update state
+- `fake_ad_server/routes/google.py`: mutate stores pushed RSAs; searchStream FROM ad_group_ad merges fixture + state; FROM campaign returns live metrics
+
+### WORKFLOW.md: end-to-end recommendation workflow document
+- Canonical terminology table (candidate space, scored observations, limbo, pushed clone, convergence)
+- Step-by-step user journey: connect → ingest → generate → BO → Push and Run → Activate → convergence → cross-platform
+- Lifecycle state table and implementation status table
+- Design gaps: Gap A (orphan/edited pushed clone), Gap B (deletion), Gap C (multi-user), Gap D (Google RSA noise), Gap E (GP target metric consistency)
+
+### BO cross-platform: PCA dimension mismatch fix
+- `bo_pipeline/cross_platform.py`: pad each group's PCA array to K dims before vstacking; fixes `ValueError` when groups have different sample counts
+
+### BO pipeline: unified cross-platform BO + code quality fixes
+
+**`bo_pipeline/pipeline.py`**
+- `run_bo` return type extended from `(picks, warning)` to `(picks, warning, scored_count, candidate_count)` — eliminates double DB query in both single-platform endpoints
+- `_build_X` and `run_bo` now accept `platform` kwarg (default `"meta"`). Google path uses 1536-dim text-only vectors; Meta keeps 3072-dim `combine(text_vec, image_vec)`. Removes zero-padding waste on Modal path; removes kernel noise on local path.
+- `_run_local_bo` and `_run_modal_bo` both accept and thread through `platform`
+
+**`bo_pipeline/cross_platform.py`**
+- `run_cross_platform_bo` default `method` changed from `"local"` to `"modal"` — consistent with single-platform `run_bo` default
+- `run_cross_platform_bo` return type changed from `list[dict]` to `(picks, group_stats)` — eliminates double DB query in cross-platform endpoint; `group_stats` is a list of `{platform, seed_ad_id, scored_count, candidate_count}` dicts
+- New `run_unified_cross_platform_bo(pairs, user_id, db_path, top_n=4, method="modal")` — per-group PCA each to the same K-dim output (both use `MODAL_BO_PCA_DIMS`), pooled into a single GP/Modal call. Meta (3072-dim) and Google (1536-dim) are reduced separately to K-dim then stacked — natural clustering in kernel space means separate response surfaces with shared hyperparameters. Local path generalizes fantasy loop to `top_n` picks (was hardcoded 2). Modal path sends one `q=top_n` call over the full pooled matrix.
+
+**`main.py`**
+- Both single-platform BO endpoints (`/api/bo/run`, `/api/google/bo/run`) updated to unpack 4-tuple from `run_bo`; pre-fetch of scored/candidates removed
+- Google BO endpoint now passes `platform="google"` to `run_bo`
+- Cross-platform endpoint updated to unpack `(picks, group_stats)` from `run_cross_platform_bo`; pre-fetch removed
+- New endpoint `POST /api/bo/cross-platform/unified` — request body `{pairs: [...], top_n: int = 4}`; same response shape as `/api/bo/cross-platform`; calls `run_unified_cross_platform_bo`
+
+**Frontend**
+- `api.js`: new `runUnifiedCrossPlatformBO(pairs, topN)` calling `/api/bo/cross-platform/unified`; old `runCrossPlatformBO` kept
+- `DashboardPage.jsx`: `metaSeedAdId`/`googleSeedAdId` replaced with `selectedPairs` array `[{platform, seed_ad_id, text_source_id, label}]` persisted to localStorage; batch displayed as removable chips; `top_n` number input (1–8, default 4); button now calls `runUnifiedCrossPlatformBO`; readiness indicator shows count per platform
+- `CampaignsPage.jsx`: accepts `batchedAdIds` prop; auto-propagate `onIngest` calls removed; explicit "Add to Analysis" / "In Batch ✓" toggle button added in recommendations header; `onIngest` callback now passes `{platform, seed_ad_id, text_source_id, label}` object
+- `GoogleCampaignsPage.jsx`: same changes as CampaignsPage — `batchedAdIds` prop, auto-propagate removed, explicit toggle button
+- `app.css`: new styles for `.batch-chip`, `.batch-chip-remove`, `.btn-batch`, `.btn-batch-active`, `.cross-platform-batch`, `.cross-platform-controls`, `.topn-label`, `.topn-input`
+
+**Tests** — 255 passed, 7 skipped (baseline unchanged)
+- All `run_bo` call sites updated to unpack 4-tuple (`picks, *_ = run_bo(...)` for direct callers; `return_value=(picks, None, 0, 1)` for mocks)
+- All `run_cross_platform_bo` call sites updated to unpack 2-tuple
+- `test_google_pmax_shopping.py`, `test_google_login_customer_id.py`, `test_google_bo.py` mock patches updated
+
+---
 
 ### Dev tooling: start.sh fake-mode warning + DEV_QUICKSTART services overview
 

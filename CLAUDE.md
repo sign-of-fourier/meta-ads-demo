@@ -21,7 +21,9 @@ Then uncomment in `backend/.env`:
 FAKE_META_BASE_URL=http://localhost:9000/meta/v19.0
 FAKE_GOOGLE_BASE_URL=http://localhost:9000/google
 ```
-OAuth still goes to real Google/Meta. Only data API calls (campaigns, insights, structure, push) are intercepted. See `fake_ad_server/README.md` and `FAKE_AD_SERVER.md` for full details.
+OAuth still goes to real Google/Meta. Only data API calls (campaigns, insights, structure, push) are intercepted. When `FAKE_META_BASE_URL` is set, `META_GRAPH` in `main.py` uses the fake server base URL — this covers all Meta API calls including `_clone_dynamic_to_static_ad` and convergence insight fetches. See `fake_ad_server/README.md` and `FAKE_AD_SERVER.md` for full details.
+
+**Fake server convergence support:** Meta `GET /{ad_id}/insights?date_preset=lifetime` returns deterministic ramp metrics for pushed clones (from `state.pushed_meta_ad_metrics`). Google GAQL `FROM ad_group_ad` with `metrics.*` in the SELECT returns per-ad ramp metrics for pushed clones (from `state.pushed_google_ad_metrics`); fixture ads return zero metrics.
 
 ### Backend (FastAPI)
 ```bash
@@ -105,19 +107,23 @@ business logic live here. Key sections in reading order:
 
 | Section | What it does |
 |---|---|
-| `init_db()` | Creates all SQLite tables (including `ad_generation_*`, `ad_text_combination_embeddings`, `dynamic_generation_jobs`, `google_connections`, and `google_pending_connections` tables via helper calls); runs ALTER TABLE migrations for columns added after initial schema — including `tier TEXT NOT NULL DEFAULT 'free'` on `users`, `seed_ad_id`/`adset_id`/`meta_ad_id` on `dynamic_generation_jobs`, and `platform` on `ad_insights`/`ad_creative_structures` |
+| `init_db()` | Creates all SQLite tables (including `ad_generation_*`, `ad_text_combination_embeddings`, `dynamic_generation_jobs`, `google_connections`, `google_pending_connections`, and `scored_observations` tables via helper calls); runs ALTER TABLE migrations for columns added after initial schema — including `tier TEXT NOT NULL DEFAULT 'free'` on `users`, `seed_ad_id`/`adset_id`/`meta_ad_id` on `dynamic_generation_jobs`, `platform` on `ad_insights`/`ad_creative_structures`, `is_pushed_clone` on `ad_creative_structures`, and `platform_ad_numeric_id`/`current_impressions`/`days_running` on `pushed_ad_combos` |
 | `get_current_user_id()` | FastAPI dependency; decodes Bearer JWT |
 | `_meta_creds(user_id)` | Loads `(access_token, ad_account_id)` from `meta_connections` for authenticated user |
 | `_fetch_campaigns_and_insights()` | Shared async helper for campaigns + 7d insights from Meta; returns `(campaigns_raw, metrics_by_campaign, insights_error_count)` — callers use `insights_error_count` to distinguish API failure from genuine zero delivery |
 | `_fetch_campaign_structure()` | Fetches adsets + ads with expanded creative fields for one campaign; includes `effective_status` |
 | `_normalize_creative(ad)` | Pure function; detects dynamic (presence of `asset_feed_spec`) vs static; extracts slots |
 | `_clone_dynamic_to_static_ad()` | Creates a new static Meta ad from chosen components; used by confirm-create flow |
+| `_check_meta_convergence(user_id, campaign_id, access_token)` | Async helper fired fire-and-forget at end of Meta ingest; fetches lifetime impressions via `GET /{platform_ad_id}/insights` for each active unconverged pushed clone in the campaign; updates `current_impressions`, `days_running`; sets `converged=1` and locks in CTR when both thresholds are met; also calls `_write_convergence_observation()` to write `metric='ctr'` to `scored_observations` |
+| `_write_convergence_observation(db, user_id, seed_ad_id, combination_key, combination_json, score, metric)` | Helper called by both convergence checkers; looks up `text_vector` from `ad_text_combination_embeddings` and `image_vector` from `ad_image_embeddings`/`ad_embeddings`, then writes to `scored_observations` with `source='convergence'` |
+| `_check_google_convergence(user_id, campaign_id, access_token, customer_id, login_customer_id)` | Same as above for Google; GAQL query `SELECT ad_group_ad.resource_name, metrics.impressions, metrics.ctr FROM ad_group_ad WHERE campaign.id = X`; matches rows to pushed clones by resource name |
 | `_suggestion_from_row()` | Converts a DB row → `SuggestionResponse` Pydantic model |
 | `_download_ad_images(components)` | Downloads Meta CDN image URLs to `backend/ad_images/` synchronously during ingest (before expiry); returns components list with local URLs substituted. Required because Meta CDN URLs are signed and expire quickly — background tasks can't use them. |
 | `GET /me` | Returns current user's email and tier (`free`/`premium`) |
 | `_upload_image_to_meta()` | Resolves a locally-served image URL (`/images/...` or `/ad-images/...`) to a file on disk, uploads it to `/{ad_account_id}/adimages`, returns the image hash. Returns `None` on failure — push continues without image rather than aborting. |
 | `_clone_dynamic_to_static_ad()` | Creates a new static Meta ad from chosen component values. Accepts optional `image_hash`; uses `image_hash` in `link_data` when provided, falls back to `picture` URL otherwise. Fetches `object_story_spec` and `asset_feed_spec` from source ad to inherit `page_id` and destination link URL. |
 | `POST /api/push` | Finds all completed `dynamic_generation_jobs` for the user where `meta_ad_id IS NULL` and `seed_ad_id`/`adset_id` are set; uploads each ad's image to Meta, then calls `_clone_dynamic_to_static_ad` to create a PAUSED static ad; records `meta_ad_id` on success. Requires Meta app in Live mode — returns per-job errors gracefully if blocked. |
+| `POST /api/ingest/structure/{campaign_id}` (Meta) | After DB commit: runs Meta clone detection (matching `ad_id` against `pushed_ad_combos.platform_ad_id`), then fires `_check_meta_convergence` fire-and-forget, then fires embedding tasks |
 | `_google_creds(user_id)` | Reads `google_connections`, always refreshes via `google_ads_api.refresh_access_token`, raises 400 if not connected; returns `(access_token, customer_id, login_customer_id)` |
 | `GET /me/google-status` | Returns `{connected, customer_id, customer_name}` |
 | `GET /auth/google/login-url` | Generates Google OAuth consent URL; stores state in `oauth_states` with `provider='google'` |
@@ -125,12 +131,14 @@ business logic live here. Key sections in reading order:
 | `GET /auth/google/pending/{key}` | Returns `{accounts: [{customer_id, name}]}` for the pending connection; requires auth; validates `user_id` matches |
 | `POST /auth/google/select-account` | Body `{key, customer_id, login_customer_id?}`; strips dashes from IDs; accepts manual customer IDs not in the accounts list (for test accounts); saves to `google_connections`, deletes pending row |
 | `GET /api/google/campaigns` | Calls `_google_creds`, creates `httpx.AsyncClient`, delegates to `google_provider.fetch_campaigns_and_insights` (passing `login_customer_id`), returns `list[Campaign]` |
-| `POST /api/google/ingest/structure/{campaign_id}` | Calls `_google_creds`, runs two parallel GAQL queries (ad groups + ads) via `google_provider.fetch_campaign_structure`, writes to `ad_creative_structures` with `platform='google'`; same idempotent upsert and missing-ad detection as Meta route; fires `embed_ad` + `embed_all_combinations(slots=('headline','description'))` per ad fire-and-forget after commit |
+| `POST /api/google/ingest/structure/{campaign_id}` | Calls `_google_creds`, runs two parallel GAQL queries (ad groups + ads) via `google_provider.fetch_campaign_structure`, writes to `ad_creative_structures` with `platform='google'`; detects pushed clones by matching `ad_id` against `pushed_ad_combos.platform_ad_numeric_id`; fires `_check_google_convergence` and `embed_ad` + `embed_all_combinations(slots=('headline','description'))` per ad fire-and-forget after commit |
 | `GET /api/google/structure/{campaign_id}` | Returns persisted Google creative structures filtered by `platform='google'`; same `list[AdStructure]` shape as Meta route |
 | `POST /api/google/generate/text/{campaign_id}` | Generates 10 RSA headline + description variants from the first ingested Google ad (or `?seed_ad_id=`); calls `run_text_pipeline(platform='google')`; returns `GenerateTextResponse`; fires `embed_all_combinations(source_id=seed_ad_id, slots=('headline','description'), components=seed+generated)` fire-and-forget so variants become BO candidates immediately |
 | `POST /api/google/bo/run` | Body `{seed_ad_id, text_source_id}`; runs BO via the same `run_bo`/`save_bo_run` functions as the Meta route; returns `BORunResponse`; falls back to random when fewer than MIN_TRAINING_POINTS scored variants exist |
 | `GET /api/google/bo/results/{ad_id}` | Returns most recent BO picks for a Google ad via `get_latest_bo_run` |
 | `POST /api/google/push` | Finds all latest unpushed `bo_selections` (pick_rank=1, `google_ad_resource_name IS NULL`) for user's Google ads; for each, resolves `adset_id` + `final_url` from `ad_creative_structures` and generated text from `generated_ad_slots`; creates PAUSED RSA via `google_ads_api.create_rsa`; writes resource name to `bo_selections.google_ad_resource_name`; returns `GooglePushResponse` with per-ad results and optional `note` |
+| `POST /api/push/pick` | Unified per-pick push for both platforms; creates PAUSED ad, records in `pushed_ad_combos` with `platform_ad_id` (full resource name for Google) and `platform_ad_numeric_id` (last path segment for Google, same as `platform_ad_id` for Meta — used for clone detection during ingest) |
+| `_enrich_pick(p, seed_ad_id, user_id)` | Queries `pushed_ad_combos` for the combination key; annotates pick with `ad_name`, `already_pushed`, `push_status`, `converged`, `platform_ad_id`, `current_impressions` |
 
 Image serving: `main.py` mounts `StaticFiles` at `/images` → `backend/generated_images/` and at `/ad-images` → `backend/ad_images/`. The `/ad-images` mount serves downloaded copies of Meta CDN ad images used by the embedding pipeline.
 
@@ -203,16 +211,27 @@ Standalone sync module. Selects two candidate text+image combinations to test ne
 | `"modal"` (default) | PCA-reduces 3072-dim embeddings to `MODAL_BO_PCA_DIMS` dims (default 64), sends the actual discrete candidate PCA vectors to the Modal GP service (stateless q-EI endpoint), receives back candidate indices — no snap-to-pool | `MODAL_BO_API_URL` is set |
 | `"local"` | Fits a local sklearn GPR, picks highest EI (pick 1), re-fits with a fantasy observation to pick a diverse second candidate | Always available; automatic fallback when Modal is unconfigured or fails |
 
-Public entry points: `run_bo(seed_ad_id, text_source_id, user_id, db_path, method="modal")` → list of up to 2 picks; `save_bo_run(...)`, `get_latest_bo_run(...)` for persistence.
+Public entry points: `run_bo(seed_ad_id, text_source_id, user_id, db_path, method="modal", platform="meta", target_metric=None)` → `(picks, warning, scored_count, candidate_count)` 4-tuple; `save_bo_run(...)`, `get_latest_bo_run(...)` for persistence. Google BO endpoint passes `platform="google"` so `_build_X` uses 1536-dim text-only instead of 3072-dim zero-padded combined.
 
 Key design: `selector.py` is the only file that knows the DB schema; `gpr.py` is pure numpy/sklearn (local path only); `modal_bo.py` contains PCA helpers and the Modal HTTP call; `pipeline.py` orchestrates both paths. Falls back to random selection when fewer than 2 scored observations exist.
 
-Scored combinations: `ad_generation_variants` (score IS NOT NULL, status != defunct) joined via `ad_embeddings` using convention `ad_id = gen_{job_id}_{variant_id}`.
+**Scored observations source: `scored_observations` table** — decoupled from the generation pipeline. Three writers:
+
+| Writer | `metric` value | `source` value |
+|---|---|---|
+| Qwen2-VL (`ad_generation/pipeline.py` after scoring) | `qwen` | `generation_pipeline` |
+| Convergence checker (`_check_meta/google_convergence`) | `ctr` | `convergence` |
+| Seed script / seed endpoint | `synthetic` | `seed_script` |
+
+`selector.py`'s `get_scored_combinations()` walks `METRIC_PREFERENCE = ("ctr", "cvr", "roas", "qwen", "synthetic")` and returns the first metric with ≥ 1 row. Optional `target_metric` overrides this. All three BO functions (`run_bo`, `run_cross_platform_bo`, `run_unified_cross_platform_bo`) accept `target_metric: str | None = None`.
+
 Candidate combinations: **N_text × N_images cross-product** — all rows in `ad_text_combination_embeddings` for `text_source_id`, each paired with every row in `ad_image_embeddings` for the seed ad. Falls back to the seed ad's single `image_vector` from `ad_embeddings` if no per-image embeddings exist. Each pick's `combination` dict includes `image_url` (the local `/ad-images/...` URL) for display. With 64 text combos and 4 image embeddings → 256 candidates.
 
-**HTTP endpoints (wired):** `POST /api/bo/run` / `GET /api/bo/results/{ad_id}` — Meta BO. `POST /api/google/bo/run` / `GET /api/google/bo/results/{ad_id}` — Google BO (identical implementation; same models and DB tables; `seed_ad_id` is the Google ad_id from ingest).
+**HTTP endpoints (wired):** `POST /api/bo/run` / `GET /api/bo/results/{ad_id}` — Meta BO. `POST /api/google/bo/run` / `GET /api/google/bo/results/{ad_id}` — Google BO. `POST /api/bo/cross-platform` — two-GPR cross-platform BO (original, kept). `POST /api/bo/cross-platform/unified` — unified single-GP cross-platform BO; request body `{pairs: [{platform, seed_ad_id, text_source_id}], top_n: int = 4}`; wired to the Dashboard "Run Cross-Platform Analysis" button. `POST /api/bo/seed-scored-variants` — seeds synthetic `scored_observations` rows directly from existing `ad_text_combination_embeddings`; body `{seed_ad_id, platform, n, text_source_id?}`; requires combination embeddings to already exist. `run_cross_platform_bo` returns `(picks, group_stats)` 2-tuple; `run_unified_cross_platform_bo` does the same. Both cross-platform functions build `group_stats` internally — endpoints no longer pre-fetch scorer/candidate counts.
 
-**Seeding scored observations for testing:** `backend/seed_bo_synthetic.py` inserts synthetic scored variants (random scores, no API keys needed) into `ad_generation_jobs`, `ad_generation_variants`, and `ad_embeddings`. Supports `--platform meta|google|cross`. Run with:
+**Unified cross-platform PCA:** `run_unified_cross_platform_bo` uses `BOGroup.build_X_unified()` for all groups — Google RSAs use `combine(text_vec, None)` → 3072-dim (image half zero-padded), same as Meta. One shared PCA is fit on the pooled 3072-dim union of all groups (scored + candidates) before the single GP call. This ensures EI scores are directly comparable across platforms. The per-platform `run_cross_platform_bo` still uses per-group PCA (separate GPRs per platform, not pooled).
+
+**Seeding scored observations for testing:** `backend/seed_bo_synthetic.py` writes synthetic scores directly to `scored_observations` (no API keys needed). Requires `ad_text_combination_embeddings` to already exist for the ad (run Ingest + wait ~10s, or run Generate Text). Supports `--platform meta|google|cross`. Run with:
 ```bash
 python seed_bo_synthetic.py --platform meta --ad-id <ad_id> --user-id <user_id> --n 5
 ```
@@ -221,24 +240,26 @@ python seed_bo_synthetic.py --platform meta --ad-id <ad_id> --user-id <user_id> 
 
 | File | Role |
 |---|---|
-| `api.js` | Single fetch wrapper; JWT stored in `localStorage`; all API calls go through here — includes `getMe()`, `runBO()`, `generateTextAds()`, `startDynamicGeneration()`, `getDynamicGenStatus()`, `getLocalAds()`, `deleteLocalAd(adId)`, `getGoogleStatus()`, `getGoogleLoginUrl()`, `getGoogleCampaigns()`, `ingestGoogleStructure(campaignId)`, `getGoogleStructure(campaignId)`, `getGooglePendingAccounts(key)`, `selectGoogleAccount(key, customerId, loginCustomerId)`, `generateGoogleTextAds(campaignId, seedAdId)`, `runGoogleBO(seedAdId, textSourceId)`, `getGoogleBOResults(adId)`, `pushGoogleAds()` |
+| `api.js` | Single fetch wrapper; JWT stored in `localStorage`; all API calls go through here — includes `getMe()`, `runBO()`, `generateTextAds()`, `startDynamicGeneration()`, `getDynamicGenStatus()`, `getLocalAds()`, `deleteLocalAd(adId)`, `getGoogleStatus()`, `getGoogleLoginUrl()`, `getGoogleCampaigns()`, `ingestGoogleStructure(campaignId)`, `getGoogleStructure(campaignId)`, `getGooglePendingAccounts(key)`, `selectGoogleAccount(key, customerId, loginCustomerId)`, `generateGoogleTextAds(campaignId, seedAdId)`, `runGoogleBO(seedAdId, textSourceId)`, `getGoogleBOResults(adId)`, `pushGoogleAds()`, `runCrossPlatformBO(pairs)` (original two-GPR, kept), `runUnifiedCrossPlatformBO(pairs, topN)` (unified single-GP, wired to Dashboard button), `seedScoredVariants(seedAdId, platform, n, textSourceId?)` |
 | `App.jsx` | Root layout with nav; React Router `<Outlet>`; fetches `GET /me` on load and exposes user via `UserContext`; shows tier badge in nav; nav links: Settings / Dashboard / Ad Library / Explorer |
 | `UserContext.js` | React context (`UserContext`) + `useUser()` hook; default tier `"free"` |
 | `pages/AuthPage.jsx` | Signup / login |
 | `pages/SettingsPage.jsx` | Connect banner ("authenticate here, then go to Dashboard"); Meta and Google OAuth connect sections; reads `?meta_connected`, `?google_error` redirect params; on `?google_pick=<key>` fetches pending accounts and shows an account picker (radio list + manual customer ID field + optional login customer ID field); on confirm calls `selectGoogleAccount` then refreshes status |
-| `pages/DashboardPage.jsx` | Unified ingestion dashboard at `/app/dashboard`; two collapsible platform sections (Meta Ads, Google Ads) with branded toggle headers; each section renders the respective platform page; single instruction banner at top |
-| `pages/CampaignsPage.jsx` | Meta campaigns — table, pause/resume, metric history, structure panel, suggestions panel; also rendered inside DashboardPage Meta section |
-| `pages/GoogleCampaignsPage.jsx` | Google campaigns table; also rendered inside DashboardPage Google section; **Sync button** calls `POST /api/google/push` then re-fetches; Ingest/Reingest per row; after ingest shows both **Get Recommendations** (fires `POST /api/google/bo/run` immediately, seed ad ID resolved from stored structure) and **Generate RSA Text** (fires `POST /api/google/generate/text`) side-by-side; `BOPicksPanel` shows up to 2 picks; `TextGenResults` shows headline + description variants |
+| `pages/DashboardPage.jsx` | Unified ingestion dashboard at `/app/dashboard`; two collapsible platform sections (Meta Ads, Google Ads); cross-platform section has `selectedPairs` batch state `[{platform, seed_ad_id, text_source_id, label}]` (persisted to localStorage), removable chips, `top_n` input (1–8, default 4), "Run Cross-Platform Analysis" button calling `runUnifiedCrossPlatformBO`; passes `onIngest={handleAddToBatch}` and `batchedAdIds` to each platform section |
+| `pages/CampaignsPage.jsx` | Meta campaigns — table, pause/resume, metric history, structure panel, suggestions panel; also rendered inside DashboardPage Meta section. Props: `onIngest(adInfo)` where `adInfo={platform,seed_ad_id,text_source_id,label}` (explicit toggle, not auto-called); `batchedAdIds: string[]`. "Add to Analysis"/"In Batch ✓" toggle button in recommendations header per ingested campaign. |
+| `pages/GoogleCampaignsPage.jsx` | Google campaigns table; also rendered inside DashboardPage Google section; **Sync button** calls `POST /api/google/push` then re-fetches; Ingest/Reingest per row; after ingest shows both **Get Recommendations** (fires `POST /api/google/bo/run` immediately, seed ad ID resolved from stored structure) and **Generate RSA Text** (fires `POST /api/google/generate/text`) side-by-side; `BOPicksPanel` shows up to 2 picks; `TextGenResults` shows headline + description variants. Same `onIngest`/`batchedAdIds` props as CampaignsPage; "Add to Analysis" toggle in action buttons. |
 | `pages/AdsPage.jsx` | Local ad library — reads `GET /api/ads/local`; card grid with source/status badges; click a card to open a detail modal showing image grid + all text slot variants; delete button with confirm dialog calls `DELETE /api/ads/local/{ad_id}` |
 | `pages/ExplorerPage.jsx` | Raw Meta API explorer (debug) |
+| `components/BOPickCard.jsx` | Shared pick card for Meta and Google; 2-per-row CSS grid in `.bo-results`; click anywhere on the card (except the action footer) to open Preview modal; both Preview and Push modals use `createPortal` → `document.body` to avoid table/grid stacking-context issues; shows image filename if `image_url` present; lifecycle action button states: **Push and Run** → **Activate** → **Running ✓** (active, zero impressions) → **Testing… N impr.** (active, below convergence, amber) → **Running ✓ — Tested** (converged, green). `current_impressions` and `converged` come from the server via `_enrich_pick`; updated on every ingest. |
 
 The Campaigns page drives panels per campaign row:
 - **Header controls** — "Sync" button: pushes unpushed generated ads (`POST /api/push`) then pulls latest campaigns (`POST /api/ingest`); shows last-synced timestamp (stored in `localStorage`); amber note if push is blocked by Meta dev-mode
 - **Ingest/Reingest button** — per-campaign; label is "Ingest" on first use, "Reingest" thereafter (tracked in `localStorage` as `ingestedIds`); both trigger `POST /api/ingest/structure/<id>`
-- **History panel** — stored metric snapshots; when campaign is ingested, shows three action buttons:
-  - **Get Recommendations** — triggers BO; shows picks with image preview
+- **History panel** — stored metric snapshots; when campaign is ingested, shows four action buttons:
+  - **Get Recommendations** — triggers BO; shows picks with image preview; shows amber note when `scored_count=0` ("no scored data yet, picks are random")
   - **Static Text Ads** — triggers `POST /api/generate/text/{campaign_id}`; synchronous; shows generated text variants per slot (headline, primary_text, description, cta)
   - **Dynamic Ad (AI Images)** — triggers `POST /api/generate/dynamic/{campaign_id}`; async; polls every 5s; shows 4-image grid + 4 text variants per slot when complete
+  - **Seed test data** — compact row with `n` input (1–50) and Seed button; calls `POST /api/bo/seed-scored-variants`; requires combination embeddings to exist first
 - **Structure panel** — ingested creative structure (slots + lifecycle badges)
 - **Suggestions panel** (inside structure panel) — pending/confirmed suggestions with Confirm Create button
 
@@ -341,6 +362,8 @@ Used by: `ad_generation/` pipeline (generate + poll steps)
 |---|---|
 | `MODAL_BO_API_URL` | Full URL of the Modal GP q-EI endpoint. Leave blank to fall back to local sklearn GPR. |
 | `MODAL_BO_PCA_DIMS` | PCA components to reduce 3072-dim embeddings to before the API call (default `64`). Lower = faster; higher = more fidelity. |
+| `MIN_CONVERGENCE_IMPRESSIONS` | Minimum lifetime impressions before a pushed clone is considered converged (default `500`). |
+| `MIN_CONVERGENCE_DAYS` | Minimum days running before a pushed clone is considered converged (default `3`). |
 
 Used by: `bo_pipeline/modal_bo.py` → `call_modal_api()`. When unset, `run_bo()` silently uses the local `"local"` (GPR + fantasy) path.
 
@@ -402,7 +425,7 @@ These are flagged for discussion before implementation — do not implement unti
 
 | Decision | Options | Notes |
 |---|---|---|
-| **Cross-platform BO** | Implemented as Option A — per-platform GPR with shared ECDF normalisation. | `POST /api/bo/cross-platform` accepts multiple `(platform, seed_ad_id, text_source_id)` pairs; fits one ECDF on the combined score pool; runs per-platform PCA+GPR; returns globally-ranked picks tagged with platform. `cross_platform.py` + `ecdf.py`. |
+| **Cross-platform BO** | Two implementations coexist. Original (`POST /api/bo/cross-platform`): per-platform PCA+GPR with shared ECDF, separate GP calls, global EI rank. Unified (`POST /api/bo/cross-platform/unified`, wired to UI): **single shared PCA** fit on pooled 3072-dim vectors from all groups (Google zero-pads image half via `build_X_unified`), then single GP/Modal call, `top_n` parameter (default 4). UI supports arbitrary batch of ads across platforms and campaigns via `selectedPairs` chip list + explicit "Add to Analysis" toggles. |
 | **Ad Library — Google ads** | Show Google-ingested/generated ads in the same library with a "Google" source badge, or keep a separate Google Library page. | Currently `GET /api/ads/local` returns Meta-sourced ads only. `SOURCE_LABELS` in `AdsPage.jsx` has no `google` entry. Backend and frontend both need additions when decided. |
 
 ---
@@ -417,14 +440,17 @@ These are flagged for discussion before implementation — do not implement unti
 - Push to Meta is implemented (`POST /api/push`) but requires the Meta app to be in **Live mode** (not Development); until then, generated ads show a "ready to push" amber note after Sync
 - Auto-activation of new static ads (always created PAUSED, user activates manually in Meta)
 - User tier enforcement beyond UI display — no backend guard on premium-only routes yet
-- Google Ads: cross-platform BO is implemented (`POST /api/bo/cross-platform`); cross-platform UI unification (unified ad library, combined push flow) not yet implemented
+- Google Ads: cross-platform UI unification (unified ad library, combined push flow) not yet implemented
 - Google `normalize_creative` stores marketing image asset resource names (e.g. `customers/123/assets/456`) and video asset resource names rather than resolved URLs — URL resolution requires a separate asset query; `youtube_thumbnail_url` utility exists but is not yet wired into the ingest embedding hook for this reason
 - Google structural ingest fires `embed_ad` (text-only; `image_vec=None` zero-pads combiner) and `embed_all_combinations(slots=('headline','description'))` but not `embed_images` — no URL images available from ingest yet
+- **Score existing images at ingest time** — currently only AI-generated image variants (from the generation pipeline) receive Qwen2-VL scores. Native ads with existing images get zero scored observations until the user runs the generation pipeline. Fix: fire a Qwen2-VL scoring task fire-and-forget during ingest for each ad's existing images.
+- **UI selector for target_metric (CTR / CVR / ROAS)** — `BORunRequest.target_metric` and `run_bo(..., target_metric=)` are wired end-to-end; UI dropdown to let users choose the optimisation target is not yet built. Currently the selector auto-picks the best available metric via `METRIC_PREFERENCE`.
+- **Mid-test edit detection (orphan ad handling)** — convergence checking runs at ingest; edit detection (comparing ingested creative fields against `pushed_ad_combos.combination`) is not yet wired. See Gap A in `WORKFLOW.md`.
 - pMax and Shopping campaigns are ingested as stubs: pMax → `creative_type='pmax'` with headline/description/image/video slots from asset groups; Shopping → `creative_type='shopping'` with `final_url` slot only. Both types are blocked from text generation and BO with a 400 (shopping/unknown are unsupported; pMax proceeds since it has headline/description slots)
 - `creative_type` values for Google: `rsa`, `display`, `video`, `pmax`, `shopping`, `unknown`
 
 ## Known technical notes
 
-- `combined_vector` stored in `ad_embeddings` is the **raw concatenation** of text (1536-dim) + image (1536-dim) = 3072-dim float32 blob. `_build_X()` now uses the full 3072-dim vectors (no truncation) via `ad_embedding_combiner` (`TEXT_DIM=1536`, `IMAGE_DIM=1536`); PCA in `_run_modal_bo` / `_run_local_bo` reduces to the working dimension at inference time. The stored blob is not used directly by the BO; it is informational only.
+- `combined_vector` stored in `ad_embeddings` is the **raw concatenation** of text (1536-dim) + image (1536-dim) = 3072-dim float32 blob. `_build_X(combinations, platform)` is platform-aware: `platform="google"` returns 1536-dim text-only (no zero-padding); `platform="meta"` (default) returns 3072-dim via `combine(text_vec, image_vec)`. PCA in `_run_modal_bo` / `_run_local_bo` reduces to the working dimension at inference time. `BOGroup.build_X_unified()` always returns 3072-dim for all platforms (Google gets `combine(text_vec, None)` → zero-padded image half) — used only by `run_unified_cross_platform_bo` for the shared PCA step.
 - The `embed_ad` fallback path uses image_vector slot from `ad_embeddings` (the seed ad's combined_vector image slot), not from `ad_image_embeddings`. Per-image BO uses `ad_image_embeddings` directly in `selector.get_candidate_combinations`.
 - Google RSA ads produce `image_vector = NULL` in `ad_embeddings` (no image URL available from GAQL). The BO combiner zero-pads the image half of the combined vector when `image_vec=None`. RSA BO therefore optimises over text combinations only, with a constant zero image component — this is intentional for RSA ads.

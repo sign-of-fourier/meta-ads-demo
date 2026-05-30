@@ -129,6 +129,18 @@ class BOGroup:
             [combine(obs["text_vector"], obs["image_vector"]) for obs in observations]
         ).astype(np.float32)
 
+    def build_X_unified(self, observations: list[dict]) -> np.ndarray:
+        """
+        Build a 3072-dim feature matrix for all platforms.
+
+        Google RSA ads have no image embedding; image half is zero-padded via
+        combine(text_vec, None).  This produces the same output dimension as
+        Meta so all groups can be pooled into a single shared PCA.
+        """
+        return np.vstack(
+            [combine(obs["text_vector"], obs.get("image_vector")) for obs in observations]
+        ).astype(np.float32)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
@@ -366,8 +378,9 @@ def run_cross_platform_bo(
     xi: float = 0.01,
     higher_is_better: bool = True,
     top_n: int = 2,
-    method: str = "local",
-) -> list[dict]:
+    method: str = "modal",
+    target_metric: str | None = None,
+) -> tuple[list[dict], list[dict]]:
     """
     Run cross-platform BO across all (platform, seed_ad_id, text_source_id) pairs.
 
@@ -409,12 +422,13 @@ def run_cross_platform_bo(
 
     # ── 1. Load scored observations and candidates for each group ─────────────
     groups: list[BOGroup] = []
+    group_stats: list[dict] = []
     for p in pairs:
         platform = p["platform"]
         seed_ad_id = p["seed_ad_id"]
         text_source_id = p["text_source_id"]
 
-        scored = get_scored_combinations(seed_ad_id, text_source_id, user_id, db_path)
+        scored = get_scored_combinations(seed_ad_id, text_source_id, user_id, db_path, target_metric=target_metric)
         scored_keys = {s["combination_key"] for s in scored}
         candidates = get_candidate_combinations(
             text_source_id, seed_ad_id, user_id,
@@ -430,6 +444,12 @@ def run_cross_platform_bo(
             candidates=candidates,
         )
         groups.append(g)
+        group_stats.append({
+            "platform": platform,
+            "seed_ad_id": seed_ad_id,
+            "scored_count": len(scored),
+            "candidate_count": len(candidates),
+        })
         logger.info(
             "cross_platform_bo[%s]: seed=%s scored=%d candidates=%d pca_dims=%d",
             platform, seed_ad_id, len(scored), len(candidates), g.pca_dims,
@@ -470,7 +490,7 @@ def run_cross_platform_bo(
             all_picks.extend(_run_group_bo(g, ecdf_transform, xi=xi, sign=sign))
 
     if not all_picks:
-        return []
+        return [], group_stats
 
     # ── 4. Global ranking: sort by EI descending, return top_n ───────────────
     all_picks.sort(key=lambda p: p["_sort_key"], reverse=True)
@@ -480,4 +500,208 @@ def run_cross_platform_bo(
     for pick in result:
         pick.pop("_sort_key", None)
 
-    return result
+    return result, group_stats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unified cross-platform BO — single PCA space, single GP call
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_unified_cross_platform_bo(
+    pairs: list[dict],
+    user_id: int,
+    db_path: Path = DB_PATH,
+    xi: float = 0.01,
+    higher_is_better: bool = True,
+    top_n: int = 4,
+    method: str = "modal",
+    target_metric: str | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Unified cross-platform BO: per-group PCA each to the same output dimension
+    (MODAL_BO_PCA_DIMS for all platforms), then pool all projected vectors into
+    a single GP/Modal call.  Returns globally-ranked top_n picks.
+
+    Key differences from run_cross_platform_bo:
+      - Both Meta (3072-dim raw) and Google (1536-dim raw) are PCA'd to the
+        same K-dim output so they can be pooled into one matrix.
+      - A single GP is fit on the pooled scored observations; a single EI pass
+        ranks all candidates (Meta + Google) together.
+      - For the local path, the fantasy loop generalises to top_n picks
+        (one EI pick + top_n-1 sequential fantasy steps).
+      - For the Modal path, one q=top_n call is made on the pooled matrices.
+
+    The two platforms will naturally cluster in different sub-regions of the
+    K-dim space (Meta's PCA captures text+image variance; Google's captures
+    text-only variance), so the GP learns separate response surfaces per
+    platform while sharing kernel hyperparameters — a practical win when
+    scored observations are few on either side.
+    """
+    from bo_pipeline.modal_bo import fit_pca, modal_bo_enabled, _api_url, pca_dims_for_platform
+
+    sign = 1.0 if higher_is_better else -1.0
+    # All groups PCA to the same dimension for pooling.
+    K = pca_dims_for_platform("meta")  # MODAL_BO_PCA_DIMS (default 64)
+
+    # ── 1. Load data and build group_stats ────────────────────────────────────
+    groups: list[BOGroup] = []
+    group_stats: list[dict] = []
+    for p in pairs:
+        platform   = p["platform"]
+        seed_ad_id = p["seed_ad_id"]
+        text_source_id = p["text_source_id"]
+
+        scored = get_scored_combinations(seed_ad_id, text_source_id, user_id, db_path, target_metric=target_metric)
+        scored_keys = {s["combination_key"] for s in scored}
+        candidates = get_candidate_combinations(
+            text_source_id, seed_ad_id, user_id,
+            exclude_keys=scored_keys,
+            db_path=db_path,
+        )
+        groups.append(BOGroup(
+            platform=platform,
+            seed_ad_id=seed_ad_id,
+            text_source_id=text_source_id,
+            scored=scored,
+            candidates=candidates,
+        ))
+        group_stats.append({
+            "platform": platform,
+            "seed_ad_id": seed_ad_id,
+            "scored_count": len(scored),
+            "candidate_count": len(candidates),
+        })
+        logger.info(
+            "unified_cross_platform_bo[%s]: seed=%s scored=%d candidates=%d",
+            platform, seed_ad_id, len(scored), len(candidates),
+        )
+
+    # ── 2. Fit shared ECDF on the combined score pool ─────────────────────────
+    all_raw_scores = [s["score"] * sign for g in groups for s in g.scored]
+    ecdf_transform = fit_ecdf(all_raw_scores) if all_raw_scores else None
+
+    # ── 3. Build 3072-dim raw vectors for all groups, then fit ONE shared PCA ──
+    # Google ads use combine(text_vec, None) → 3072-dim (image half zero-padded).
+    # Meta ads use combine(text_vec, image_vec) → 3072-dim.
+    # A single PCA over the pooled union captures variance across both platforms;
+    # EI scores from the resulting GP are in one comparable latent space.
+    scored_raw_rows: list[np.ndarray] = []   # 3072-dim scored obs, all groups
+    cands_raw_rows: list[np.ndarray]  = []   # 3072-dim candidates, all groups
+    scored_meta: list[dict]           = []   # flattened scored dicts (for y)
+    cands_meta: list[dict]            = []   # flattened candidate dicts (for picks)
+
+    # Track per-group candidate offsets so we can map GP indices → platform.
+    group_cand_offsets: list[tuple[int, int, BOGroup]] = []
+    offset = 0
+
+    for g in groups:
+        if not g.candidates:
+            group_cand_offsets.append((offset, offset, g))
+            continue
+
+        X_scored_raw = g.build_X_unified(g.scored).astype(np.float32) if g.scored else None
+        X_cands_raw  = g.build_X_unified(g.candidates).astype(np.float32)
+
+        if X_scored_raw is not None:
+            scored_raw_rows.append(X_scored_raw)
+            scored_meta.extend(g.scored)
+
+        cands_raw_rows.append(X_cands_raw)
+        cands_meta.extend(g.candidates)
+        group_cand_offsets.append((offset, offset + len(g.candidates), g))
+        offset += len(g.candidates)
+
+    if not cands_meta:
+        return [], group_stats
+
+    # ── 4. Handle no scored data — random fallback for all ───────────────────
+    if ecdf_transform is None or not scored_meta:
+        logger.info("unified_cross_platform_bo: no scored data — random fallback")
+        rng = np.random.default_rng()
+        chosen = rng.choice(len(cands_meta), size=min(top_n, len(cands_meta)), replace=False)
+        picks = []
+        for idx in chosen:
+            g = next(g for start, end, g in group_cand_offsets if start <= idx < end)
+            local_idx = idx - next(start for start, end, grp in group_cand_offsets if grp is g)
+            picks.append(_make_pick(g.candidates[local_idx], _FALLBACK_TYPE, g.platform, g.seed_ad_id, g.text_source_id, _sort_key=_RANDOM_SORT_KEY))
+        for p in picks:
+            p.pop("_sort_key", None)
+        return picks, group_stats
+
+    # Fit ONE shared PCA on the union of all scored + candidate raw vectors.
+    # This ensures the GP operates in a single latent space where Meta and Google
+    # embeddings (both 3072-dim) are jointly projected and directly comparable.
+    X_all_raw = np.vstack(scored_raw_rows + cands_raw_rows).astype(np.float32)
+    n_scored_total = sum(r.shape[0] for r in scored_raw_rows)
+    n_components = min(K, X_all_raw.shape[0], X_all_raw.shape[1])
+    _, X_all_pca = fit_pca(X_all_raw, n_components=n_components)
+
+    X_scored_pool = X_all_pca[:n_scored_total].astype(np.float64)
+    X_cands_pool_raw = X_all_pca[n_scored_total:].astype(np.float64)
+
+    # Pad to K if the shared PCA produced fewer components than K (small datasets).
+    def _pad_to_K(arr: np.ndarray) -> np.ndarray:
+        if arr.shape[1] == K:
+            return arr
+        pad = np.zeros((arr.shape[0], K - arr.shape[1]), dtype=arr.dtype)
+        return np.hstack([arr, pad])
+
+    X_scored_pool = _pad_to_K(X_scored_pool)
+    X_cands_pool  = _pad_to_K(X_cands_pool_raw)
+
+    y_raw  = np.array([s["score"] * sign for s in scored_meta], dtype=np.float64)
+    y_pool = ecdf_transform(y_raw)
+    y_best = float(y_pool.max())
+
+    # ── 5. Single GP call ─────────────────────────────────────────────────────
+    use_modal = method == "modal" and modal_bo_enabled()
+    all_picks: list[dict] = []
+
+    if use_modal:
+        from bo_pipeline.modal_bo import call_modal_api
+        try:
+            suggestions = call_modal_api(
+                api_url=_api_url(),
+                X_train_pca=X_scored_pool.astype(np.float32),
+                y=y_pool.astype(np.float32),
+                X_cands_pca=X_cands_pool.astype(np.float32),
+                q=min(top_n, len(cands_meta)),
+                xi=xi,
+            )
+            seen: set[int] = set()
+            n_picks = len(suggestions)
+            for rank, suggestion in enumerate(suggestions):
+                idx = suggestion["index"]
+                if idx in seen:
+                    continue
+                seen.add(idx)
+                start, end, g = next((s, e, grp) for s, e, grp in group_cand_offsets if s <= idx < e)
+                all_picks.append(_make_pick(cands_meta[idx], _MODAL_TYPE, g.platform, g.seed_ad_id, g.text_source_id, _sort_key=float(n_picks - rank)))
+        except Exception as exc:
+            logger.warning("unified_cross_platform_bo: Modal failed (%s) — local GPR fallback", exc)
+            use_modal = False
+
+    if not use_modal:
+        gpr, scaler = fit_gpr(X_scored_pool, y_pool)
+        ei_scores = expected_improvement(gpr, scaler, X_cands_pool, y_best, xi=xi)
+        remaining = list(range(len(cands_meta)))
+
+        for pick_num in range(min(top_n, len(cands_meta))):
+            best_local = int(np.argmax(ei_scores[remaining]))
+            idx = remaining[best_local]
+            start, end, g = next((s, e, grp) for s, e, grp in group_cand_offsets if s <= idx < e)
+            mu, sigma = predict_with_std(gpr, scaler, X_cands_pool[[idx]])
+            ei_val = float(ei_scores[idx])
+            sel_type = _EI_TYPE if pick_num == 0 else _FANTASY_TYPE
+            all_picks.append(_make_pick(cands_meta[idx], sel_type, g.platform, g.seed_ad_id, g.text_source_id, ei_score=ei_val, gpr_mean=float(mu[0]), gpr_std=float(sigma[0]), _sort_key=ei_val))
+            remaining.pop(best_local)
+            if remaining and pick_num < top_n - 1:
+                gpr, scaler = fantasize(gpr, scaler, X_scored_pool, y_pool, X_cands_pool[[idx]])
+
+    # ── 6. Global rank and return ─────────────────────────────────────────────
+    all_picks.sort(key=lambda p: p["_sort_key"], reverse=True)
+    result = all_picks[:top_n]
+    for pick in result:
+        pick.pop("_sort_key", None)
+
+    return result, group_stats

@@ -196,9 +196,7 @@ def test_google_bo_run_returns_response_shape(client, user_token):
         }
     ]
 
-    with patch("bo_pipeline.pipeline.run_bo", return_value=(mock_picks, None)), \
-         patch("bo_pipeline.selector.get_scored_combinations", return_value=[]), \
-         patch("bo_pipeline.selector.get_candidate_combinations", return_value=[{"x": 1}]), \
+    with patch("bo_pipeline.pipeline.run_bo", return_value=(mock_picks, None, 0, 1)), \
          patch("bo_pipeline.storage.save_bo_run", return_value=[1]):
         resp = client.post(
             "/api/google/bo/run",
@@ -221,9 +219,7 @@ def test_google_bo_run_returns_response_shape(client, user_token):
 def test_google_bo_run_empty_picks_when_no_candidates(client, user_token):
     _, token = user_token
 
-    with patch("bo_pipeline.pipeline.run_bo", return_value=([], None)), \
-         patch("bo_pipeline.selector.get_scored_combinations", return_value=[]), \
-         patch("bo_pipeline.selector.get_candidate_combinations", return_value=[]), \
+    with patch("bo_pipeline.pipeline.run_bo", return_value=([], None, 0, 0)), \
          patch("bo_pipeline.storage.save_bo_run", return_value=[]):
         resp = client.post(
             "/api/google/bo/run",
@@ -326,32 +322,6 @@ CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, pw_hash TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS ad_generation_jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    campaign_id TEXT NOT NULL,
-    adset_id TEXT NOT NULL,
-    seed_ad_id TEXT,
-    seed_image_url TEXT NOT NULL,
-    headline TEXT NOT NULL,
-    short_text TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    suggestions TEXT, error TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS ad_generation_variants (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id INTEGER NOT NULL,
-    suggestion TEXT NOT NULL,
-    deapi_request_id TEXT,
-    status TEXT NOT NULL DEFAULT 'submitted',
-    result_url TEXT, local_filename TEXT,
-    score REAL, severity TEXT, score_labels TEXT,
-    qa_status TEXT, qa_corrections TEXT, parent_variant_id INTEGER,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
 CREATE TABLE IF NOT EXISTS ad_embeddings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -384,6 +354,20 @@ CREATE TABLE IF NOT EXISTS ad_image_embeddings (
     embedded_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (user_id, ad_id, slot_index)
 );
+CREATE TABLE IF NOT EXISTS scored_observations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL,
+    seed_ad_id      TEXT NOT NULL,
+    combination_key TEXT NOT NULL,
+    combination     TEXT NOT NULL,
+    score           REAL NOT NULL,
+    metric          TEXT NOT NULL DEFAULT 'synthetic',
+    source          TEXT NOT NULL DEFAULT 'seed_script',
+    text_vector     BLOB,
+    image_vector    BLOB,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, seed_ad_id, combination_key, metric)
+);
 """
 
 
@@ -392,10 +376,10 @@ def _g_rand_vec(dim: int = _G_EMBED_DIM) -> np.ndarray:
 
 
 def _seed_google_bo_db(db_path: Path) -> None:
-    from bo_pipeline.selector import variant_embedding_ad_id
     from ad_embedding_combiner import combine
 
     conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
     conn.executescript(_G_DDL)
 
     conn.execute(
@@ -425,38 +409,22 @@ def _seed_google_bo_db(db_path: Path) -> None:
             (_G_TEXT_SOURCE_ID, key, vec.tobytes(), "text-embedding-3-small"),
         )
 
-    # One generation job
-    cur = conn.execute(
-        """INSERT INTO ad_generation_jobs
-           (user_id, campaign_id, adset_id, seed_ad_id, seed_image_url,
-            headline, short_text, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (_G_USER_ID, "camp_google_bo_test", "adg_google_test", _G_SEED_AD_ID,
-         "http://example.com/google_seed.png",
-         "Buy Premium Socks", "Hand crafted in Switzerland.", "done"),
-    )
-    job_id = cur.lastrowid
-
-    # N_SCORED variants — image_vector=None (Google RSA has no image)
+    # Scored observations — write directly to scored_observations (Google: no image vector)
     for i in range(_G_N_SCORED):
-        cur2 = conn.execute(
-            """INSERT INTO ad_generation_variants
-               (job_id, suggestion, status, score)
-               VALUES (?, ?, 'scored', ?)""",
-            (job_id, f"google_suggestion_{i}", _G_SCORES[i]),
-        )
-        variant_id = cur2.lastrowid
-
-        emb_ad_id = variant_embedding_ad_id(job_id, variant_id)
-        v_txt = _g_rand_vec()
-        combined = combine(v_txt, None)   # zero-padded image half
-
+        combo = _G_TEXT_COMBOS[i]
+        key = json.dumps(combo, sort_keys=True, separators=(",", ":"))
+        tce_row = conn.execute(
+            "SELECT vector FROM ad_text_combination_embeddings WHERE source_id=? AND combination_key=?",
+            (_G_TEXT_SOURCE_ID, key),
+        ).fetchone()
+        txt_vec_bytes = tce_row["vector"] if tce_row else _g_rand_vec().tobytes()
         conn.execute(
-            """INSERT OR REPLACE INTO ad_embeddings
-               (user_id, ad_id, campaign_id, text_vector, image_vector, combined_vector)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (_G_USER_ID, emb_ad_id, "camp_google_bo_test",
-             v_txt.tobytes(), None, combined.tobytes()),
+            """INSERT OR REPLACE INTO scored_observations
+               (user_id, seed_ad_id, combination_key, combination,
+                score, metric, source, text_vector, image_vector)
+               VALUES (?, ?, ?, ?, ?, 'synthetic', 'seed_script', ?, ?)""",
+            (_G_USER_ID, _G_SEED_AD_ID, key, key,
+             _G_SCORES[i], txt_vec_bytes, None),
         )
 
     conn.commit()
@@ -484,7 +452,7 @@ class TestGoogleBOPipeline:
         from bo_pipeline import run_bo
         # BO_TEST_METHOD env var selects the path: "local" (default) or "modal".
         method = os.getenv("BO_TEST_METHOD", "local")
-        picks, _ = run_bo(
+        picks, *_ = run_bo(
             _G_SEED_AD_ID, _G_TEXT_SOURCE_ID,
             _G_USER_ID, db_path=google_bo_db, method=method,
         )
@@ -598,7 +566,7 @@ class TestGoogleBOPipeline:
         conn.close()
 
         method = os.getenv("BO_TEST_METHOD", "local")
-        picks, _ = run_bo(
+        picks, *_ = run_bo(
             _G_SEED_AD_ID, _G_TEXT_SOURCE_ID,
             _G_USER_ID, db_path=empty_db, method=method,
         )

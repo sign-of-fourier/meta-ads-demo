@@ -101,6 +101,7 @@ def get_embeddings_for_source(
       model            — str | None
       embedded_at      — str
     """
+    ensure_table(db_path)
     c = _conn(db_path)
     rows = c.execute(
         """SELECT combination_key, vector, model, embedded_at
@@ -124,6 +125,7 @@ def get_embeddings_for_source(
 
 
 def count_embeddings_for_source(source_id: str, db_path: Path = DB_PATH) -> int:
+    ensure_table(db_path)
     c = _conn(db_path)
     n = c.execute(
         "SELECT COUNT(*) FROM ad_text_combination_embeddings WHERE source_id = ?",
