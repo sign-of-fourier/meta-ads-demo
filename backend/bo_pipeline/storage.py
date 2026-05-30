@@ -30,6 +30,23 @@ CREATE TABLE IF NOT EXISTS bo_selections (
 )
 """
 
+_SCORED_OBS_CREATE = """
+CREATE TABLE IF NOT EXISTS scored_observations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL,
+    seed_ad_id      TEXT NOT NULL,
+    combination_key TEXT NOT NULL,
+    combination     TEXT NOT NULL,
+    score           REAL NOT NULL,
+    metric          TEXT NOT NULL DEFAULT 'synthetic',
+    source          TEXT NOT NULL DEFAULT 'seed_script',
+    text_vector     BLOB,
+    image_vector    BLOB,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, seed_ad_id, combination_key, metric)
+)
+"""
+
 
 def _conn(db_path: Path) -> sqlite3.Connection:
     c = sqlite3.connect(str(db_path))
@@ -41,6 +58,13 @@ def _conn(db_path: Path) -> sqlite3.Connection:
 def ensure_table(db_path: Path = DB_PATH) -> None:
     c = _conn(db_path)
     c.execute(_CREATE)
+    c.commit()
+    c.close()
+
+
+def ensure_scored_observations_table(db_path: Path = DB_PATH) -> None:
+    c = _conn(db_path)
+    c.execute(_SCORED_OBS_CREATE)
     c.commit()
     c.close()
 

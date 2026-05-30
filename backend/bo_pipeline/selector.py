@@ -1,32 +1,17 @@
 """
 DB access layer for the BO pipeline.
 
-This is the only file in bo_pipeline that knows which tables exist and how to
-join them.  All lower layers (gpr.py, pipeline.py) receive plain Python
-objects and numpy arrays.
+Scored observations are read from scored_observations, which is written by:
+  - seed_script (metric='synthetic') via seed_bo_synthetic.py or the seed endpoint
+  - generation_pipeline (metric='qwen') after Qwen2-VL scoring
+  - convergence (metric='ctr'|'cvr'|'roas') after a pushed clone converges
 
-Scored combinations
--------------------
-Source: ad_generation_variants WHERE score IS NOT NULL AND status != 'defunct'
-        joined to ad_generation_jobs (for seed_ad_id, headline, short_text).
-image_vector: ad_embeddings WHERE ad_id = variant_embedding_ad_id(job_id, variant_id)
-text_vector:  ad_text_combination_embeddings WHERE source_id = text_source_id
-              AND combination_key matches {"headline": job.headline, "primary_text": job.short_text}.
-              Falls back to ad_embeddings.text_vector for the seed ad if the
-              combination is not found in ad_text_combination_embeddings.
+get_scored_combinations walks METRIC_PREFERENCE and returns the first metric
+with at least one row, unless target_metric is explicitly given.
 
-Candidate combinations
-----------------------
-All rows in ad_text_combination_embeddings for text_source_id, each paired with
-the seed ad's image_vector (from ad_embeddings WHERE ad_id = seed_ad_id).
-Combinations already scored are excluded when exclude_keys is provided.
-
-Per-ad constraint
------------------
-Scored variants are filtered to jobs where seed_ad_id = seed_ad_id.
-Candidate text combinations are filtered to text_source_id.
-Both parameters must refer to the same ad — enforcement is the caller's
-responsibility.
+Candidate combinations are unchanged: all rows in ad_text_combination_embeddings
+for text_source_id, each paired with every image in ad_image_embeddings (or the
+seed ad's image_vector as fallback).
 """
 
 from __future__ import annotations
@@ -39,22 +24,9 @@ import numpy as np
 
 DB_PATH = Path(__file__).parent.parent / "app.db"
 
+# Metric resolution order: prefer real signals over synthetic ones.
+METRIC_PREFERENCE = ("ctr", "cvr", "roas", "qwen", "synthetic")
 
-# ---------------------------------------------------------------------------
-# Naming convention for generated-variant embeddings
-# ---------------------------------------------------------------------------
-
-def variant_embedding_ad_id(job_id: int, variant_id: int) -> str:
-    """
-    The ad_id used when storing a generated variant's embedding in ad_embeddings.
-    Whoever embeds generated variants must use this same convention.
-    """
-    return f"gen_{job_id}_{variant_id}"
-
-
-# ---------------------------------------------------------------------------
-# DB helpers
-# ---------------------------------------------------------------------------
 
 def _conn(db_path: Path) -> sqlite3.Connection:
     c = sqlite3.connect(str(db_path))
@@ -69,119 +41,56 @@ def _vec(blob: bytes | None) -> np.ndarray | None:
     return np.frombuffer(blob, dtype=np.float32)
 
 
-# ---------------------------------------------------------------------------
-# Scored combinations
-# ---------------------------------------------------------------------------
-
 def get_scored_combinations(
     seed_ad_id: str,
-    text_source_id: str,
+    text_source_id: str,   # kept for API compatibility; not used for filtering
     user_id: int,
     db_path: Path = DB_PATH,
+    target_metric: str | None = None,
 ) -> list[dict]:
     """
-    Return scored variants for seed_ad_id with their text + image vectors.
+    Return scored observations for seed_ad_id from scored_observations.
 
-    Each dict:
-      variant_id       — int
-      job_id           — int
-      combination_key  — str  (JSON key used in ad_text_combination_embeddings)
-      combination      — dict (parsed combination_key)
+    Walks METRIC_PREFERENCE and returns the first metric with >= 1 row,
+    unless target_metric is given (in which case only that metric is used).
+
+    Each returned dict:
+      combination_key  — str
+      combination      — dict (parsed from JSON)
       score            — float
       text_vector      — np.ndarray float32
-      image_vector     — np.ndarray float32
-
-    Variants with no image embedding in ad_embeddings are silently skipped.
+      image_vector     — np.ndarray float32 | None
     """
+    from bo_pipeline.storage import ensure_scored_observations_table
+    ensure_scored_observations_table(db_path)
+
     c = _conn(db_path)
-
-    # All scored, non-defunct variants for this seed ad
-    variants = c.execute(
-        """
-        SELECT v.id, v.job_id, v.score
-        FROM ad_generation_variants v
-        JOIN ad_generation_jobs j ON v.job_id = j.id
-        WHERE j.seed_ad_id = ?
-          AND v.score IS NOT NULL
-          AND COALESCE(v.status, '') != 'defunct'
-        ORDER BY v.id
-        """,
-        (seed_ad_id,),
-    ).fetchall()
-
-    if not variants:
-        c.close()
+    try:
+        metrics_to_try = (target_metric,) if target_metric else METRIC_PREFERENCE
+        for metric in metrics_to_try:
+            rows = c.execute(
+                """SELECT combination_key, combination, score, text_vector, image_vector
+                   FROM scored_observations
+                   WHERE user_id = ? AND seed_ad_id = ? AND metric = ?
+                   ORDER BY id""",
+                (user_id, seed_ad_id, metric),
+            ).fetchall()
+            if rows:
+                return [
+                    {
+                        "combination_key": r["combination_key"],
+                        "combination": json.loads(r["combination"]),
+                        "score": float(r["score"]),
+                        "text_vector": _vec(r["text_vector"]),
+                        "image_vector": _vec(r["image_vector"]),
+                    }
+                    for r in rows
+                    if r["text_vector"] is not None
+                ]
         return []
+    finally:
+        c.close()
 
-    # Seed ad text_vector (fallback)
-    seed_row = c.execute(
-        "SELECT text_vector FROM ad_embeddings WHERE ad_id = ? AND user_id = ?",
-        (seed_ad_id, user_id),
-    ).fetchone()
-    seed_text_vec = _vec(seed_row["text_vector"]) if seed_row else None
-
-    results = []
-    for v in variants:
-        variant_id = v["id"]
-        job_id = v["job_id"]
-
-        # Image vector
-        emb_ad_id = variant_embedding_ad_id(job_id, variant_id)
-        emb_row = c.execute(
-            "SELECT image_vector FROM ad_embeddings WHERE ad_id = ? AND user_id = ?",
-            (emb_ad_id, user_id),
-        ).fetchone()
-        image_vec = _vec(emb_row["image_vector"]) if emb_row else None
-        # None image_vec is allowed — combiner will zero-pad that slot
-
-        # Text vector — prefer exact combination match in ad_text_combination_embeddings
-        job_row = c.execute(
-            "SELECT headline, short_text FROM ad_generation_jobs WHERE id = ?",
-            (job_id,),
-        ).fetchone()
-        text_vec = None
-        combo_key = None
-        combo = None
-        if job_row:
-            combo = {"headline": job_row["headline"], "primary_text": job_row["short_text"]}
-            combo_key = json.dumps(combo, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-            tce_row = c.execute(
-                """SELECT vector FROM ad_text_combination_embeddings
-                   WHERE source_id = ? AND combination_key = ?""",
-                (text_source_id, combo_key),
-            ).fetchone()
-            if tce_row:
-                text_vec = _vec(tce_row["vector"])
-
-        # Fallback: seed ad text_vector
-        if text_vec is None:
-            text_vec = seed_text_vec
-
-        if text_vec is None:
-            continue
-
-        if combo_key is None:
-            combo_key = json.dumps({"variant_id": variant_id}, sort_keys=True, separators=(",", ":"))
-        if combo is None:
-            combo = {}
-
-        results.append({
-            "variant_id": variant_id,
-            "job_id": job_id,
-            "combination_key": combo_key,
-            "combination": combo,
-            "score": float(v["score"]),
-            "text_vector": text_vec,
-            "image_vector": image_vec,
-        })
-
-    c.close()
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Candidate combinations
-# ---------------------------------------------------------------------------
 
 def get_candidate_combinations(
     text_source_id: str,
@@ -202,11 +111,10 @@ def get_candidate_combinations(
       combination_key  — str  (compound JSON of text combo + image_slot)
       combination      — dict (text fields + image_url for display)
       text_vector      — np.ndarray float32
-      image_vector     — np.ndarray float32
+      image_vector     — np.ndarray float32 | None
     """
     c = _conn(db_path)
 
-    # Per-image embeddings for seed ad (one row per image slot)
     image_rows = c.execute(
         """SELECT slot_index, image_ref, vector
            FROM ad_image_embeddings
@@ -221,14 +129,12 @@ def get_candidate_combinations(
             for r in image_rows
         ]
     else:
-        # Fall back to single image_vector from ad_embeddings
         seed_row = c.execute(
             "SELECT image_vector FROM ad_embeddings WHERE ad_id = ? AND user_id = ?",
             (seed_ad_id, user_id),
         ).fetchone()
         image_slots = [{"slot_index": 0, "image_ref": None, "image_vec": _vec(seed_row["image_vector"]) if seed_row else None}]
 
-    # All text combinations for this source
     text_rows = c.execute(
         """SELECT combination_key, vector
            FROM ad_text_combination_embeddings

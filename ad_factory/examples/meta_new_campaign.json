@@ -1,0 +1,10 @@
+{
+  "concept": "AI-powered yoga mat that tracks posture and breathing via embedded sensors",
+  "platform": "meta",
+  "campaign_name": "SmartYoga — Launch Campaign",
+  "adset_name": "Fitness Enthusiasts",
+  "final_url": "https://smart-yoga.example.com",
+  "status": "PAUSED",
+  "generate_image": false,
+  "fake_server_dir": "fake_ad_server"
+}

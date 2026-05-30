@@ -7,7 +7,7 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 
 _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-_GOOGLE_ADS_BASE = "https://googleads.googleapis.com"
+_GOOGLE_ADS_BASE = os.getenv("FAKE_GOOGLE_BASE_URL", "https://googleads.googleapis.com")
 
 
 async def refresh_access_token(refresh_token: str) -> str:
@@ -90,6 +90,7 @@ async def create_rsa(
     descriptions: list[str],
     final_url: str,
     login_customer_id: str | None = None,
+    ad_name: str | None = None,
 ) -> str:
     """Create a new PAUSED Responsive Search Ad via the Mutate API.
 
@@ -120,6 +121,7 @@ async def create_rsa(
                 "adGroupAdOperation": {
                     "create": {
                         "ad": {
+                            **({"name": ad_name} if ad_name else {}),
                             "responsiveSearchAd": {
                                 "headlines": headline_assets,
                                 "descriptions": description_assets,

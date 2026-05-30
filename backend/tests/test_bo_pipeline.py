@@ -14,6 +14,7 @@ No ad creation — all variants/jobs/embeddings are inserted directly.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -51,38 +52,6 @@ CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, pw_hash TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS ad_generation_jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    campaign_id TEXT NOT NULL,
-    adset_id TEXT NOT NULL,
-    seed_ad_id TEXT,
-    seed_image_url TEXT NOT NULL,
-    headline TEXT NOT NULL,
-    short_text TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    suggestions TEXT,
-    error TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS ad_generation_variants (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id INTEGER NOT NULL,
-    suggestion TEXT NOT NULL,
-    deapi_request_id TEXT,
-    status TEXT NOT NULL DEFAULT 'submitted',
-    result_url TEXT,
-    local_filename TEXT,
-    score REAL,
-    severity TEXT,
-    score_labels TEXT,
-    qa_status TEXT,
-    qa_corrections TEXT,
-    parent_variant_id INTEGER,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
 CREATE TABLE IF NOT EXISTS ad_embeddings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -115,6 +84,20 @@ CREATE TABLE IF NOT EXISTS ad_image_embeddings (
     embedded_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (user_id, ad_id, slot_index)
 );
+CREATE TABLE IF NOT EXISTS scored_observations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL,
+    seed_ad_id      TEXT NOT NULL,
+    combination_key TEXT NOT NULL,
+    combination     TEXT NOT NULL,
+    score           REAL NOT NULL,
+    metric          TEXT NOT NULL DEFAULT 'synthetic',
+    source          TEXT NOT NULL DEFAULT 'seed_script',
+    text_vector     BLOB,
+    image_vector    BLOB,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, seed_ad_id, combination_key, metric)
+);
 """
 
 # Text combinations for the test: 8 combinations (headlines × primary_texts)
@@ -137,6 +120,7 @@ _SCORED_SCORES = [3.5, 4.2, 2.8, 5.1, 4.7]  # one per scored variant
 
 def _seed_db(db_path: Path) -> None:
     conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
     conn.executescript(_DDL)
 
     # User
@@ -168,62 +152,25 @@ def _seed_db(db_path: Path) -> None:
             (TEXT_SOURCE_ID, key, vec.tobytes(), "embed-v-4-0"),
         )
 
-    # One generation job
-    cur = conn.execute(
-        """INSERT INTO ad_generation_jobs
-           (user_id, campaign_id, adset_id, seed_ad_id, seed_image_url, headline, short_text, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (TEST_USER_ID, "camp_bo_test", "adset_bo_test", SEED_AD_ID,
-         "http://example.com/seed.png", "Wool Socks", "Hand made in Switzerland.", "done"),
-    )
-    job_id = cur.lastrowid
-
-    # N_SCORED variants with scores — each matched to one of the first N_SCORED text combos
+    # Scored observations — write directly to scored_observations
     for i in range(N_SCORED):
-        cur2 = conn.execute(
-            """INSERT INTO ad_generation_variants
-               (job_id, suggestion, status, result_url, local_filename, score)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (job_id, f"suggestion_{i}", "scored",
-             f"http://deapi.example.com/result_{i}.png",
-             f"variant_{i}.png", _SCORED_SCORES[i]),
-        )
-        variant_id = cur2.lastrowid
-
-        # Image embedding for this variant (stored with variant_embedding_ad_id convention)
-        from bo_pipeline.selector import variant_embedding_ad_id
-        emb_ad_id = variant_embedding_ad_id(job_id, variant_id)
+        combo = _TEXT_COMBOS[i]
+        key = json.dumps(combo, sort_keys=True, separators=(",", ":"))
+        # text_vector: use the same vector that was stored in ad_text_combination_embeddings
+        tce_row = conn.execute(
+            "SELECT vector FROM ad_text_combination_embeddings WHERE source_id=? AND combination_key=?",
+            (TEXT_SOURCE_ID, key),
+        ).fetchone()
+        txt_vec_bytes = tce_row["vector"] if tce_row else _rand_vec().tobytes()
         img_vec = _rand_vec()
-        txt_vec = _rand_vec()
-        comb = np.concatenate([img_vec[:IMAGE_DIM], txt_vec[:TEXT_DIM]]).tobytes()
         conn.execute(
-            """INSERT OR REPLACE INTO ad_embeddings
-               (user_id, ad_id, campaign_id, text_vector, image_vector, combined_vector)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (TEST_USER_ID, emb_ad_id, "camp_bo_test",
-             txt_vec.tobytes(), img_vec.tobytes(), comb),
+            """INSERT OR REPLACE INTO scored_observations
+               (user_id, seed_ad_id, combination_key, combination,
+                score, metric, source, text_vector, image_vector)
+               VALUES (?, ?, ?, ?, ?, 'synthetic', 'seed_script', ?, ?)""",
+            (TEST_USER_ID, SEED_AD_ID, key, key,
+             _SCORED_SCORES[i], txt_vec_bytes, img_vec.tobytes()),
         )
-
-    # One defunct variant — should be excluded
-    cur3 = conn.execute(
-        """INSERT INTO ad_generation_variants
-           (job_id, suggestion, status, score)
-           VALUES (?, ?, ?, ?)""",
-        (job_id, "defunct_suggestion", "defunct", 1.0),
-    )
-    defunct_id = cur3.lastrowid
-    from bo_pipeline.selector import variant_embedding_ad_id
-    defunct_ad_id = variant_embedding_ad_id(job_id, defunct_id)
-    img_vec = _rand_vec()
-    txt_vec = _rand_vec()
-    comb = np.concatenate([img_vec[:IMAGE_DIM], txt_vec[:TEXT_DIM]]).tobytes()
-    conn.execute(
-        """INSERT OR REPLACE INTO ad_embeddings
-           (user_id, ad_id, campaign_id, text_vector, image_vector, combined_vector)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (TEST_USER_ID, defunct_ad_id, "camp_bo_test",
-         txt_vec.tobytes(), img_vec.tobytes(), comb),
-    )
 
     conn.commit()
     conn.close()
@@ -250,7 +197,9 @@ class TestCombineEmbeddings:
 
     def test_truncates_long_vector(self):
         from ad_embedding_combiner import TEXT_DIM, truncate_pad
-        long_vec = _rand_vec(512)
+        # Use a vector genuinely longer than TEXT_DIM (1536) so truncation occurs.
+        # The original test used 512 which is shorter — it padded instead of truncated.
+        long_vec = _rand_vec(TEXT_DIM + 512)
         result = truncate_pad(long_vec, TEXT_DIM)
         assert result.shape == (TEXT_DIM,)
         assert np.allclose(result, long_vec[:TEXT_DIM])
@@ -374,21 +323,11 @@ class TestSelector:
     def test_scored_has_required_fields(self, test_db):
         from bo_pipeline.selector import get_scored_combinations
         for row in get_scored_combinations(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, test_db):
-            assert "variant_id" in row
+            assert "combination_key" in row
+            assert "combination" in row
             assert "score" in row
             assert isinstance(row["text_vector"], np.ndarray)
-            assert isinstance(row["image_vector"], np.ndarray)
             assert row["text_vector"].dtype == np.float32
-            assert row["image_vector"].dtype == np.float32
-
-    def test_defunct_excluded_from_scored(self, test_db):
-        from bo_pipeline.selector import get_scored_combinations
-        scored = get_scored_combinations(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, test_db)
-        scores = [s["score"] for s in scored]
-        assert 1.0 not in scores or all(s["score"] != 1.0 or len([x for x in scored if x["score"] == 1.0]) == 0
-                                         for _ in [None]), \
-            "defunct variant (score=1.0 with status='defunct') should not appear"
-        assert all(s["score"] in _SCORED_SCORES for s in scored)
 
     def test_candidates_returns_all_text_combos(self, test_db):
         from bo_pipeline.selector import get_candidate_combinations
@@ -443,18 +382,21 @@ class TestBOPipeline:
     @pytest.fixture(scope="class")
     def bo_result(self, test_db):
         from bo_pipeline import run_bo
-        # Pin method="local" so these tests always exercise the GPR+fantasy path
-        # regardless of whether MODAL_BO_API_URL is set in the environment.
-        return run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db, method="local")
+        # BO_TEST_METHOD env var selects the path: "local" (default) or "modal".
+        # "local" always exercises GPR+fantasy without any network calls.
+        # "modal" requires MODAL_BO_API_URL to be set and hits the live endpoint.
+        method = os.getenv("BO_TEST_METHOD", "local")
+        picks, *_ = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db, method=method)
+        return picks
 
     def test_returns_two_picks(self, bo_result):
         assert len(bo_result) == 2
 
     def test_pick1_is_ei_type(self, bo_result):
-        assert bo_result[0]["selection_type"] == "ei"
+        assert bo_result[0]["selection_type"] in {"ei", "modal_q_ei"}
 
     def test_pick2_is_fantasy_type(self, bo_result):
-        assert bo_result[1]["selection_type"] == "fantasy"
+        assert bo_result[1]["selection_type"] in {"fantasy", "modal_q_ei"}
 
     def test_picks_have_combination(self, bo_result):
         for pick in bo_result:
@@ -466,14 +408,25 @@ class TestBOPipeline:
 
     def test_picks_have_ei_score(self, bo_result):
         for pick in bo_result:
-            assert pick["ei_score"] is not None
-            assert pick["ei_score"] >= 0.0
+            if pick["selection_type"] in ("ei", "fantasy"):
+                # Local path: explicit EI values are always present
+                assert pick["ei_score"] is not None
+                assert pick["ei_score"] >= 0.0
+            else:
+                # Modal path: batch q-EI doesn't return per-pick EI scores
+                assert pick["ei_score"] is None
 
     def test_picks_have_gpr_stats(self, bo_result):
         for pick in bo_result:
-            assert pick["gpr_mean"] is not None
-            assert pick["gpr_std"] is not None
-            assert pick["gpr_std"] >= 0.0
+            if pick["selection_type"] in ("ei", "fantasy"):
+                # Local path: GPR stats are always populated
+                assert pick["gpr_mean"] is not None
+                assert pick["gpr_std"] is not None
+                assert pick["gpr_std"] >= 0.0
+            else:
+                # Modal path: no per-pick GPR decomposition
+                assert pick["gpr_mean"] is None
+                assert pick["gpr_std"] is None
 
     def test_picks_are_from_candidate_pool(self, test_db, bo_result):
         from bo_pipeline.selector import get_candidate_combinations, get_scored_combinations
@@ -528,9 +481,11 @@ class TestBOPipeline:
         conn.commit()
         conn.close()
 
-        picks = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=empty_db, method="local")
+        method = os.getenv("BO_TEST_METHOD", "local")
+        picks, *_ = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=empty_db, method=method)
         assert len(picks) == 2
         for pick in picks:
+            # Insufficient data → random fallback regardless of method
             assert pick["selection_type"] == "random"
 
     def test_full_bo_report(self, test_db):
@@ -573,14 +528,17 @@ class TestBOPipeline:
         assert n_candidates == len(_TEXT_COMBOS)
 
         # ---- 2. Fit GPR ----
+        # The pipeline applies transform_y before fitting (rank → standard-normal).
+        # The manual computation here must match so EI values are comparable.
         from ad_embedding_combiner import combine
+        from bo_pipeline.gpr import transform_y
         X_train = np.vstack([combine(s["text_vector"], s["image_vector"]) for s in scored]).astype(np.float64)
-        y_train = np.array([s["score"] for s in scored])
+        y_train = transform_y(np.array([s["score"] for s in scored]))
         gpr, scaler = fit_gpr(X_train, y_train)
 
         n_fit = len(y_train)
         y_best = float(y_train.max())
-        print(f"\nGPR fit on {n_fit} point(s)  |  best observed score: {y_best:.2f}")
+        print(f"\nGPR fit on {n_fit} point(s)  |  best transformed target: {y_best:.4f}")
         print(f"Optimized kernel: {gpr.kernel_}")
 
         assert n_fit == N_SCORED
@@ -596,41 +554,54 @@ class TestBOPipeline:
 
         assert np.all(ei_scores >= 0)
 
-        # ---- 4. Full pipeline run (EI pick + fantasy pick) ----
-        picks = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db, method="local")
+        # ---- 4. Full pipeline run ----
+        method = os.getenv("BO_TEST_METHOD", "local")
+        picks, *_ = run_bo(SEED_AD_ID, TEXT_SOURCE_ID, TEST_USER_ID, db_path=test_db, method=method)
 
         pick1, pick2 = picks
-        mu1, sig1 = predict_with_std(gpr, scaler, X_cands[[int(np.argmax(ei_scores))]])
+
+        def _fmt(v, fmt):
+            return format(v, fmt) if v is not None else "N/A (modal)"
 
         print("\n" + "-" * 60)
         print(f"PICK 1  [{pick1['selection_type'].upper()}]")
         print(f"  Combination : {pick1['combination']}")
-        print(f"  GPR mean    : {pick1['gpr_mean']:.4f}")
-        print(f"  GPR std     : {pick1['gpr_std']:.4f}")
-        print(f"  EI score    : {pick1['ei_score']:.6f}")
+        print(f"  GPR mean    : {_fmt(pick1['gpr_mean'], '.4f')}")
+        print(f"  GPR std     : {_fmt(pick1['gpr_std'],  '.4f')}")
+        print(f"  EI score    : {_fmt(pick1['ei_score'], '.6f')}")
 
         print(f"\nPICK 2  [{pick2['selection_type'].upper()}]")
         print(f"  Combination : {pick2['combination']}")
-        print(f"  GPR mean    : {pick2['gpr_mean']:.4f}")
-        print(f"  GPR std     : {pick2['gpr_std']:.4f}")
-        print(f"  EI score    : {pick2['ei_score']:.6f}")
+        print(f"  GPR mean    : {_fmt(pick2['gpr_mean'], '.4f')}")
+        print(f"  GPR std     : {_fmt(pick2['gpr_std'],  '.4f')}")
+        print(f"  EI score    : {_fmt(pick2['ei_score'], '.6f')}")
 
         print("\nSummary")
         print(f"  n_scored    : {n_scored}")
         print(f"  n_fit       : {n_fit}")
         print(f"  n_candidates: {n_candidates}")
         print(f"  best_obs    : {y_best:.2f}")
-        print(f"  pick1_ei    : {pick1['ei_score']:.6f}")
-        print(f"  pick2_ei    : {pick2['ei_score']:.6f}")
+        print(f"  method      : {method}")
+        print(f"  pick1_ei    : {_fmt(pick1['ei_score'], '.6f')}")
+        print(f"  pick2_ei    : {_fmt(pick2['ei_score'], '.6f')}")
         print("=" * 60)
 
-        # ---- Assertions ----
-        assert pick1["selection_type"] == "ei"
-        assert pick2["selection_type"] == "fantasy"
+        # ---- Assertions (common to all methods) ----
         assert pick1["combination_key"] != pick2["combination_key"]
-        assert pick1["ei_score"] >= 0
-        assert pick2["ei_score"] >= 0
-        assert pick1["gpr_std"] >= 0
-        assert pick2["gpr_std"] >= 0
-        # pick1 must have the highest EI in the pool
-        assert pick1["ei_score"] == pytest.approx(float(ei_scores.max()), rel=1e-3)
+
+        if method == "modal":
+            # Modal path: picks carry selection_type="modal_q_ei" and no per-pick stats
+            assert pick1["selection_type"] == "modal_q_ei"
+            assert pick2["selection_type"] == "modal_q_ei"
+            assert pick1["ei_score"] is None
+            assert pick2["ei_score"] is None
+        else:
+            # Local path: explicit selection types and non-negative EI/GPR stats
+            assert pick1["selection_type"] == "ei"
+            assert pick2["selection_type"] == "fantasy"
+            assert pick1["ei_score"] >= 0
+            assert pick2["ei_score"] >= 0
+            assert pick1["gpr_std"] >= 0
+            assert pick2["gpr_std"] >= 0
+            # pick1 must have the highest EI in the pool
+            assert pick1["ei_score"] == pytest.approx(float(ei_scores.max()), rel=1e-3)

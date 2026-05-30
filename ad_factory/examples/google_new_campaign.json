@@ -1,0 +1,10 @@
+{
+  "concept": "Electric cargo bike for urban deliveries — 100km range, 200kg payload, zero emissions",
+  "platform": "google",
+  "campaign_name": "EcoCargo — Search Campaign",
+  "adset_name": "Urban Logistics",
+  "final_url": "https://ecocargo.example.com/fleet",
+  "status": "PAUSED",
+  "customer_id": "1234567890",
+  "fake_server_dir": "fake_ad_server"
+}

@@ -31,7 +31,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # ── Load .env ──────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -61,9 +61,13 @@ JWT_SECRET = os.getenv("JWT_SECRET", "change-me")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 24
 
-META_GRAPH = f"https://graph.facebook.com/{META_API_VERSION}"
+_FAKE_META_BASE_URL = os.getenv("FAKE_META_BASE_URL", "")
+META_GRAPH = _FAKE_META_BASE_URL if _FAKE_META_BASE_URL else f"https://graph.facebook.com/{META_API_VERSION}"
 
 DB_PATH = Path(__file__).parent / os.getenv("DATABASE_PATH", "app.db")
+
+MIN_CONVERGENCE_IMPRESSIONS = int(os.getenv("MIN_CONVERGENCE_IMPRESSIONS", "500"))
+MIN_CONVERGENCE_DAYS = int(os.getenv("MIN_CONVERGENCE_DAYS", "3"))
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +294,46 @@ def init_db() -> None:
         conn.commit()
     except Exception:
         pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE ad_creative_structures ADD COLUMN is_pushed_clone INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    for _col in [
+        "platform_ad_numeric_id TEXT",
+        "current_impressions INTEGER NOT NULL DEFAULT 0",
+        "days_running INTEGER NOT NULL DEFAULT 0",
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE pushed_ad_combos ADD COLUMN {_col}")
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pushed_ad_combos (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id                 INTEGER NOT NULL,
+            platform                TEXT NOT NULL,
+            seed_ad_id              TEXT NOT NULL,
+            ad_name                 TEXT NOT NULL,
+            combination_key         TEXT NOT NULL,
+            combination             TEXT NOT NULL,
+            platform_ad_id          TEXT,
+            platform_ad_numeric_id  TEXT,
+            push_status             TEXT NOT NULL DEFAULT 'paused',
+            converged               INTEGER NOT NULL DEFAULT 0,
+            converged_at            TEXT,
+            convergence_metric      REAL,
+            current_impressions     INTEGER NOT NULL DEFAULT 0,
+            days_running            INTEGER NOT NULL DEFAULT 0,
+            pushed_at               TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(user_id, platform, seed_ad_id, combination_key)
+        )
+        """
+    )
     conn.commit()
     conn.close()
     # Ensure tables for modules not yet wired into HTTP routes (needed by BO)
@@ -297,6 +341,8 @@ def init_db() -> None:
     _ensure_ad_tables()
     from ad_combination_embeddings.storage import ensure_table as _ensure_combo_table
     _ensure_combo_table()
+    from bo_pipeline.storage import ensure_scored_observations_table as _ensure_scored_obs
+    _ensure_scored_obs()
 
 
 # ── App lifecycle ──────────────────────────────────────────────────────────────
@@ -1127,8 +1173,33 @@ async def ingest_google_campaign_structure(
             (user_id, campaign_id, *missing_ad_ids),
         )
 
+    # ── Google clone detection ────────────────────────────────────────────────
+    # Match on platform_ad_numeric_id (last segment of resource name) because
+    # pushed_ad_combos.platform_ad_id is a full resource name string which does
+    # not equal the numeric ad_id stored in ad_creative_structures.
+    if current_ad_ids:
+        pushed_rows_g = db.execute(
+            "SELECT platform_ad_numeric_id FROM pushed_ad_combos "
+            "WHERE user_id = ? AND platform = 'google' AND platform_ad_numeric_id IS NOT NULL",
+            (user_id,),
+        ).fetchall()
+        pushed_numeric_ids = {r["platform_ad_numeric_id"] for r in pushed_rows_g if r["platform_ad_numeric_id"]}
+        clone_ids_g = current_ad_ids & pushed_numeric_ids
+        if clone_ids_g:
+            placeholders = ",".join("?" * len(clone_ids_g))
+            db.execute(
+                f"UPDATE ad_creative_structures SET is_pushed_clone = 1 "
+                f"WHERE user_id = ? AND platform = 'google' AND ad_id IN ({placeholders})",
+                (user_id, *clone_ids_g),
+            )
+
     db.commit()
     db.close()
+
+    # ── Convergence check (fire-and-forget) ───────────────────────────────────
+    asyncio.create_task(_check_google_convergence(
+        user_id, campaign_id, access_token, customer_id, login_customer_id
+    ))
 
     # ── Embedding hook (fire-and-forget) ──────────────────────────────────────
     # RSA and video/display get text-only embeddings via embed_ad (image_url=None
@@ -1365,7 +1436,7 @@ async def _download_ad_images(components: list[dict]) -> list[dict]:
     _backend_base = os.getenv("IMAGES_SERVE_BASE_URL", "http://localhost:8000/images").replace("/images", "")
 
     result = []
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
         for comp in components:
             if comp.get("slot") == "image" and comp.get("value", "").startswith("http"):
                 url = comp["value"]
@@ -1385,6 +1456,225 @@ async def _download_ad_images(components: list[dict]) -> list[dict]:
             else:
                 result.append(comp)
     return result
+
+
+def _write_convergence_observation(
+    db: sqlite3.Connection,
+    user_id: int,
+    seed_ad_id: str,
+    combination_key: str,
+    combination_json: str,
+    score: float,
+    metric: str,
+) -> None:
+    """Write a converged real-metric score to scored_observations."""
+    tce = db.execute(
+        "SELECT vector FROM ad_text_combination_embeddings WHERE source_id=? AND combination_key=?",
+        (seed_ad_id, combination_key),
+    ).fetchone()
+    text_vec_bytes = tce["vector"] if tce else None
+
+    img_row = db.execute(
+        "SELECT vector FROM ad_image_embeddings WHERE user_id=? AND ad_id=? ORDER BY slot_index LIMIT 1",
+        (user_id, seed_ad_id),
+    ).fetchone()
+    image_vec_bytes = img_row["vector"] if img_row else None
+    if not image_vec_bytes:
+        emb_row = db.execute(
+            "SELECT image_vector FROM ad_embeddings WHERE ad_id=? AND user_id=?",
+            (seed_ad_id, user_id),
+        ).fetchone()
+        image_vec_bytes = emb_row["image_vector"] if emb_row else None
+
+    try:
+        db.execute(
+            """INSERT OR REPLACE INTO scored_observations
+               (user_id, seed_ad_id, combination_key, combination,
+                score, metric, source, text_vector, image_vector)
+               VALUES (?, ?, ?, ?, ?, ?, 'convergence', ?, ?)""",
+            (user_id, seed_ad_id, combination_key, combination_json,
+             score, metric, text_vec_bytes, image_vec_bytes),
+        )
+    except Exception as exc:
+        logger.warning("_write_convergence_observation failed for %s: %s", seed_ad_id, exc)
+
+
+async def _check_meta_convergence(
+    user_id: int, campaign_id: str, access_token: str
+) -> None:
+    """Fetch lifetime impressions for each active, unconverged pushed Meta clone in
+    this campaign and flip converged=1 when both thresholds are met."""
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT pac.id, pac.platform_ad_id, pac.pushed_at,
+               pac.seed_ad_id, pac.combination_key, pac.combination
+        FROM pushed_ad_combos pac
+        JOIN ad_creative_structures acs
+            ON acs.ad_id = pac.seed_ad_id AND acs.user_id = pac.user_id
+        WHERE pac.user_id = ? AND pac.platform = 'meta'
+          AND pac.push_status = 'active' AND pac.converged = 0
+          AND acs.campaign_id = ?
+        GROUP BY pac.id
+        """,
+        (user_id, campaign_id),
+    ).fetchall()
+    db.close()
+
+    if not rows:
+        return
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        for row in rows:
+            try:
+                resp = await client.get(
+                    f"{META_GRAPH}/{row['platform_ad_id']}/insights",
+                    params={
+                        "access_token": access_token,
+                        "fields": "impressions,ctr",
+                        "date_preset": "lifetime",
+                    },
+                )
+                if resp.status_code != 200:
+                    continue
+                data = resp.json().get("data", [])
+                if not data:
+                    continue
+
+                impressions = int(data[0].get("impressions", 0) or 0)
+                # Meta returns CTR as a percentage string (e.g. "4.52"); store as decimal
+                ctr = float(data[0].get("ctr", 0) or 0) / 100
+
+                try:
+                    pushed_at = datetime.strptime(row["pushed_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    pushed_at = datetime.now(timezone.utc)
+                days_running = max(0, (datetime.now(timezone.utc) - pushed_at).days)
+
+                db = get_db()
+                db.execute(
+                    "UPDATE pushed_ad_combos SET current_impressions = ?, days_running = ? WHERE id = ?",
+                    (impressions, days_running, row["id"]),
+                )
+                if impressions >= MIN_CONVERGENCE_IMPRESSIONS and days_running >= MIN_CONVERGENCE_DAYS:
+                    db.execute(
+                        "UPDATE pushed_ad_combos SET converged = 1, converged_at = datetime('now'), "
+                        "convergence_metric = ? WHERE id = ?",
+                        (ctr, row["id"]),
+                    )
+                    logger.info(
+                        "convergence: Meta ad=%s converged (%d impr, %d days, ctr=%.4f)",
+                        row["platform_ad_id"], impressions, days_running, ctr,
+                    )
+                    _write_convergence_observation(
+                        db, user_id,
+                        row["seed_ad_id"], row["combination_key"], row["combination"],
+                        ctr, "ctr",
+                    )
+                db.commit()
+                db.close()
+            except Exception as exc:
+                logger.warning("convergence check failed for Meta ad=%s: %s", row["platform_ad_id"], exc)
+
+
+async def _check_google_convergence(
+    user_id: int,
+    campaign_id: str,
+    access_token: str,
+    customer_id: str,
+    login_customer_id: str | None,
+) -> None:
+    """Fetch aggregate impressions for active, unconverged pushed Google RSA clones
+    in this campaign and flip converged=1 when both thresholds are met."""
+    from google_ads_api import run_gaql as _run_gaql
+
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT pac.id, pac.platform_ad_id, pac.pushed_at,
+               pac.seed_ad_id, pac.combination_key, pac.combination
+        FROM pushed_ad_combos pac
+        JOIN ad_creative_structures acs
+            ON acs.ad_id = pac.seed_ad_id AND acs.user_id = pac.user_id
+        WHERE pac.user_id = ? AND pac.platform = 'google'
+          AND pac.push_status = 'active' AND pac.converged = 0
+          AND acs.campaign_id = ?
+        GROUP BY pac.id
+        """,
+        (user_id, campaign_id),
+    ).fetchall()
+    db.close()
+
+    if not rows:
+        return
+
+    resource_name_map = {r["platform_ad_id"]: r for r in rows if r["platform_ad_id"]}
+    if not resource_name_map:
+        return
+
+    gaql = f"""
+        SELECT ad_group_ad.resource_name, metrics.impressions, metrics.ctr
+        FROM ad_group_ad
+        WHERE campaign.id = '{campaign_id}'
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            ad_rows = await _run_gaql(
+                client=client,
+                gaql=gaql,
+                api_version=GOOGLE_ADS_API_VERSION,
+                customer_id=customer_id,
+                access_token=access_token,
+                developer_token=GOOGLE_DEVELOPER_TOKEN,
+                login_customer_id=login_customer_id,
+            )
+        except Exception as exc:
+            logger.warning("google convergence: GAQL failed: %s", exc)
+            return
+
+    metrics_by_resource: dict[str, dict] = {}
+    for ar in ad_rows:
+        rn = (ar.get("adGroupAd") or {}).get("resourceName", "")
+        if rn and ar.get("metrics"):
+            metrics_by_resource[rn] = ar["metrics"]
+
+    for resource_name, row in resource_name_map.items():
+        m = metrics_by_resource.get(resource_name)
+        if not m:
+            continue
+
+        impressions = int(m.get("impressions", 0) or 0)
+        # Google returns CTR as decimal fraction (e.g. 0.045 = 4.5%); store as-is
+        ctr = float(m.get("ctr", 0) or 0)
+
+        try:
+            pushed_at = datetime.strptime(row["pushed_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            pushed_at = datetime.now(timezone.utc)
+        days_running = max(0, (datetime.now(timezone.utc) - pushed_at).days)
+
+        db = get_db()
+        db.execute(
+            "UPDATE pushed_ad_combos SET current_impressions = ?, days_running = ? WHERE id = ?",
+            (impressions, days_running, row["id"]),
+        )
+        if impressions >= MIN_CONVERGENCE_IMPRESSIONS and days_running >= MIN_CONVERGENCE_DAYS:
+            db.execute(
+                "UPDATE pushed_ad_combos SET converged = 1, converged_at = datetime('now'), "
+                "convergence_metric = ? WHERE id = ?",
+                (ctr, row["id"]),
+            )
+            logger.info(
+                "convergence: Google ad=%s converged (%d impr, %d days, ctr=%.4f)",
+                resource_name, impressions, days_running, ctr,
+            )
+            _write_convergence_observation(
+                db, user_id,
+                row["seed_ad_id"], row["combination_key"], row["combination"],
+                ctr, "ctr",
+            )
+        db.commit()
+        db.close()
 
 
 @app.post("/api/ingest/structure/{campaign_id}", response_model=StructureIngestResult)
@@ -1499,8 +1789,27 @@ async def ingest_campaign_structure(
             (user_id, campaign_id, *missing_ad_ids),
         )
 
+    # ── Clone detection: mark pushed clones so they're excluded from BO seeds ──
+    if current_ad_ids:
+        pushed_rows = db.execute(
+            "SELECT platform_ad_id FROM pushed_ad_combos WHERE user_id = ? AND platform = 'meta'",
+            (user_id,),
+        ).fetchall()
+        pushed_platform_ids = {r["platform_ad_id"] for r in pushed_rows if r["platform_ad_id"]}
+        clone_ids = current_ad_ids & pushed_platform_ids
+        if clone_ids:
+            placeholders = ",".join("?" * len(clone_ids))
+            db.execute(
+                f"UPDATE ad_creative_structures SET is_pushed_clone = 1 "
+                f"WHERE user_id = ? AND ad_id IN ({placeholders})",
+                (user_id, *clone_ids),
+            )
+
     db.commit()
     db.close()
+
+    # ── Convergence check (fire-and-forget) ───────────────────────────────────
+    asyncio.create_task(_check_meta_convergence(user_id, campaign_id, access_token))
 
     # ── Embedding hook (fire-and-forget) ──────────────────────────────────────
     # embed_ad       → 1 seed embedding per ad (slot[0] text + image[0]) → ad_embeddings
@@ -1893,6 +2202,7 @@ async def _clone_dynamic_to_static_ad(
     components: dict[str, str],
     suggestion_id: int,
     image_hash: str | None = None,
+    ad_name: str | None = None,
 ) -> str:
     """
     Create a new static ad in Meta from a chosen set of component values.
@@ -1970,7 +2280,7 @@ async def _clone_dynamic_to_static_ad(
     ad_resp = await client.post(
         f"{META_GRAPH}/{ad_account_id}/ads",
         data={
-            "name": f"Static ad – suggestion {suggestion_id}",
+            "name": ad_name or f"Static ad – suggestion {suggestion_id}",
             "adset_id": adset_id,
             "creative": json.dumps({"creative_id": new_creative_id}),
             "status": "PAUSED",
@@ -2151,11 +2461,19 @@ class BOPick(BaseModel):
     gpr_mean: float | None = None
     gpr_std: float | None = None
     placements: list[dict] = []
+    # Lifecycle — populated by _enrich_pick after checking pushed_ad_combos
+    ad_name: str | None = None
+    already_pushed: bool = False
+    push_status: str | None = None
+    converged: bool = False
+    platform_ad_id: str | None = None
+    current_impressions: int = 0
 
 
 class BORunRequest(BaseModel):
     seed_ad_id: str
     text_source_id: str  # usually same as seed_ad_id
+    target_metric: str | None = None
 
 
 class BORunResponse(BaseModel):
@@ -2164,6 +2482,7 @@ class BORunResponse(BaseModel):
     picks: list[BOPick]
     scored_count: int
     candidate_count: int
+    warning: str | None = None
 
 
 def _get_placements_for_ad(ad_id: str, user_id: int) -> list[dict]:
@@ -2186,7 +2505,36 @@ def _get_placements_for_ad(ad_id: str, user_id: int) -> list[dict]:
 def _enrich_pick(p: dict, seed_ad_id: str, user_id: int) -> BOPick:
     combo = _resolve_combination_image_url(p["combination"])
     placements = _get_placements_for_ad(seed_ad_id, user_id)
-    return BOPick(**{**p, "combination": combo, "placements": placements})
+    db = get_db()
+    pushed_row = db.execute(
+        "SELECT ad_name, push_status, converged, platform_ad_id, current_impressions "
+        "FROM pushed_ad_combos "
+        "WHERE user_id = ? AND seed_ad_id = ? AND combination_key = ?",
+        (user_id, seed_ad_id, p["combination_key"]),
+    ).fetchone()
+    db.close()
+    lifecycle: dict = {}
+    if pushed_row:
+        lifecycle = {
+            "ad_name": pushed_row["ad_name"],
+            "already_pushed": True,
+            "push_status": pushed_row["push_status"],
+            "converged": bool(pushed_row["converged"]),
+            "platform_ad_id": pushed_row["platform_ad_id"],
+            "current_impressions": pushed_row["current_impressions"] or 0,
+        }
+    return BOPick(**{**p, "combination": combo, "placements": placements, **lifecycle})
+
+
+def _get_pushed_exclude_keys(user_id: int, seed_ad_id: str) -> set[str]:
+    """Return combination_keys already pushed for this seed ad — excluded from BO candidates."""
+    db = get_db()
+    rows = db.execute(
+        "SELECT combination_key FROM pushed_ad_combos WHERE user_id = ? AND seed_ad_id = ?",
+        (user_id, seed_ad_id),
+    ).fetchall()
+    db.close()
+    return {r["combination_key"] for r in rows}
 
 
 @app.post("/api/bo/run", response_model=BORunResponse)
@@ -2196,12 +2544,14 @@ def run_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_current_user_
     seed_ad_id and text_source_id are normally the same (both = the ingested ad_id).
     """
     from bo_pipeline.pipeline import run_bo
-    from bo_pipeline.selector import get_candidate_combinations, get_scored_combinations
     from bo_pipeline.storage import DB_PATH as BO_DB_PATH, save_bo_run
 
-    scored = get_scored_combinations(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
-    candidates = get_candidate_combinations(body.text_source_id, body.seed_ad_id, user_id, db_path=BO_DB_PATH)
-    picks = run_bo(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
+    pushed_keys = _get_pushed_exclude_keys(user_id, body.seed_ad_id)
+    picks, warning, scored_count, candidate_count = run_bo(
+        body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH,
+        additional_exclude_keys=pushed_keys,
+        target_metric=body.target_metric,
+    )
 
     if picks:
         save_bo_run(body.seed_ad_id, body.text_source_id, picks, BO_DB_PATH)
@@ -2210,8 +2560,9 @@ def run_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_current_user_
         seed_ad_id=body.seed_ad_id,
         text_source_id=body.text_source_id,
         picks=[_enrich_pick(p, body.seed_ad_id, user_id) for p in picks],
-        scored_count=len(scored),
-        candidate_count=len(candidates),
+        scored_count=scored_count,
+        candidate_count=candidate_count,
+        warning=warning,
     )
 
 
@@ -2230,7 +2581,6 @@ def run_google_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_curren
     Falls back to random when fewer than MIN_TRAINING_POINTS scored variants exist.
     """
     from bo_pipeline.pipeline import run_bo
-    from bo_pipeline.selector import get_candidate_combinations, get_scored_combinations
     from bo_pipeline.storage import DB_PATH as BO_DB_PATH, save_bo_run
 
     db = get_db()
@@ -2246,9 +2596,12 @@ def run_google_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_curren
             f"Creative type '{ct_row['creative_type']}' is not supported for optimization.",
         )
 
-    scored = get_scored_combinations(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
-    candidates = get_candidate_combinations(body.text_source_id, body.seed_ad_id, user_id, db_path=BO_DB_PATH)
-    picks = run_bo(body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH)
+    pushed_keys = _get_pushed_exclude_keys(user_id, body.seed_ad_id)
+    picks, warning, scored_count, candidate_count = run_bo(
+        body.seed_ad_id, body.text_source_id, user_id, BO_DB_PATH,
+        platform="google", additional_exclude_keys=pushed_keys,
+        target_metric=body.target_metric,
+    )
 
     if picks:
         save_bo_run(body.seed_ad_id, body.text_source_id, picks, BO_DB_PATH)
@@ -2257,8 +2610,9 @@ def run_google_bo_endpoint(body: BORunRequest, user_id: int = Depends(get_curren
         seed_ad_id=body.seed_ad_id,
         text_source_id=body.text_source_id,
         picks=[_enrich_pick(p, body.seed_ad_id, user_id) for p in picks],
-        scored_count=len(scored),
-        candidate_count=len(candidates),
+        scored_count=scored_count,
+        candidate_count=candidate_count,
+        warning=warning,
     )
 
 
@@ -2267,6 +2621,249 @@ def get_google_bo_results(ad_id: str, user_id: int = Depends(get_current_user_id
     """Return the most recent BO picks for a Google ad."""
     from bo_pipeline.storage import DB_PATH as BO_DB_PATH, get_latest_bo_run
     return [_enrich_pick(p, ad_id, user_id) for p in get_latest_bo_run(ad_id, ad_id, BO_DB_PATH)]
+
+
+# ── Cross-platform BO ─────────────────────────────────────────────────────────
+
+class CrossPlatformBOPick(BaseModel):
+    """A single BO pick from the cross-platform run, tagged with its originating platform."""
+    combination_key: str
+    combination: dict
+    selection_type: str
+    ei_score: float | None = None
+    gpr_mean: float | None = None
+    gpr_std: float | None = None
+    platform: str               # "meta" | "google"
+    seed_ad_id: str
+    text_source_id: str
+    placements: list[dict] = []
+
+
+class CrossPlatformBOPair(BaseModel):
+    platform: str       # "meta" | "google"
+    seed_ad_id: str
+    text_source_id: str
+
+
+class CrossPlatformBORequest(BaseModel):
+    pairs: list[CrossPlatformBOPair]
+
+
+class CrossPlatformBOGroupStat(BaseModel):
+    platform: str
+    seed_ad_id: str
+    scored_count: int
+    candidate_count: int
+
+
+class CrossPlatformBOResponse(BaseModel):
+    picks: list[CrossPlatformBOPick]
+    group_stats: list[CrossPlatformBOGroupStat]
+
+
+def _enrich_cross_platform_pick(p: dict, user_id: int) -> CrossPlatformBOPick:
+    """Resolve image URLs and attach placements for a cross-platform pick."""
+    combo = _resolve_combination_image_url(p["combination"])
+    placements = _get_placements_for_ad(p["seed_ad_id"], user_id)
+    return CrossPlatformBOPick(**{**p, "combination": combo, "placements": placements})
+
+
+@app.post("/api/bo/cross-platform", response_model=CrossPlatformBOResponse)
+def run_cross_platform_bo_endpoint(
+    body: CrossPlatformBORequest,
+    user_id: int = Depends(get_current_user_id),
+):
+    """
+    Run Bayesian Optimisation jointly across Meta and Google (or any platform mix).
+
+    Accepts a list of (platform, seed_ad_id, text_source_id) pairs.  A shared
+    ECDF normalises scores across platforms before per-platform GPRs compute EI.
+    Returns up to 2 globally-ranked picks, each tagged with its originating
+    platform.
+
+    Requires at least one pair; each pair must have ingested structure and text
+    combinations.  Falls back to random selection per platform when fewer than 2
+    scored observations exist for that platform.
+    """
+    from bo_pipeline.cross_platform import run_cross_platform_bo
+    from bo_pipeline.storage import DB_PATH as BO_DB_PATH, save_bo_run
+
+    if not body.pairs:
+        raise HTTPException(400, "At least one pair is required.")
+
+    pairs_dicts = [p.model_dump() for p in body.pairs]
+    picks, raw_stats = run_cross_platform_bo(pairs_dicts, user_id, BO_DB_PATH)
+
+    # Persist each pick under its own (seed_ad_id, text_source_id) via save_bo_run
+    from itertools import groupby
+    for (seed_ad_id, text_source_id), group_picks in groupby(
+        picks, key=lambda p: (p["seed_ad_id"], p["text_source_id"])
+    ):
+        group_list = list(group_picks)
+        if group_list:
+            save_bo_run(seed_ad_id, text_source_id, group_list, BO_DB_PATH)
+
+    return CrossPlatformBOResponse(
+        picks=[_enrich_cross_platform_pick(p, user_id) for p in picks],
+        group_stats=[CrossPlatformBOGroupStat(**s) for s in raw_stats],
+    )
+
+
+class UnifiedCrossPlatformBORequest(BaseModel):
+    pairs: list[CrossPlatformBOPair]
+    top_n: int = 4
+
+
+@app.post("/api/bo/cross-platform/unified", response_model=CrossPlatformBOResponse)
+def run_unified_cross_platform_bo_endpoint(
+    body: UnifiedCrossPlatformBORequest,
+    user_id: int = Depends(get_current_user_id),
+):
+    """
+    Unified cross-platform BO: per-group PCA each to the same K-dim output,
+    pooled into a single GP/Modal call.  Returns top_n globally-ranked picks.
+
+    Supports arbitrary mixes of platforms, campaigns, and ad types in one batch.
+    top_n defaults to 4 and is configurable via the request body.
+    """
+    from bo_pipeline.cross_platform import run_unified_cross_platform_bo
+    from bo_pipeline.storage import DB_PATH as BO_DB_PATH, save_bo_run
+
+    if not body.pairs:
+        raise HTTPException(400, "At least one pair is required.")
+
+    pairs_dicts = [p.model_dump() for p in body.pairs]
+    picks, raw_stats = run_unified_cross_platform_bo(pairs_dicts, user_id, BO_DB_PATH, top_n=body.top_n)
+
+    from itertools import groupby
+    for (seed_ad_id, text_source_id), group_picks in groupby(
+        picks, key=lambda p: (p["seed_ad_id"], p["text_source_id"])
+    ):
+        group_list = list(group_picks)
+        if group_list:
+            save_bo_run(seed_ad_id, text_source_id, group_list, BO_DB_PATH)
+
+    return CrossPlatformBOResponse(
+        picks=[_enrich_cross_platform_pick(p, user_id) for p in picks],
+        group_stats=[CrossPlatformBOGroupStat(**s) for s in raw_stats],
+    )
+
+
+# ── Seed fake scored variants for BO testing ─────────────────────────────────
+
+class SeedScoredVariantsRequest(BaseModel):
+    seed_ad_id: str
+    text_source_id: str | None = None
+    platform: str = "meta"          # "meta" | "google"
+    n: int = Field(default=5, ge=1, le=50)
+
+
+class SeedScoredVariantsResponse(BaseModel):
+    seeded: int
+    warning: str | None = None
+
+
+@app.post("/api/bo/seed-scored-variants", response_model=SeedScoredVariantsResponse)
+def seed_scored_variants_endpoint(
+    body: SeedScoredVariantsRequest,
+    user_id: int = Depends(get_current_user_id),
+):
+    """
+    Seed synthetic scored observations for BO testing without API keys.
+
+    Picks up to n existing text combination embeddings for text_source_id
+    and writes them directly to scored_observations with random scores in [2.0, 9.0].
+
+    Requires text combination embeddings to already exist for the ad —
+    run Ingest then wait ~10 s for the embedding pipeline, or run
+    Generate Text first.
+    """
+    import numpy as np
+    from bo_pipeline.storage import ensure_scored_observations_table
+
+    ensure_scored_observations_table(DB_PATH)
+
+    text_source_id = body.text_source_id or body.seed_ad_id
+    include_image = body.platform != "google"
+    IMAGE_DIM = 1536
+    rng = np.random.default_rng()
+
+    db = get_db()
+    try:
+        rows = db.execute(
+            """SELECT combination_key, vector
+               FROM ad_text_combination_embeddings
+               WHERE source_id = ?
+               ORDER BY RANDOM()
+               LIMIT ?""",
+            (text_source_id, body.n),
+        ).fetchall()
+
+        if not rows:
+            raise HTTPException(
+                400,
+                "No text combination embeddings found for this ad. "
+                "Run Ingest, then Generate Text (or wait ~10 s for embeddings to finish), "
+                "then try again.",
+            )
+
+        # Build image vector pool (Meta only)
+        image_pool: list = []
+        if include_image:
+            per_img = db.execute(
+                "SELECT vector FROM ad_image_embeddings WHERE user_id=? AND ad_id=? ORDER BY slot_index",
+                (user_id, body.seed_ad_id),
+            ).fetchall()
+            image_pool = [
+                np.frombuffer(r["vector"], dtype=np.float32)
+                for r in per_img if r["vector"]
+            ]
+            if not image_pool:
+                seed_emb = db.execute(
+                    "SELECT image_vector FROM ad_embeddings WHERE ad_id=? AND user_id=?",
+                    (body.seed_ad_id, user_id),
+                ).fetchone()
+                if seed_emb and seed_emb["image_vector"]:
+                    image_pool = [np.frombuffer(seed_emb["image_vector"], dtype=np.float32)]
+
+        seeded = 0
+        for i, row in enumerate(rows):
+            text_vec = np.frombuffer(row["vector"], dtype=np.float32)
+            if not include_image:
+                image_vec = None
+            elif image_pool:
+                image_vec = image_pool[i % len(image_pool)]
+            else:
+                image_vec = rng.random(IMAGE_DIM).astype(np.float32)
+
+            score = round(float(rng.uniform(2.0, 9.0)), 2)
+            db.execute(
+                """INSERT OR REPLACE INTO scored_observations
+                   (user_id, seed_ad_id, combination_key, combination,
+                    score, metric, source, text_vector, image_vector)
+                   VALUES (?, ?, ?, ?, ?, 'synthetic', 'seed_script', ?, ?)""",
+                (
+                    user_id, body.seed_ad_id,
+                    row["combination_key"],
+                    row["combination_key"],  # combination_key IS the JSON combination for text combos
+                    score,
+                    text_vec.tobytes(),
+                    image_vec.tobytes() if image_vec is not None else None,
+                ),
+            )
+            seeded += 1
+
+        db.commit()
+        warning = None
+        if len(rows) < body.n:
+            warning = (
+                f"Only {len(rows)} combination embeddings found; seeded {seeded}. "
+                "Run Generate Text to create more."
+            )
+        return SeedScoredVariantsResponse(seeded=seeded, warning=warning)
+
+    finally:
+        db.close()
 
 
 # ── Push to Meta ─────────────────────────────────────────────────────────────
@@ -2392,6 +2989,7 @@ async def _create_google_rsa_ad(
     customer_id: str,
     access_token: str,
     login_customer_id: str | None,
+    ad_name: str | None = None,
 ) -> str:
     """Look up ad group + final_url + generated text, create a PAUSED RSA.
 
@@ -2463,6 +3061,7 @@ async def _create_google_rsa_ad(
         descriptions=descriptions,
         final_url=final_url,
         login_customer_id=login_customer_id,
+        ad_name=ad_name,
     )
 
 
@@ -2532,6 +3131,164 @@ async def push_google_ads(user_id: int = Depends(get_current_user_id)):
     return GooglePushResponse(pushed=pushed, failed=failed, results=results)
 
 
+# ── Per-pick push (named, explicit) ──────────────────────────────────────────
+
+class PushPickRequest(BaseModel):
+    platform: str          # 'meta' | 'google'
+    seed_ad_id: str
+    combination_key: str   # compound JSON key from the BO pipeline
+    combination: dict      # actual slot values
+    name: str              # user-supplied name
+
+
+class PushPickResponse(BaseModel):
+    platform_ad_id: str
+    ad_name: str
+
+
+@app.post("/api/push/pick", response_model=PushPickResponse)
+async def push_pick(body: PushPickRequest, user_id: int = Depends(get_current_user_id)):
+    """
+    Push a specific BO-recommended combination as a new PAUSED ad.
+
+    Meta:  creates a static ad via _clone_dynamic_to_static_ad.
+    Google: creates a PAUSED RSA via _create_google_rsa_ad.
+
+    Records the push in pushed_ad_combos so future BO runs exclude this
+    combination and the UI can show lifecycle state.
+    """
+    db = get_db()
+    struct_row = db.execute(
+        "SELECT ad_account_id, adset_id FROM ad_creative_structures "
+        "WHERE user_id = ? AND ad_id = ? LIMIT 1",
+        (user_id, body.seed_ad_id),
+    ).fetchone()
+    db.close()
+    if not struct_row:
+        raise HTTPException(400, f"No ingested structure for ad {body.seed_ad_id}")
+
+    if body.platform == "meta":
+        access_token, ad_account_id = _meta_creds(user_id)
+        adset_id = struct_row["adset_id"]
+        if not adset_id:
+            raise HTTPException(400, "No adset_id found for this ad — reingest the campaign")
+
+        image_hash: str | None = None
+        async with httpx.AsyncClient(timeout=30) as client:
+            if body.combination.get("image"):
+                image_hash = await _upload_image_to_meta(
+                    client, access_token, ad_account_id, body.combination["image"]
+                )
+            platform_ad_id = await _clone_dynamic_to_static_ad(
+                client=client,
+                access_token=access_token,
+                ad_account_id=ad_account_id,
+                adset_id=adset_id,
+                source_ad_id=body.seed_ad_id,
+                components=body.combination,
+                suggestion_id=0,
+                image_hash=image_hash,
+                ad_name=body.name,
+            )
+
+    elif body.platform == "google":
+        access_token, customer_id, login_customer_id = await _google_creds(user_id)
+        platform_ad_id = await _create_google_rsa_ad(
+            user_id=user_id,
+            seed_ad_id=body.seed_ad_id,
+            bo_combination=body.combination,
+            customer_id=customer_id,
+            access_token=access_token,
+            login_customer_id=login_customer_id,
+            ad_name=body.name,
+        )
+    else:
+        raise HTTPException(400, f"Unsupported platform: {body.platform}")
+
+    # For Google, extract the numeric ad ID from the resource name
+    # (e.g. "customers/123/adGroupAds/456" → "456") for clone detection during ingest.
+    numeric_id = str(platform_ad_id).split("/")[-1] if body.platform == "google" else platform_ad_id
+
+    db = get_db()
+    db.execute(
+        """
+        INSERT OR REPLACE INTO pushed_ad_combos
+            (user_id, platform, seed_ad_id, ad_name, combination_key, combination,
+             platform_ad_id, platform_ad_numeric_id, push_status, pushed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'paused', datetime('now'))
+        """,
+        (user_id, body.platform, body.seed_ad_id, body.name,
+         body.combination_key, json.dumps(body.combination), platform_ad_id, numeric_id),
+    )
+    db.commit()
+    db.close()
+
+    logger.info("push/pick: platform=%s seed=%s ad_id=%s name=%s",
+                body.platform, body.seed_ad_id, platform_ad_id, body.name)
+    return PushPickResponse(platform_ad_id=platform_ad_id, ad_name=body.name)
+
+
+# ── Activate a pushed clone ───────────────────────────────────────────────────
+
+class ActivateRequest(BaseModel):
+    platform: str
+    platform_ad_id: str
+
+
+@app.post("/api/activate")
+async def activate_ad(body: ActivateRequest, user_id: int = Depends(get_current_user_id)):
+    """Enable a PAUSED pushed clone on the platform."""
+    if body.platform == "meta":
+        access_token, ad_account_id = _meta_creds(user_id)
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{META_GRAPH}/{body.platform_ad_id}",
+                data={"status": "ACTIVE", "access_token": access_token},
+            )
+        if resp.status_code != 200:
+            raise HTTPException(502, f"Meta activate failed: {resp.text}")
+
+    elif body.platform == "google":
+        access_token, customer_id, login_customer_id = await _google_creds(user_id)
+        api_version = os.getenv("GOOGLE_ADS_API_VERSION", "")
+        developer_token = os.getenv("GOOGLE_DEVELOPER_TOKEN", "")
+        url = f"{os.getenv('GOOGLE_ADS_BASE_URL', 'https://googleads.googleapis.com')}/{api_version}/customers/{customer_id}:mutate"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "developer-token": developer_token,
+            "Content-Type": "application/json",
+        }
+        if login_customer_id:
+            headers["login-customer-id"] = login_customer_id
+        mutate_body = {
+            "mutateOperations": [{
+                "adGroupAdOperation": {
+                    "update": {
+                        "resourceName": body.platform_ad_id,
+                        "status": "ENABLED",
+                    },
+                    "updateMask": "status",
+                }
+            }]
+        }
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(url, json=mutate_body, headers=headers)
+        if resp.status_code != 200:
+            raise HTTPException(502, f"Google activate failed: {resp.text}")
+    else:
+        raise HTTPException(400, f"Unsupported platform: {body.platform}")
+
+    db = get_db()
+    db.execute(
+        "UPDATE pushed_ad_combos SET push_status = 'active' "
+        "WHERE user_id = ? AND platform = ? AND platform_ad_id = ?",
+        (user_id, body.platform, body.platform_ad_id),
+    )
+    db.commit()
+    db.close()
+    return {"status": "active", "platform_ad_id": body.platform_ad_id}
+
+
 # ── Ad text generation routes ─────────────────────────────────────────────────
 
 class GeneratedAdSlot(BaseModel):
@@ -2590,6 +3347,19 @@ async def generate_text_ads(
     )
 
     slots = get_generated_ad(generated_ad_id)
+
+    # Fire embed_all_combinations under the seed ad's ID so BO automatically
+    # sees both original ingested combinations AND these new generated variants
+    # as one expanded candidate pool (idempotent — existing combos are skipped).
+    _gen_components = [
+        {"slot": s["slot"], "slot_index": s["slot_index"], "value": s["value"]}
+        for s in slots
+        if s.get("source") == "generated"
+    ]
+    _merged_meta = seed_components + _gen_components
+    from ad_combination_embeddings.pipeline import embed_all_combinations as _embed_combos
+    asyncio.create_task(_embed_combos(source_id=seed_ad_id, components=_merged_meta))
+
     return GenerateTextResponse(
         generated_ad_id=generated_ad_id,
         source_ad_id=seed_ad_id,
@@ -2653,6 +3423,24 @@ async def generate_google_text_ads(
     )
 
     slots = get_generated_ad(generated_ad_id)
+
+    # Fire embed_all_combinations under the seed ad's ID (Google RSA slots only)
+    # so BO sees ingested + generated variants as one expanded candidate pool.
+    _gen_components_g = [
+        {"slot": s["slot"], "slot_index": s["slot_index"], "value": s["value"]}
+        for s in slots
+        if s.get("source") == "generated"
+    ]
+    _merged_google = seed_components + _gen_components_g
+    from ad_combination_embeddings.pipeline import embed_all_combinations as _embed_combos_g
+    asyncio.create_task(
+        _embed_combos_g(
+            source_id=seed_ad_id,
+            components=_merged_google,
+            slots=("headline", "description"),
+        )
+    )
+
     return GenerateTextResponse(
         generated_ad_id=generated_ad_id,
         source_ad_id=seed_ad_id,

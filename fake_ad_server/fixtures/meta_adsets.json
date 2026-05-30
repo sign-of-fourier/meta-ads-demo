@@ -1,0 +1,50 @@
+{
+  "120210001": [
+    {
+      "id": "120211001",
+      "name": "Prospecting — Lookalike 1%",
+      "status": "ACTIVE",
+      "campaign_id": "120210001",
+      "targeting": {
+        "publisher_platforms": ["facebook", "instagram"],
+        "facebook_positions": ["feed", "story"],
+        "instagram_positions": ["stream", "story"]
+      }
+    },
+    {
+      "id": "120211002",
+      "name": "Prospecting — Interest Targeting",
+      "status": "ACTIVE",
+      "campaign_id": "120210001",
+      "targeting": {
+        "publisher_platforms": ["facebook"],
+        "facebook_positions": ["feed", "marketplace"]
+      }
+    }
+  ],
+  "120210002": [
+    {
+      "id": "120211003",
+      "name": "Retargeting — 14-Day Cart",
+      "status": "ACTIVE",
+      "campaign_id": "120210002",
+      "targeting": {
+        "publisher_platforms": ["facebook", "instagram"],
+        "facebook_positions": ["feed"],
+        "instagram_positions": ["stream", "explore"]
+      }
+    }
+  ],
+  "120210003": [
+    {
+      "id": "120211004",
+      "name": "Brand — Broad Reach",
+      "status": "PAUSED",
+      "campaign_id": "120210003",
+      "targeting": {
+        "publisher_platforms": ["facebook", "instagram", "audience_network"],
+        "facebook_positions": ["feed", "right_hand_column", "story"]
+      }
+    }
+  ]
+}

@@ -469,9 +469,7 @@ def test_bo_run_does_not_call_google_creds(client, user_token, tmp_db):
     forbidden = AsyncMock(side_effect=AssertionError("_google_creds must not be called"))
 
     with patch("main._google_creds", new=forbidden), \
-         patch("bo_pipeline.pipeline.run_bo", return_value=[]), \
-         patch("bo_pipeline.selector.get_scored_combinations", return_value=[]), \
-         patch("bo_pipeline.selector.get_candidate_combinations", return_value=[]):
+         patch("bo_pipeline.pipeline.run_bo", return_value=([], None, 0, 0)):
         resp = client.post(
             "/api/google/bo/run",
             json={"seed_ad_id": "g_ad_1", "text_source_id": "g_ad_1"},

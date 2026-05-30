@@ -1,0 +1,138 @@
+{
+  "9876543210": [
+    {
+      "adGroupAd": {
+        "ad": {
+          "id": "7654321000",
+          "name": "Brand RSA \u2014 Primary",
+          "type": "RESPONSIVE_SEARCH_AD",
+          "finalUrls": [
+            "https://example-store.com/brand"
+          ],
+          "responsiveSearchAd": {
+            "headlines": [
+              {
+                "text": "Shop the Best Deals Online"
+              },
+              {
+                "text": "Save Big Today"
+              },
+              {
+                "text": "Top-Rated Products"
+              },
+              {
+                "text": "Free Shipping on Orders"
+              },
+              {
+                "text": "Limited Time Offer"
+              },
+              {
+                "text": "Official Store \u2014 Shop Now"
+              }
+            ],
+            "descriptions": [
+              {
+                "text": "Explore our full catalog of premium products at unbeatable prices."
+              },
+              {
+                "text": "Fast delivery, easy returns, and 24/7 customer support available."
+              }
+            ]
+          }
+        },
+        "status": "ENABLED"
+      },
+      "adGroup": {
+        "id": "8765432100"
+      }
+    },
+    {
+      "adGroupAd": {
+        "ad": {
+          "id": "7654321001",
+          "name": "Brand RSA \u2014 Seasonal",
+          "type": "RESPONSIVE_SEARCH_AD",
+          "finalUrls": [
+            "https://example-store.com/summer"
+          ],
+          "responsiveSearchAd": {
+            "headlines": [
+              {
+                "text": "Summer Sale Is Here"
+              },
+              {
+                "text": "Up to 50% Off Now"
+              },
+              {
+                "text": "Shop Summer 2026"
+              },
+              {
+                "text": "New Season, New Deals"
+              },
+              {
+                "text": "Clearance Sale \u2014 Ends Soon"
+              }
+            ],
+            "descriptions": [
+              {
+                "text": "Stock up on summer essentials before they sell out."
+              },
+              {
+                "text": "Members get exclusive early access to sale prices."
+              }
+            ]
+          }
+        },
+        "status": "ENABLED"
+      },
+      "adGroup": {
+        "id": "8765432101"
+      }
+    }
+  ],
+  "9876543211": [
+    {
+      "adGroupAd": {
+        "ad": {
+          "id": "7654321002",
+          "name": "Display RDA \u2014 Prospecting",
+          "type": "RESPONSIVE_DISPLAY_AD",
+          "finalUrls": [
+            "https://example-store.com/display-landing"
+          ],
+          "responsiveDisplayAd": {
+            "headlines": [
+              {
+                "text": "Amazing Products Await"
+              },
+              {
+                "text": "Shop Now and Save"
+              }
+            ],
+            "descriptions": [
+              {
+                "text": "Discover our seasonal collection with new arrivals weekly."
+              },
+              {
+                "text": "Join over 2 million satisfied customers worldwide."
+              }
+            ],
+            "marketingImages": [
+              {
+                "asset": "customers/fake/assets/img_display_001"
+              },
+              {
+                "asset": "customers/fake/assets/img_display_002"
+              }
+            ]
+          }
+        },
+        "status": "ENABLED"
+      },
+      "adGroup": {
+        "id": "8765432102"
+      }
+    }
+  ],
+  "9876543212": []
+}

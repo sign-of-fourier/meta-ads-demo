@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import BOPickCard from "../components/BOPickCard.jsx";
 import {
   getCampaigns,
   pauseCampaign,
@@ -15,6 +16,7 @@ import {
   generateTextAds,
   startDynamicGeneration,
   getDynamicGenStatus,
+  seedScoredVariants,
 } from "../api.js";
 import { useUser } from "../UserContext.js";
 
@@ -228,15 +230,18 @@ function StructurePanel({ data, onDismiss, onConfirmSuggestion, confirmingId, se
   );
 }
 
-export default function CampaignsPage() {
+export default function CampaignsPage({ onIngest = null, batchedAdIds = [] }) {
   const { tier } = useUser();
   const [campaigns, setCampaigns] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [actionLoading, setActionLoading] = useState({});
+
+  // expandedId controls the single unified detail row per campaign
   const [expandedId, setExpandedId] = useState(null);
   const [history, setHistory] = useState([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+
   // boStateById[campaignId] = null | "loading" | { picks, scored_count, candidate_count } | { error }
   const [boStateById, setBoStateById] = useState({});
   // genStateById[campaignId] = null | "loading" | { generated_ad_id, source_ad_id, slots } | { error }
@@ -248,7 +253,7 @@ export default function CampaignsPage() {
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState(null);
   const [lastSynced, setLastSynced] = useState(() => localStorage.getItem(LAST_SYNCED_KEY));
-  const [pushResult, setPushResult] = useState(null); // { pushed, failed } | null
+  const [pushResult, setPushResult] = useState(null);
 
   // Persisted set of campaign IDs whose creative structure has been ingested
   const [ingestedIds, setIngestedIds] = useState(loadIngestedIds);
@@ -257,10 +262,10 @@ export default function CampaignsPage() {
   // structureById[campaignId] = null | "loading" | { summary, ads, suggestions } | { error }
   const [structureById, setStructureById] = useState({});
   const [confirmingId, setConfirmingId] = useState(null);
-  // selectedSeedAdById[campaignId] = ad_id string | undefined (undefined = use first)
   const [selectedSeedAdById, setSelectedSeedAdById] = useState({});
-  // savingSuggestionKey[campaignId+"-"+pickIndex] = true when saving
   const [savingSuggestionKey, setSavingSuggestionKey] = useState({});
+  // seedStateById[id] = { n, loading, seeded, error }
+  const [seedStateById, setSeedStateById] = useState({});
 
   useEffect(() => {
     getCampaigns()
@@ -268,6 +273,27 @@ export default function CampaignsPage() {
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
   }, []);
+
+  // On mount, silently reload stored structure for any previously-ingested campaigns
+  // so getSeedAdId() works without requiring a manual Reingest click.
+  useEffect(() => {
+    if (campaigns.length === 0) return;
+    const toReload = campaigns.filter((c) => ingestedIds.has(c.id));
+    if (toReload.length === 0) return;
+    toReload.forEach(async (c) => {
+      try {
+        const [ads, suggestions] = await Promise.all([
+          getCampaignStructure(c.id),
+          getCampaignSuggestions(c.id),
+        ]);
+        if (ads?.length > 0) {
+          setStructureById((prev) => ({ ...prev, [c.id]: { ads, suggestions } }));
+        }
+      } catch {
+        // silently ignore — user can still click Reingest manually
+      }
+    });
+  }, [campaigns]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Poll dynamic generation jobs while any are running
   useEffect(() => {
@@ -290,12 +316,30 @@ export default function CampaignsPage() {
     return () => clearInterval(id);
   }, [dynJobById]);
 
+  // ── Load history for a campaign (shared by toggle and auto-expand) ──────────
+  function loadHistory(campaignId) {
+    setHistoryLoading(true);
+    getCampaignHistory(campaignId, 30)
+      .then(setHistory)
+      .catch(() => setHistory([]))
+      .finally(() => setHistoryLoading(false));
+  }
+
+  // ── Toggle the detail row (name click) ─────────────────────────────────────
+  function toggleExpanded(campaignId) {
+    if (expandedId === campaignId) {
+      setExpandedId(null);
+      return;
+    }
+    setExpandedId(campaignId);
+    loadHistory(campaignId);
+  }
+
   async function handleSyncCampaigns() {
     setSyncError(null);
     setPushResult(null);
     setSyncing(true);
     try {
-      // Push generated ads first (best-effort — never blocks the pull)
       let pushSummary = null;
       try {
         pushSummary = await pushGeneratedAds();
@@ -338,25 +382,16 @@ export default function CampaignsPage() {
     }
   }
 
-  async function toggleHistory(campaignId) {
-    if (expandedId === campaignId) {
-      setExpandedId(null);
-      return;
-    }
-    setExpandedId(campaignId);
-    setHistoryLoading(true);
-    try {
-      const data = await getCampaignHistory(campaignId, 30);
-      setHistory(data);
-    } catch {
-      setHistory([]);
-    } finally {
-      setHistoryLoading(false);
-    }
-  }
-
+  // ── Ingest: reads creative structure, then auto-expands the detail row ──────
   async function handleIngestStructure(campaignId) {
     setStructureById((prev) => ({ ...prev, [campaignId]: "loading" }));
+
+    // Auto-expand and start loading history concurrently
+    if (expandedId !== campaignId) {
+      setExpandedId(campaignId);
+      loadHistory(campaignId);
+    }
+
     try {
       const summary = await ingestCampaignStructure(campaignId);
       const [ads, suggestions] = await Promise.all([
@@ -370,6 +405,7 @@ export default function CampaignsPage() {
         saveIngestedIds(next);
         return next;
       });
+
     } catch (err) {
       setStructureById((prev) => ({ ...prev, [campaignId]: { error: err.message } }));
     }
@@ -415,6 +451,19 @@ export default function CampaignsPage() {
     }
   }
 
+  async function handleSeedTestData(campaignId) {
+    const seedAdId = getSeedAdId(campaignId);
+    if (!seedAdId) return;
+    const n = seedStateById[campaignId]?.n ?? 5;
+    setSeedStateById(prev => ({ ...prev, [campaignId]: { ...prev[campaignId], loading: true, seeded: null, error: null } }));
+    try {
+      const result = await seedScoredVariants(seedAdId, "meta", n, seedAdId);
+      setSeedStateById(prev => ({ ...prev, [campaignId]: { ...prev[campaignId], loading: false, seeded: result.seeded, warning: result.warning } }));
+    } catch (err) {
+      setSeedStateById(prev => ({ ...prev, [campaignId]: { ...prev[campaignId], loading: false, error: err.message } }));
+    }
+  }
+
   async function handleSaveAsSuggestion(campaignId, pick, pickIndex) {
     const key = `${campaignId}-${pickIndex}`;
     setSavingSuggestionKey((prev) => ({ ...prev, [key]: true }));
@@ -437,7 +486,6 @@ export default function CampaignsPage() {
         components,
       });
 
-      // Refresh suggestions in structure panel
       const suggestions = await getCampaignSuggestions(campaignId);
       setStructureById((prev) => {
         const current = prev[campaignId];
@@ -495,25 +543,18 @@ export default function CampaignsPage() {
 
   return (
     <div className="campaigns-page">
-      <div className="page-hint-banner">
-        <p style={{ margin: "0 0 0.4rem", fontWeight: 600, color: "#333" }}>How to use this page</p>
-        <ol style={{ margin: 0, paddingLeft: "1.4rem", lineHeight: 1.9, fontSize: "0.88rem" }}>
-          <li>Click <strong>Sync</strong> (top right) to load your latest campaigns and metrics</li>
-          <li>Click <strong>Ingest</strong> on any campaign row to read its ad creatives</li>
-          <li>Click the <strong>campaign name</strong> to open it and reveal the action buttons</li>
-          <li>Click <strong>Get Recommendations</strong> — the AI suggests the best headline, copy, and image combinations to test next</li>
-          <li>Optionally click <strong>Static Text Ads</strong> or <strong>Dynamic Ad (AI Images)</strong> to generate new variants first</li>
-          <li>Click <strong>Sync</strong> again to push any generated ads to Meta as new paused ads</li>
-        </ol>
-      </div>
-
       <div className="campaigns-header">
         <h2>Campaigns</h2>
         <div className="sync-controls">
           {lastSynced && (
             <span className="sync-timestamp">Last synced: {lastSynced}</span>
           )}
-          <button className="btn-primary" onClick={handleSyncCampaigns} disabled={syncing} title="Push generated ads to Meta, then pull latest campaigns">
+          <button
+            className="btn-primary"
+            onClick={handleSyncCampaigns}
+            disabled={syncing}
+            title="Pull latest campaigns from Meta; also pushes any generated ads"
+          >
             {syncing ? "Syncing…" : "Sync"}
           </button>
         </div>
@@ -552,12 +593,13 @@ export default function CampaignsPage() {
           <tbody>
             {campaigns.map((c) => (
               <>
+                {/* ── Main row ────────────────────────────────────────────── */}
                 <tr key={c.id}>
                   <td>
                     <button
                       className="btn-link campaign-name"
-                      onClick={() => toggleHistory(c.id)}
-                      title="Show metric history"
+                      onClick={() => toggleExpanded(c.id)}
+                      title="Show metric history and recommendations"
                     >
                       {c.name}
                     </button>
@@ -580,23 +622,17 @@ export default function CampaignsPage() {
                       <button
                         onClick={() => handleToggle(c)}
                         disabled={!!actionLoading[c.id]}
-                        className={
-                          c.status === "ACTIVE" ? "btn-warn" : "btn-success"
-                        }
+                        className={c.status === "ACTIVE" ? "btn-warn" : "btn-success"}
                         title={c.status === "ACTIVE" ? "Pause this campaign in Meta" : "Resume this campaign in Meta"}
                       >
-                        {actionLoading[c.id]
-                          ? "..."
-                          : c.status === "ACTIVE"
-                            ? "Pause"
-                            : "Resume"}
+                        {actionLoading[c.id] ? "..." : c.status === "ACTIVE" ? "Pause" : "Resume"}
                       </button>
                     )}
                     <button
                       className="btn-creatives"
                       onClick={() => handleIngestStructure(c.id)}
                       disabled={structureById[c.id] === "loading"}
-                      title={ingestedIds.has(c.id) ? "Re-ingest creative structure" : "Ingest creative structure"}
+                      title={ingestedIds.has(c.id) ? "Re-read this campaign's ad creatives from Meta" : "Read this campaign's ad creatives"}
                     >
                       {structureById[c.id] === "loading"
                         ? "…"
@@ -607,65 +643,33 @@ export default function CampaignsPage() {
                   </td>
                 </tr>
 
-                {structureById[c.id] && structureById[c.id] !== "loading" && (
-                  <tr key={`${c.id}-structure`} className="history-row">
-                    <td colSpan={9}>
-                      <StructurePanel
-                        data={structureById[c.id]}
-                        onDismiss={() =>
-                          setStructureById((prev) => ({ ...prev, [c.id]: null }))
-                        }
-                        onConfirmSuggestion={(suggestionId) =>
-                          handleConfirmSuggestion(c.id, suggestionId)
-                        }
-                        confirmingId={confirmingId}
-                        selectedSeedAdId={selectedSeedAdById[c.id]}
-                        onSelectSeed={(adId) =>
-                          setSelectedSeedAdById((prev) => ({ ...prev, [c.id]: adId }))
-                        }
-                      />
-                    </td>
-                  </tr>
-                )}
-
+                {/* ── Unified detail row (opens on name click OR after Ingest) ── */}
                 {expandedId === c.id && (
-                  <tr key={`${c.id}-history`} className="history-row">
+                  <tr key={`${c.id}-detail`} className="history-row">
                     <td colSpan={9}>
-                      {historyLoading ? (
-                        <p className="history-loading">Loading history...</p>
-                      ) : history.length === 0 ? (
-                        <p className="history-empty">
-                          No stored snapshots yet. Use "Sync" to save snapshots.
-                        </p>
-                      ) : (
-                        <table className="history-table">
-                          <thead>
-                            <tr>
-                              <th>Date</th>
-                              <th>Impressions</th>
-                              <th>Clicks</th>
-                              <th>Spend</th>
-                              <th>CTR</th>
-                              <th>CPM</th>
-                              <th>CPC</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {history.map((h) => (
-                              <tr key={h.date}>
-                                <td>{h.date}</td>
-                                <td>{fmtInt(h.impressions)}</td>
-                                <td>{fmtInt(h.clicks)}</td>
-                                <td>{fmt(h.spend, "$")}</td>
-                                <td>{fmt(h.ctr, "", "%")}</td>
-                                <td>{fmt(h.cpm, "$")}</td>
-                                <td>{fmt(h.cpc, "$")}</td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
+
+                      {/* 1. Creative structure */}
+                      {structureById[c.id] === "loading" && (
+                        <p className="history-loading">Loading creative structure…</p>
+                      )}
+                      {structureById[c.id] && structureById[c.id] !== "loading" && (
+                        <StructurePanel
+                          data={structureById[c.id]}
+                          onDismiss={() =>
+                            setStructureById((prev) => ({ ...prev, [c.id]: null }))
+                          }
+                          onConfirmSuggestion={(suggestionId) =>
+                            handleConfirmSuggestion(c.id, suggestionId)
+                          }
+                          confirmingId={confirmingId}
+                          selectedSeedAdId={selectedSeedAdById[c.id]}
+                          onSelectSeed={(adId) =>
+                            setSelectedSeedAdById((prev) => ({ ...prev, [c.id]: adId }))
+                          }
+                        />
                       )}
 
+                      {/* 2. Recommendations — shown once ingested */}
                       {ingestedIds.has(c.id) && (
                         <div className="recommendations-section">
                           <div className="recommendations-header">
@@ -673,7 +677,7 @@ export default function CampaignsPage() {
                               className="btn-primary"
                               onClick={() => handleGetRecommendations(c.id)}
                               disabled={boStateById[c.id] === "loading"}
-                              title="Uses Bayesian Optimisation to suggest the best headline, copy, and image combinations to test next"
+                              title="Bayesian Optimisation: suggests the best headline, copy, and image combinations to test next"
                             >
                               {boStateById[c.id] === "loading" ? "Running…" : "Get Recommendations"}
                             </button>
@@ -681,7 +685,7 @@ export default function CampaignsPage() {
                               className="btn-secondary"
                               onClick={() => handleGenerateTextAds(c.id)}
                               disabled={genStateById[c.id] === "loading"}
-                              title="Generate 10 new text variants per slot (headline, primary text, description, CTA) using AI — no new images"
+                              title="Generate 10 new text variants per slot (headline, primary text, description, CTA)"
                             >
                               {genStateById[c.id] === "loading" ? "Generating…" : "Static Text Ads"}
                             </button>
@@ -689,12 +693,60 @@ export default function CampaignsPage() {
                               className="btn-secondary btn-dynamic"
                               onClick={() => handleGenerateDynamic(c.id)}
                               disabled={dynJobById[c.id]?.status === "running"}
-                              title="Generate AI images plus 4 text variants per slot and build a new dynamic ad — every combination is scored"
+                              title="Generate AI images + 4 text variants per slot — every combination is scored"
                             >
                               {dynJobById[c.id]?.status === "running"
                                 ? "Generating…"
                                 : "Dynamic Ad (AI Images)"}
                             </button>
+                            {onIngest && (() => {
+                              const seedAdId = getSeedAdId(c.id);
+                              if (!seedAdId) return null;
+                              const inBatch = batchedAdIds.includes(seedAdId);
+                              return (
+                                <button
+                                  className={inBatch ? "btn-batch-active" : "btn-batch"}
+                                  onClick={() => onIngest({ platform: "meta", seed_ad_id: seedAdId, text_source_id: seedAdId, label: c.name })}
+                                  title={inBatch ? "Remove from cross-platform analysis batch" : "Add to cross-platform analysis batch"}
+                                >
+                                  {inBatch ? "In Batch ✓" : "Add to Analysis"}
+                                </button>
+                              );
+                            })()}
+                          </div>
+
+                          {/* Seed test data */}
+                          <div className="seed-controls">
+                            <span className="seed-controls-label">Seed test data:</span>
+                            <input
+                              type="number"
+                              min={1} max={50}
+                              value={seedStateById[c.id]?.n ?? 5}
+                              onChange={e => setSeedStateById(prev => ({
+                                ...prev,
+                                [c.id]: { ...prev[c.id], n: Math.max(1, Math.min(50, parseInt(e.target.value) || 1)) },
+                              }))}
+                              className="seed-n-input"
+                              title="Number of fake scored variants to seed"
+                            />
+                            <span className="seed-controls-unit">variants</span>
+                            <button
+                              className="btn-small"
+                              onClick={() => handleSeedTestData(c.id)}
+                              disabled={seedStateById[c.id]?.loading || !getSeedAdId(c.id)}
+                              title="Seed fake scored observations so Get Recommendations has training data"
+                            >
+                              {seedStateById[c.id]?.loading ? "Seeding…" : "Seed"}
+                            </button>
+                            {seedStateById[c.id]?.seeded != null && (
+                              <span className="seed-success">✓ {seedStateById[c.id].seeded} seeded</span>
+                            )}
+                            {seedStateById[c.id]?.warning && (
+                              <span className="seed-warning">{seedStateById[c.id].warning}</span>
+                            )}
+                            {seedStateById[c.id]?.error && (
+                              <span className="error-inline">{seedStateById[c.id].error}</span>
+                            )}
                           </div>
 
                           {/* Static text generation results */}
@@ -748,15 +800,13 @@ export default function CampaignsPage() {
                                 structures · embeddings firing in background
                               </p>
 
-                              {/* Image generation warning */}
                               {dynJobById[c.id].images_generated === 0 && (
                                 <p className="dyn-warning">
                                   Image generation failed (DEAPI_API_KEY not configured) — showing
-                                  seed image(s) as placeholder. Add the key and regenerate for AI images.
+                                  seed image(s) as placeholder.
                                 </p>
                               )}
 
-                              {/* Image grid */}
                               {dynJobById[c.id].image_urls?.length > 0 && (
                                 <div className="dyn-image-grid">
                                   {dynJobById[c.id].image_urls.map((url, i) => (
@@ -770,7 +820,6 @@ export default function CampaignsPage() {
                                 </div>
                               )}
 
-                              {/* Text slots */}
                               {["headline", "primary_text", "description", "cta"].map((slotName) => {
                                 const slotItems = dynJobById[c.id].slots?.filter(
                                   (s) => s.slot === slotName
@@ -790,19 +839,21 @@ export default function CampaignsPage() {
                             </div>
                           )}
 
+                          {/* BO results */}
                           {boStateById[c.id]?.error && (
                             <p className="error">{boStateById[c.id].error}</p>
                           )}
 
                           {boStateById[c.id]?.picks && (
                             <div className="bo-results">
+                              {boStateById[c.id].warning && (
+                                <p className="dyn-warning">{boStateById[c.id].warning}</p>
+                              )}
                               <p className="bo-meta">
-                                Based on <strong>{boStateById[c.id].scored_count}</strong> scored
-                                variant{boStateById[c.id].scored_count !== 1 ? "s" : ""} across{" "}
-                                <strong>{boStateById[c.id].candidate_count}</strong> candidate
-                                combination{boStateById[c.id].candidate_count !== 1 ? "s" : ""}
-                                {boStateById[c.id].seedAdId && (
-                                  <> · seed <code>{boStateById[c.id].seedAdId}</code></>
+                                <strong>{boStateById[c.id].scored_count}</strong> scored variant{boStateById[c.id].scored_count !== 1 ? "s" : ""} ·{" "}
+                                <strong>{boStateById[c.id].candidate_count}</strong> candidate{boStateById[c.id].candidate_count !== 1 ? "s" : ""}
+                                {boStateById[c.id].scored_count === 0 && (
+                                  <span className="stat-random-note"> — no scored data yet, picks are random. Run Dynamic Ad (AI Images) first to generate scored variants.</span>
                                 )}
                               </p>
                               {boStateById[c.id].picks.length === 0 ? (
@@ -810,57 +861,32 @@ export default function CampaignsPage() {
                                   Not enough scored data yet — generate a Dynamic Ad first, then run BO again.
                                 </p>
                               ) : (
-                                boStateById[c.id].picks.map((pick, i) => {
-                                  const saveKey = `${c.id}-${i}`;
-                                  const isSaving = !!savingSuggestionKey[saveKey];
-                                  return (
-                                    <div key={i} className="bo-pick">
-                                      <div className="bo-pick-header">
-                                        <span className="bo-pick-label">
-                                          Recommendation {i + 1}
-                                        </span>
-                                        <span className="bo-pick-type">{pick.selection_type === "ei" ? "Best expected" : "Exploratory"}</span>
-                                        <button
-                                          className="btn-success btn-save-suggestion"
-                                          onClick={() => handleSaveAsSuggestion(c.id, pick, i)}
-                                          disabled={isSaving}
-                                          title="Save this recommendation as a suggestion you can confirm-create in Meta"
-                                        >
-                                          {isSaving ? "Saving…" : "Save as Suggestion"}
-                                        </button>
-                                      </div>
-                                      {pick.combination.image_url && (
-                                        <PlacementPreview
-                                          imageUrl={pick.combination.image_url}
-                                          imageWidth={pick.combination.image_width}
-                                          imageHeight={pick.combination.image_height}
-                                          placements={pick.placements}
-                                        />
-                                      )}
-                                      <dl className="slot-list">
-                                        {Object.entries(pick.combination)
-                                          .filter(([k]) => !["image_url", "image_width", "image_height"].includes(k))
-                                          .map(([k, v]) => (
-                                            <div key={k} className="slot-row">
-                                              <dt>{SLOT_LABELS[k] ?? k}</dt>
-                                              <dd><span className="slot-value">{v || <em>—</em>}</span></dd>
-                                            </div>
-                                          ))}
-                                      </dl>
-                                      {pick.gpr_mean != null && (
-                                        <p className="bo-pick-score">
-                                          Predicted score: <strong>{pick.gpr_mean.toFixed(2)}</strong>
-                                          {pick.ei_score != null && (
-                                            <> &nbsp;·&nbsp; EI: {pick.ei_score.toFixed(4)}</>
-                                          )}
-                                        </p>
-                                      )}
-                                    </div>
-                                  );
-                                })
+                                boStateById[c.id].picks.map((pick, i) => (
+                                  <BOPickCard
+                                    key={pick.combination_key}
+                                    pick={pick}
+                                    index={i}
+                                    platform="meta"
+                                    seedAdId={boStateById[c.id].seedAdId || getSeedAdId(c.id)}
+                                    campaignName={c.name}
+                                    onPushed={(p, platformAdId, adName) => {
+                                      // Optimistically update the pick in state
+                                      setBoStateById(prev => ({
+                                        ...prev,
+                                        [c.id]: {
+                                          ...prev[c.id],
+                                          picks: prev[c.id].picks.map(pk =>
+                                            pk.combination_key === p.combination_key
+                                              ? { ...pk, already_pushed: true, push_status: "paused", ad_name: adName, platform_ad_id: platformAdId }
+                                              : pk
+                                          ),
+                                        },
+                                      }));
+                                    }}
+                                  />
+                                ))
                               )}
 
-                              {/* Saved suggestions from this campaign */}
                               {structureById[c.id]?.suggestions?.length > 0 && (
                                 <div className="bo-saved-suggestions">
                                   <h5 className="bo-saved-suggestions-heading">Saved Suggestions</h5>
@@ -874,13 +900,53 @@ export default function CampaignsPage() {
 
                           {tier === "free" && (
                             <p className="upsell-note">
-                              Premium plan includes continuous improvement. AdStac.kr will
+                              Premium plan includes continuous improvement. Adstac.kr will
                               automatically check your stats and periodically create new ads
                               and make new suggestions.
                             </p>
                           )}
                         </div>
                       )}
+
+                      {/* 3. Metric history */}
+                      <div className="campaign-history-section">
+                        <h4 className="campaign-history-heading">Metric History</h4>
+                        {historyLoading ? (
+                          <p className="history-loading">Loading history...</p>
+                        ) : history.length === 0 ? (
+                          <p className="history-empty">
+                            No stored snapshots yet — use Sync to save a snapshot.
+                          </p>
+                        ) : (
+                          <table className="history-table">
+                            <thead>
+                              <tr>
+                                <th>Date</th>
+                                <th>Impressions</th>
+                                <th>Clicks</th>
+                                <th>Spend</th>
+                                <th>CTR</th>
+                                <th>CPM</th>
+                                <th>CPC</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {history.map((h) => (
+                                <tr key={h.date}>
+                                  <td>{h.date}</td>
+                                  <td>{fmtInt(h.impressions)}</td>
+                                  <td>{fmtInt(h.clicks)}</td>
+                                  <td>{fmt(h.spend, "$")}</td>
+                                  <td>{fmt(h.ctr, "", "%")}</td>
+                                  <td>{fmt(h.cpm, "$")}</td>
+                                  <td>{fmt(h.cpc, "$")}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
+                      </div>
+
                     </td>
                   </tr>
                 )}

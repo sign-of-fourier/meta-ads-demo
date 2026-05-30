@@ -36,14 +36,15 @@ python -m pytest tests/test_structural_ingest.py tests/test_suggestions.py \
 | `tests/test_google_campaigns.py` | 9 + 1 skipped | Campaign normalization, metrics, route |
 | `tests/test_google_structural_ingest.py` | 18 | Creative normalization (RSA/display/video/pMax/Shopping), ingest route |
 | `tests/test_google_text_pipeline.py` | 10 | Platform-aware slot filter, RSA text generation route |
-| `tests/test_google_bo.py` | 12 | Combiner NULL-image handling, BO routes |
+| `tests/test_google_bo.py` | 12 + 12 | Combiner NULL-image handling, BO routes; `TestGoogleBOPipeline` — full GPR pipeline (text-only, zero-padded image) |
+| `tests/test_cross_platform_bo.py` | 45 | ECDF normalisation, PCA dim routing, `BOGroup.build_X`, full cross-platform pipeline, FastAPI route shape |
 | `tests/test_google_push.py` | 11 | RSA push route, Mutate API shape, resource name persistence |
 | `tests/test_google_pmax_shopping.py` | 6 | 400 guards for unsupported creative types |
-| `tests/test_google_demo.py` | 26 | Demo provider, masking layer, factory selection |
+| `tests/test_google_demo.py` | 20 + 6 skipped | Demo provider, factory selection; `TestGoogleMaskingProvider` skipped (masking deprecated) |
 | `tests/test_google_login_customer_id.py` | 10 | MCC `login-customer-id` threading through all routes |
 
 ```bash
-python -m pytest tests/test_google_db.py tests/test_google_auth.py tests/test_google_campaigns.py tests/test_google_structural_ingest.py tests/test_google_text_pipeline.py tests/test_google_bo.py tests/test_google_push.py tests/test_google_pmax_shopping.py tests/test_google_demo.py tests/test_google_login_customer_id.py -v
+python -m pytest tests/test_google_db.py tests/test_google_auth.py tests/test_google_campaigns.py tests/test_google_structural_ingest.py tests/test_google_text_pipeline.py tests/test_google_bo.py tests/test_google_push.py tests/test_google_pmax_shopping.py tests/test_google_demo.py tests/test_google_login_customer_id.py tests/test_cross_platform_bo.py -v
 ```
 
 ### API keys required
@@ -62,45 +63,25 @@ python -m pytest tests/test_google_db.py tests/test_google_auth.py tests/test_go
 
 The most informative single test to run. Executes the full BO pipeline and prints a
 human-readable report: scored observations, GPR fit, EI ranking over all candidates,
-pick 1 (EI), pick 2 (fantasy), and a summary row.
+picks, and a summary row.
 
 ```bash
+# Local GPR path (default — no network)
 python -m pytest tests/test_bo_pipeline.py::TestBOPipeline::test_full_bo_report -v -s
-```
 
-Example output:
-```
-============================================================
-  AdStac.kr BO Run — Full Report
-============================================================
-
-Training set  : 5 scored observation(s)
-Candidate pool: 7 unscored combination(s)
-
-Scored observations:
-  [1] score=3.50  combo={'headline': 'Wool Socks', 'primary_text': 'Hand made in Switzerland.'}
-  ...
-
-GPR fit on 5 point(s)  |  best observed score: 5.10
-Optimized kernel: 0.949**2 * RBF(length_scale=1) + WhiteKernel(noise_level=0.099)
-
-PICK 1  [EI]
-  Combination : {'headline': 'Wool Socks', 'primary_text': 'Premium wool since 1952.'}
-  GPR mean    : 4.0600  |  GPR std: 0.8261  |  EI: 0.039983
-
-PICK 2  [FANTASY]
-  Combination : {'headline': 'Warm Feet Forever', 'primary_text': 'Hand made in Switzerland.'}
-  GPR mean    : 4.0600  |  GPR std: 0.7541  |  EI: 0.028118
-
-Summary
-  n_scored=5  n_fit=5  n_candidates=7  best_obs=5.10
+# Modal q-EI path (requires MODAL_BO_API_URL in .env, ~30s)
+BO_TEST_METHOD=modal python -m pytest tests/test_bo_pipeline.py::TestBOPipeline::test_full_bo_report -v -s
 ```
 
 **Note on uniform EI:** the test seeds all embeddings as random vectors, so all
 candidates sit equidistant from the training set in embedding space and share
 identical EI. With real Azure embeddings, semantically similar candidates will
-differentiate. The fantasy step is still exercised correctly — σ drops from
-0.826 → 0.754 on pick 2.
+differentiate. The fantasy step is still exercised correctly — σ drops on pick 2.
+
+**`BO_TEST_METHOD` env var:** controls which BO path the three pipeline test classes
+(`TestBOPipeline`, `TestGoogleBOPipeline`, `TestCrossPlatformBO`) exercise. Defaults
+to `"local"` when unset. Set to `"modal"` to hit the live Modal GP endpoint. Pure
+math tests and route-shape tests are unaffected regardless of this setting.
 
 ---
 
@@ -165,8 +146,8 @@ tasks run in the background. Wait a few seconds, then confirm:
 # Seed embedding per ad — has_text and has_image should both be 'yes' when keys are set
 sqlite3 backend/app.db "SELECT ad_id, text_snapshot, CASE WHEN text_vector IS NULL THEN 'no' ELSE 'yes' END as has_text, CASE WHEN image_vector IS NULL THEN 'no' ELSE 'yes' END as has_image FROM ad_embeddings;"
 
-# Check combined vector dimension (expect 256: TEXT_DIM=128 + IMAGE_DIM=128)
-sqlite3 backend/app.db "SELECT ad_id, LENGTH(combined_vector) / 8 as combined_dim FROM ad_embeddings;"
+# Check combined vector dimension (expect 3072: TEXT_DIM=1536 + IMAGE_DIM=1536, float32 = 4 bytes each)
+sqlite3 backend/app.db "SELECT ad_id, LENGTH(combined_vector) / 4 as combined_dim FROM ad_embeddings;"
 
 # Per-image-slot embeddings
 sqlite3 backend/app.db "SELECT ad_id, slot_index, image_ref, CASE WHEN vector IS NULL THEN 'no' ELSE 'yes' END as embedded FROM ad_image_embeddings;"

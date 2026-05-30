@@ -277,6 +277,93 @@ async def _poll_and_save(vid: int, job_id: int, db_path: Path) -> None:
         update_variant(vid, db_path, status="failed")
 
 
+def _write_qwen_observation(
+    variant_id: int,
+    job: dict,
+    score: float,
+    db_path: Path,
+) -> None:
+    """Write a Qwen2-VL score to scored_observations for BO training."""
+    import sqlite3 as _sqlite3
+    seed_ad_id = job.get("seed_ad_id")
+    user_id = job.get("user_id")
+    job_id = job.get("id")
+    if not seed_ad_id or not user_id or not job_id:
+        return
+
+    conn = _sqlite3.connect(str(db_path))
+    conn.row_factory = _sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        variant_row = conn.execute(
+            "SELECT suggestion FROM ad_generation_variants WHERE id=?", (variant_id,)
+        ).fetchone()
+
+        combo_key = None
+        combo = None
+        text_vec_bytes = None
+
+        # 1. Try suggestion as JSON combination dict
+        if variant_row:
+            try:
+                suggestion_combo = json.loads(variant_row["suggestion"])
+                if isinstance(suggestion_combo, dict) and "headline" in suggestion_combo:
+                    ck = json.dumps(suggestion_combo, sort_keys=True, separators=(",", ":"))
+                    tce = conn.execute(
+                        "SELECT vector FROM ad_text_combination_embeddings WHERE source_id=? AND combination_key=?",
+                        (seed_ad_id, ck),
+                    ).fetchone()
+                    if tce:
+                        combo_key = ck
+                        combo = suggestion_combo
+                        text_vec_bytes = tce["vector"]
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # 2. Fall back to headline + short_text reconstruction
+        if text_vec_bytes is None:
+            for slot_name in ("primary_text", "description"):
+                candidate_combo = {
+                    "headline": job.get("headline", ""),
+                    slot_name: job.get("short_text", ""),
+                }
+                ck = json.dumps(candidate_combo, sort_keys=True, separators=(",", ":"))
+                tce = conn.execute(
+                    "SELECT vector FROM ad_text_combination_embeddings WHERE source_id=? AND combination_key=?",
+                    (seed_ad_id, ck),
+                ).fetchone()
+                if tce:
+                    combo_key = ck
+                    combo = candidate_combo
+                    text_vec_bytes = tce["vector"]
+                    break
+
+        if text_vec_bytes is None:
+            return  # no matching combination embedding — skip silently
+
+        # Image vector for this specific variant
+        emb_ad_id = f"gen_{job_id}_{variant_id}"
+        emb = conn.execute(
+            "SELECT image_vector FROM ad_embeddings WHERE ad_id=? AND user_id=?",
+            (emb_ad_id, user_id),
+        ).fetchone()
+        image_vec_bytes = emb["image_vector"] if emb and emb["image_vector"] else None
+
+        conn.execute(
+            """INSERT OR REPLACE INTO scored_observations
+               (user_id, seed_ad_id, combination_key, combination,
+                score, metric, source, text_vector, image_vector)
+               VALUES (?, ?, ?, ?, ?, 'qwen', 'generation_pipeline', ?, ?)""",
+            (user_id, seed_ad_id, combo_key, json.dumps(combo),
+             score, text_vec_bytes, image_vec_bytes),
+        )
+        conn.commit()
+    except Exception as exc:
+        logger.warning("_write_qwen_observation failed for variant %d: %s", variant_id, exc)
+    finally:
+        conn.close()
+
+
 async def _score(vid: int, job: dict, db_path: Path) -> None:
     variant = _get_variant(vid, job["id"], db_path)
     if variant is None or variant["status"] != "done" or not variant.get("local_filename"):
@@ -295,5 +382,6 @@ async def _score(vid: int, job: dict, db_path: Path) -> None:
             score_labels=json.dumps(result.labels),
         )
         logger.info("job %d variant %d: score=%.3f severity=%s", job["id"], vid, result.score, result.severity)
+        _write_qwen_observation(vid, job, result.score, db_path)
     except Exception as exc:
         logger.warning("job %d variant %d: scoring failed: %s", job["id"], vid, exc)

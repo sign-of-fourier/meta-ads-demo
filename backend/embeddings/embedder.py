@@ -65,7 +65,7 @@ async def embed_image_url(image_url: str) -> np.ndarray | None:
     try:
         import base64
         import httpx
-        async with httpx.AsyncClient(timeout=20) as http:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as http:
             r = await http.get(image_url)
             r.raise_for_status()
         content_type = r.headers.get("content-type", "image/jpeg").split(";")[0].strip()
