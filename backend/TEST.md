@@ -68,8 +68,8 @@ python -m pytest tests/test_bo_pipeline.py -v -k "TestCombineEmbeddings or TestG
 ### `tests/test_modal_bo.py`
 Tests for `bo_pipeline.modal_bo` — PCA helpers, snap logic, and the live Modal GP endpoint.
 
-- `TestModalBOUnit` — `fit_pca` (shape, cap at n_samples/n_features), `project`, `dim_bounds`, `snap_to_pool` (correct indices, dedup, pool exhaustion), env-var reading for `MODAL_BO_API_URL` / `MODAL_BO_PCA_DIMS`. No network calls.
-- `TestModalBOLive` — calls the real Modal GP endpoint with synthetic 256-dim embeddings; verifies response shape, bounds compliance, and end-to-end snap to distinct candidates. Skipped if `MODAL_BO_API_URL` is unset; defaults to the production endpoint if unset but the class is selected directly.
+- `TestModalBOUnit` — `fit_pca` (shape, cap at n_samples/n_features), `project`, `dim_bounds`, env-var reading for `MODAL_BO_API_URL` / `MODAL_BO_PCA_DIMS`; `call_modal_api_multioutput` payload shape (`d`/`d_candidates`/`rho` present and correct, response parsed to index+x). No network calls.
+- `TestModalBOLive` — calls the real Modal GP endpoint; verifies single-output path (response shape, bounds compliance, distinct candidates) and multioutput path (`d`/`d_candidates`/`rho` sent, server branches to `_TorchMultiOutputGP`, returns q candidates in same format). Defaults to the production endpoint when `MODAL_BO_API_URL` is unset.
 
 ```bash
 # Unit tests only (no network)
@@ -277,6 +277,7 @@ Cross-platform Bayesian Optimisation — ECDF normalisation + global EI ranking.
 - `TestBOGroupBuildX` — input matrix construction: Meta uses 3072-dim combined vectors, Google uses 1536-dim text-only, different dims prevent cross-group mixing, `None` image still works, dtype float32
 - `TestCrossPlatformBO` — full end-to-end DB pipeline with both Meta and Google groups seeded: returns list, top-N cap, at least one pick, platform tags, seed_ad_id/text_source_id fields, picks from correct pool, EI scores non-negative, first pick ≥ second by EI, no internal sort keys in result, `top_n=1`/`top_n=4`, random fallback when no scored data, partial fallback when one group has insufficient data, empty pairs returns empty, single Meta pair works, ECDF uses combined score pool
 - `TestCrossPlatformBOEndpoint` — FastAPI route: auth guard, 400 on empty pairs, 200 with mocked pipeline, response shape for picks and group_stats
+- `TestUnifiedBOMultioutput` — `run_unified_cross_platform_bo` with `method="modal_multioutput"`; `call_modal_api_multioutput` patched (no network); covers 2-tuple return, group_stats covers both platforms, required pick fields, picks span Meta and Google, no `_sort_key` leak, `d_train`/`d_cands` contain both platform indices, fallback to shared-PCA on empty response, fallback on exception, `top_n` respected
 
 ```bash
 python -m pytest tests/test_cross_platform_bo.py -v

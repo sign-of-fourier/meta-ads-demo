@@ -55,14 +55,21 @@ def _severity(score: float) -> str:
 
 
 def _image_bytes_from_url(image_url: str) -> bytes:
-    """Decode a data URL or fetch an http URL to raw bytes."""
+    """Decode a data URL, fetch an http URL, or read a local /ad-images/ path from disk."""
     if image_url.startswith("data:"):
-        # data:<mime>;base64,<data>
         _, encoded = image_url.split(",", 1)
         return base64.b64decode(encoded)
-    response = httpx.get(image_url, timeout=30)
-    response.raise_for_status()
-    return response.content
+    if image_url.startswith(("http://", "https://")):
+        response = httpx.get(image_url, timeout=30, follow_redirects=True)
+        response.raise_for_status()
+        return response.content
+    # Local URL path: /ad-images/<filename> → backend/ad_images/<filename>
+    from pathlib import Path
+    name = image_url.lstrip("/")
+    if name.startswith("ad-images/"):
+        name = name[len("ad-images/"):]
+    fs_path = Path(__file__).parent.parent / "ad_images" / name
+    return fs_path.read_bytes()
 
 
 async def score_variant(

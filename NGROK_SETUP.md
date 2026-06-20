@@ -25,17 +25,12 @@ Follow ngrok's quickstart at https://dashboard.ngrok.com/get-started/setup to in
 
 ### Start the tunnel
 
-**Preferred — use `start.sh`** (starts backend + frontend + ngrok together):
-```bash
-./start.sh              # prod: ngrok on port 5173
-./start.sh staging      # staging: ngrok on port 5174
-```
-
-**Manual fallback:**
 ```bash
 ngrok http 5173         # prod
 ngrok http 5174         # staging
 ```
+
+Run `./start.sh` to print a reminder of all ports if you forget which is which.
 Point ngrok at the **Vite port**, not 8000. Vite's proxy handles forwarding to the backend internally — the browser never needs to reach port 8000 directly.
 
 ### AWS VPC / Security Groups

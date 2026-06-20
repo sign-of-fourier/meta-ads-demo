@@ -242,6 +242,50 @@ export async function activatePick({ platform, platformAdId }) {
   });
 }
 
+export async function pauseAd({ platform, platformAdId }) {
+  return request("/api/pause-ad", {
+    method: "POST",
+    body: JSON.stringify({ platform, platform_ad_id: platformAdId }),
+  });
+}
+
+export async function retainPick(comboId) {
+  return request(`/api/push/retain/${comboId}`, { method: "POST" });
+}
+
+export async function pushMatch({ platform, seedAdId, combinationKey, combination, existingAdId }) {
+  return request("/api/push/match", {
+    method: "POST",
+    body: JSON.stringify({
+      platform,
+      seed_ad_id: seedAdId,
+      combination_key: combinationKey,
+      combination,
+      existing_ad_id: existingAdId,
+    }),
+  });
+}
+
+export async function createGenerator(name, members) {
+  return request("/api/generators", {
+    method: "POST",
+    body: JSON.stringify({ name, members }),
+  });
+}
+
+export async function runBOForGenerator(generatorId, platform, targetMetric) {
+  const endpoint = platform === "google" ? "/api/google/bo/run" : "/api/bo/run";
+  return request(endpoint, {
+    method: "POST",
+    body: JSON.stringify({
+      seed_ad_id: generatorId,
+      text_source_id: generatorId,
+      generator_id: generatorId,
+      ...(targetMetric ? { target_metric: targetMetric } : {}),
+    }),
+  });
+}
+
 export async function startDynamicGeneration(campaignId, seedAdId) {
   const qs = seedAdId ? `?seed_ad_id=${encodeURIComponent(seedAdId)}` : "";
   return request(`/api/generate/dynamic/${campaignId}${qs}`, { method: "POST" });
@@ -277,10 +321,14 @@ export async function runCrossPlatformBO(pairs) {
  * topN: number of recommendations to return (default 4)
  * Returns { picks, group_stats }
  */
-export async function runUnifiedCrossPlatformBO(pairs, topN = 4) {
+export async function runUnifiedCrossPlatformBO(pairs, topN = 4, targetMetric = null) {
   return request("/api/bo/cross-platform/unified", {
     method: "POST",
-    body: JSON.stringify({ pairs, top_n: topN }),
+    body: JSON.stringify({
+      pairs,
+      top_n: topN,
+      ...(targetMetric ? { target_metric: targetMetric } : {}),
+    }),
   });
 }
 

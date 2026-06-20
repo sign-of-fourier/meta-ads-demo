@@ -124,9 +124,9 @@ export default function SettingsPage() {
         </p>
       </section>
 
-      <section className="card" style={{ background: "#f8f9ff", border: "1px solid #dde3f5" }}>
-        <p style={{ margin: "0 0 0.5rem", fontWeight: 600, color: "#333" }}>How it works</p>
-        <ol style={{ margin: 0, paddingLeft: "1.4rem", lineHeight: 1.9, color: "#444", fontSize: "0.9rem" }}>
+      <section className="card" style={{ background: "#f0f9ff", border: "1px solid #bae6fd" }}>
+        <p style={{ margin: "0 0 0.5rem", fontWeight: 600, color: "#111827" }}>How it works</p>
+        <ol style={{ margin: 0, paddingLeft: "1.4rem", lineHeight: 1.9, color: "#374151", fontSize: "0.875rem" }}>
           <li>Connect your Meta and/or Google Ads account below</li>
           <li>Go to the <strong>Dashboard</strong> in the nav</li>
           <li>Click <strong>Sync</strong> to load your campaigns</li>

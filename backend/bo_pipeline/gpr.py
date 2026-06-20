@@ -19,7 +19,7 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
 from sklearn.preprocessing import StandardScaler
 
-MIN_TRAINING_POINTS = 2  # below this, fit() is not called (caller should fallback)
+from bo_pipeline.config import MIN_TRAINING_POINTS  # noqa: E402
 
 
 def transform_y(y: np.ndarray) -> np.ndarray:

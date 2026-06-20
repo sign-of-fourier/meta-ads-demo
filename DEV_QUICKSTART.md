@@ -90,7 +90,7 @@ cp .env.example .env   # VITE_API_URL defaults to http://localhost:8000
 
 ## 3 — Services overview
 
-The app has up to five processes. Two are required; the others are optional or pre-deployed.
+The app has up to four processes. Two are required; the others are optional or pre-deployed.
 
 | Process | Required | How to start |
 |---|---|---|
@@ -98,45 +98,25 @@ The app has up to five processes. Two are required; the others are optional or p
 | Frontend (React/Vite) | Yes | `cd frontend && npm run dev` → :5173 |
 | ngrok | Yes for OAuth | `ngrok http 5173` — required so Meta/Google OAuth callbacks reach localhost |
 | Modal GP service | No | Already deployed in the cloud; set `MODAL_BO_API_URL` in `.env`. BO falls back to local sklearn GPR if unset. The Modal app source is not in this repo — deploy once via Modal's CLI if you need to redeploy. |
-| Fake ad server | No | `cd fake_ad_server && uvicorn server:app --port 9000 --reload` — only needed for fake data testing. See `FAKE_ADS_TESTING.md`. |
+| Fake ad server | No | `cd fake_ad_server && uvicorn server:app --port 9000 --reload` — replaces live Meta/Google calls with fixture data. Add `FAST_RAMP=true` for Case 2 (cold-start demo with Qwen-derived CTR). |
 
-### Preferred: start backend + frontend + ngrok together
+### Starting services (tmux sessions — start each separately)
 
-```bash
-./start.sh            # prod: backend :8000, frontend :5173, then ngrok on :5173
-./start.sh staging    # staging: backend :8001, frontend :5174
-```
+Run `./start.sh` (or `./start.sh staging`) to print all commands and ports as a reminder.
 
-`start.sh` warns at startup if fake ad server mode is active (`FAKE_META_BASE_URL` / `FAKE_GOOGLE_BASE_URL` set in `backend/.env`).
+| Service | Prod | Staging | Command |
+|---|---|---|---|
+| backend | :8000 | :8001 | `cd backend && source .venv/bin/activate && python main.py` |
+| frontend | :5173 | :5174 | `cd frontend && npm run dev` |
+| ngrok | — | — | `ngrok http 5173` (or 5174 for staging) |
+| fake ads | :9000 | :9000 | `cd fake_ad_server && uvicorn server:app --port 9000 --reload` |
 
-### Manual: separate terminals
-
-```bash
-# Terminal 1 — Backend (auto-reloads on file save)
-cd backend
-source .venv/bin/activate
-python main.py        # → http://localhost:8000
-
-# Terminal 2 — Frontend
-cd frontend
-npm run dev           # → http://localhost:5173
-
-# Terminal 3 — ngrok tunnel (required for Meta/Google OAuth)
-ngrok http 5173
-# Copy the https://*.ngrok-free.dev URL
-# Update META_REDIRECT_URI, GOOGLE_REDIRECT_URI, and FRONTEND_URL in backend/.env
-# Update allowedHosts in frontend/vite.config.js
-# Restart both servers
-```
-
-See `NGROK_SETUP.md` for the full checklist when the ngrok URL changes.
+See `NGROK_SETUP.md` for the checklist when the ngrok URL changes.
 
 ### Fake ad server (optional — replaces live Meta/Google data calls)
 
 ```bash
-# Terminal 4 (only when testing with fake data)
-cd fake_ad_server
-uvicorn server:app --port 9000 --reload
+cd fake_ad_server && uvicorn server:app --port 9000 --reload
 ```
 
 Then uncomment in `backend/.env`:
@@ -145,9 +125,11 @@ FAKE_META_BASE_URL=http://localhost:9000/meta/v19.0
 FAKE_GOOGLE_BASE_URL=http://localhost:9000/google
 ```
 
-`start.sh` will warn if these are set. OAuth still hits real Google/Meta. See `FAKE_ADS_TESTING.md` for the full walkthrough including BO seeding.
+OAuth still hits real Google/Meta. See `FAKE_ADS_TESTING.md` for the full walkthrough including BO seeding.
 
-**Switching from fake to real mode:** comment out both `FAKE_*` lines and restart the backend. The campaigns list is live API data (not from the DB), so real campaigns appear immediately. Fake rows remain in the DB keyed on fake IDs (`120210001`, `120212001`, etc.) — they are inert since real campaigns use different IDs. Any synthetic BO observations seeded via `seed_bo_synthetic.py` also remain but don't affect real campaigns. To wipe fake data, use the teardown queries in `FAKE_ADS_TESTING.md`.
+`./start.sh` prints a reminder line for any active fake-server vars it detects in `backend/.env`.
+
+**Switching from fake to real mode:** comment out the `FAKE_*` lines and restart the backend. Real campaigns appear immediately (live API). Fake rows remain in the DB keyed on fake IDs (`120210001`, `120212001`, etc.) — they are inert since real campaigns use different IDs.
 
 ---
 

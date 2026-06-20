@@ -9,6 +9,8 @@ export default function UnifiedCampaignsTable({
   onIngest,
   selectedAdIds,
   onToggleAd,
+  pauseWarningByKey = {},
+  staleCampaigns = new Set(),
 }) {
   if (campaigns.length === 0) {
     return (
@@ -48,6 +50,8 @@ export default function UnifiedCampaignsTable({
               onIngest={onIngest}
               selectedAdIds={selectedAdIds}
               onToggleAd={onToggleAd}
+              parentShouldPause={pauseWarningByKey[key] ?? false}
+              isStale={staleCampaigns.has(key)}
             />
           );
         })}

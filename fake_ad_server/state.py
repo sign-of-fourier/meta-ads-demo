@@ -11,6 +11,7 @@ Also owns the deterministic metrics functions used by both route modules.
 
 import hashlib
 import json
+import os
 import random
 import time
 import uuid
@@ -19,6 +20,17 @@ from threading import Lock
 
 _lock = Lock()
 
+# FAST_RAMP=true — treat every pushed clone as if it has been running for 24 hours.
+# Use alongside COLD_START so that after the user pushes a clone, the convergence
+# checker immediately writes real CTR to scored_observations, transitioning to Case 1.
+_FAST_RAMP = os.getenv("FAST_RAMP", "").lower() in ("1", "true", "yes")
+
+# COLD_START=true — fixture campaign and ad metrics return zeros.
+# Simulates a new account with no delivery history: ingest sees no impressions,
+# so scored_observations stays empty and warm-start fires on the first BO run.
+# Switch to Case 1 by restarting without COLD_START and reingesting.
+_COLD_START = os.getenv("COLD_START", "").lower() in ("1", "true", "yes")
+
 # ── Meta state ────────────────────────────────────────────────────────────────
 
 # creative_id → {id, name, object_story_spec}
@@ -26,6 +38,9 @@ _meta_creatives: dict[str, dict] = {}
 
 # act_id → list of ad dicts (each carries "_pushed_at" internal key)
 _meta_ads: dict[str, list[dict]] = {}
+
+# ad_id → Qwen-derived CTR percentage (cached after first Qwen call)
+_meta_ad_qwen_ctr: dict[str, float] = {}
 
 # ── Google state ──────────────────────────────────────────────────────────────
 
@@ -141,6 +156,31 @@ def update_meta_ad_status(ad_id: str, status: str) -> bool:
                     return True
     return False
 
+
+def get_creative_content_for_ad(ad_id: str) -> dict | None:
+    """Return {title, body, image_url} extracted from a pushed ad's creative, or None."""
+    with _lock:
+        for ads in _meta_ads.values():
+            for ad in ads:
+                if ad["id"] == ad_id:
+                    oss = (ad.get("creative") or {}).get("object_story_spec") or {}
+                    link_data = oss.get("link_data") or {}
+                    return {
+                        "title": link_data.get("name", ""),
+                        "body": link_data.get("message", ""),
+                        "image_url": link_data.get("picture", ""),
+                    }
+    return None
+
+
+def get_ad_qwen_ctr(ad_id: str) -> float | None:
+    return _meta_ad_qwen_ctr.get(ad_id)
+
+
+def set_ad_qwen_ctr(ad_id: str, ctr: float) -> None:
+    with _lock:
+        _meta_ad_qwen_ctr[ad_id] = ctr
+
 # ── Google operations ─────────────────────────────────────────────────────────
 
 def store_google_ad(customer_id: str, body: dict) -> str:
@@ -211,6 +251,10 @@ def pushed_google_ad_metrics(resource_name: str) -> dict | None:
     return None
 
 
+def is_fast_ramp() -> bool:
+    return _FAST_RAMP
+
+
 def update_google_ad_status(resource_name: str, status: str) -> bool:
     with _lock:
         for rows in _google_ads.values():
@@ -238,9 +282,11 @@ _GOOGLE_BASES = {
 def campaign_metrics(campaign_id: str, platform: str = "meta") -> dict:
     """
     Deterministic, slowly evolving metrics for a fixture campaign.
-    Numbers change each hour and grow over the course of a week before
-    resetting — simulates normal weekly campaign variation.
+    Returns zeros when COLD_START=true to simulate a new account with no history.
     """
+    if _COLD_START:
+        return {"impressions": 0, "clicks": 0, "spend": 0.0, "ctr": 0.0, "cpm": 0.0, "cpc": 0.0}
+
     bases = _META_BASES if platform == "meta" else _GOOGLE_BASES
     base = bases.get(str(campaign_id), 10000)
 
@@ -270,8 +316,13 @@ def _ramp_metrics(entity_id: str, pushed_at: float) -> dict:
     """
     Metrics for a pushed clone: zero at push time, ramping up each hour.
     Deterministic per (entity_id, hour).
+    With FAST_RAMP=true, treats every pushed ad as already 24 hours old so the
+    convergence checker sees data immediately.
     """
-    hours_running = max(0.0, (time.time() - pushed_at) / 3600)
+    if _FAST_RAMP:
+        hours_running = 24.0
+    else:
+        hours_running = max(0.0, (time.time() - pushed_at) / 3600)
     seed = int(hashlib.md5(entity_id.encode()).hexdigest(), 16) % (2 ** 32)
     rng = random.Random(seed + int(hours_running))
 

@@ -5,14 +5,24 @@
 # Access tokens and account IDs are accepted but ignored.
 #
 # Pushed ad state and evolving metrics live in state.py.
+# When MODAL_SCORING_ENDPOINT is set, pushed clone insights use Qwen-derived CTR.
 
+import base64
 import json
 import logging
+import os
+import re
 
+import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 import state
+
+_SCORING_ENDPOINT = os.getenv(
+    "MODAL_SCORING_ENDPOINT",
+    "https://markshipman4273--bad-ads-qwen2vl-badadsmodel-web.modal.run/predict",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -186,11 +196,108 @@ async def _post_ads(request: Request) -> JSONResponse:
     return JSONResponse({"id": ad_id})
 
 
-def _get_entity_insights(entity_id: str) -> JSONResponse:
-    """GET /{ad_id}/insights — lifetime metrics for a pushed clone."""
+async def _qwen_ctr_for_ad(ad_id: str) -> float | None:
+    """
+    Call Qwen with the pushed ad's creative and return a CTR percentage.
+    Result is cached in state so Qwen is called at most once per ad.
+    Returns None if scoring fails or no image is available.
+    """
+    cached = state.get_ad_qwen_ctr(ad_id)
+    if cached is not None:
+        return cached
+
+    content = state.get_creative_content_for_ad(ad_id)
+    if not content or not content.get("image_url"):
+        return None
+
+    image_url = content["image_url"]
+    headline = content["title"]
+    body = content["body"]
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            if image_url.startswith("data:"):
+                _, encoded = image_url.split(",", 1)
+                image_bytes = base64.b64decode(encoded)
+            else:
+                r = await client.get(image_url)
+                r.raise_for_status()
+                image_bytes = r.content
+
+            prompt = f"Headline: {headline}\nShort text: {body}"
+            resp = await client.post(
+                _SCORING_ENDPOINT,
+                files={"file": ("ad.png", image_bytes, "image/png")},
+                data={"prompt": prompt},
+            )
+            resp.raise_for_status()
+
+        raw = resp.json().get("raw_output", "")
+        m = re.search(r'"score"\s*:\s*([0-9.]+)', raw)
+        if not m:
+            return None
+        modal_score = float(m.group(1))          # 1–7, higher = better ad
+        quality = (modal_score - 1) / 6          # 0–1, higher = better
+        ctr_pct = round(0.03 * (quality / 0.5) * 100, 4)  # percentage
+        state.set_ad_qwen_ctr(ad_id, ctr_pct)
+        return ctr_pct
+    except Exception as exc:
+        logger.warning("fake_ad_server: Qwen scoring failed for %s: %s", ad_id, exc)
+        return None
+
+
+def _fixture_ad_campaign(entity_id: str) -> str | None:
+    """Return the campaign_id for a fixture ad, or None if not a fixture ad."""
+    from pathlib import Path
+    import json as _json
+    try:
+        all_ads = _json.loads((Path(__file__).parent.parent / "fixtures" / "meta_ads.json").read_text())
+        for campaign_id, ads in all_ads.items():
+            for ad in ads:
+                if str(ad.get("id")) == entity_id:
+                    return campaign_id
+    except Exception:
+        pass
+    return None
+
+
+async def _get_entity_insights(entity_id: str) -> JSONResponse:
+    """GET /{ad_id}/insights — lifetime metrics for a pushed clone or fixture ad."""
+    # Fixture native ads: return campaign-level metrics so structural ingest can
+    # write real CTR to scored_observations (Case 1 behaviour).
+    # Returns zeros when COLD_START=true (Case 2 behaviour).
+    campaign_id = _fixture_ad_campaign(entity_id)
+    if campaign_id is not None:
+        m = state.campaign_metrics(campaign_id, platform="meta")
+        if not m or m["impressions"] == 0:
+            return JSONResponse({"data": [], "paging": _paging()})
+        return JSONResponse({
+            "data": [{
+                "impressions": str(m["impressions"]),
+                "clicks": str(m["clicks"]),
+                "spend": str(m["spend"]),
+                "ctr": str(m["ctr"]),
+                "date_start": "2020-01-01",
+                "date_stop": "9999-12-31",
+            }],
+            "paging": _paging(),
+        })
+
     m = state.pushed_meta_ad_metrics(entity_id)
     if not m:
         return JSONResponse({"data": [], "paging": _paging()})
+
+    qwen_ctr = await _qwen_ctr_for_ad(entity_id)
+    if qwen_ctr is not None:
+        m = dict(m)
+        impressions = m["impressions"]
+        clicks = max(0, int(impressions * qwen_ctr / 100))
+        spend = round(clicks * 0.80, 2)
+        m["clicks"] = clicks
+        m["spend"] = spend
+        m["ctr"] = qwen_ctr
+        m["cpm"] = round(spend / max(1, impressions) * 1000, 2)
+        m["cpc"] = round(spend / max(1, clicks), 2) if clicks > 0 else 0.0
+
     return JSONResponse({
         "data": [{
             "impressions": str(m["impressions"]),
@@ -220,14 +327,30 @@ async def _entity_action(entity_id: str, request: Request) -> JSONResponse:
         for ads in all_ads.values():
             for ad in ads:
                 if str(ad.get("id")) == entity_id:
-                    return JSONResponse({"id": entity_id, "creative": ad.get("creative", {})})
+                    eff = ad.get("effective_status") or ad.get("status", "ACTIVE")
+                    return JSONResponse({
+                        "id": entity_id,
+                        "effective_status": eff,
+                        "status": ad.get("status", "ACTIVE"),
+                        "creative": ad.get("creative", {}),
+                    })
 
         # Check pushed clones in state
         pushed_ad = state.get_meta_ad_by_id(entity_id)
         if pushed_ad:
-            return JSONResponse({"id": entity_id, "creative": pushed_ad.get("creative", {})})
+            eff = pushed_ad.get("effective_status") or pushed_ad.get("status", "PAUSED")
+            # FAST_RAMP simulates the full lifecycle including the user activating the clone.
+            # Without this, the convergence checker sees PAUSED and never promotes clone_active.
+            if state.is_fast_ramp() and eff == "PAUSED":
+                eff = "ACTIVE"
+            return JSONResponse({
+                "id": entity_id,
+                "effective_status": eff,
+                "status": eff,
+                "creative": pushed_ad.get("creative", {}),
+            })
 
-        return JSONResponse({"id": entity_id, "creative": {}})
+        return JSONResponse({"id": entity_id, "effective_status": "UNKNOWN", "status": "UNKNOWN", "creative": {}})
 
     # POST — pause / resume / status update
     try:
@@ -291,6 +414,19 @@ async def meta_catch_all(path: str, request: Request) -> JSONResponse:
 
     logger.debug("Meta fake: method=%s resource=%s endpoint=%s", method, resource_id, endpoint)
 
+    # OAuth token exchange
+    if resource_id == "oauth" and endpoint == "access_token":
+        return JSONResponse({"access_token": "fake_access_token", "token_type": "bearer"})
+
+    # /me and /me/adaccounts
+    if resource_id == "me":
+        if endpoint == "adaccounts":
+            return JSONResponse({
+                "data": [{"id": "act_123456789", "name": "Fake Ad Account", "account_status": 1}],
+                "paging": _paging(),
+            })
+        return JSONResponse({"id": "fake_meta_user_123", "name": "Fake User"})
+
     if resource_id.startswith("act_"):
         if endpoint == "campaigns":
             return _get_campaigns()
@@ -316,5 +452,5 @@ async def meta_catch_all(path: str, request: Request) -> JSONResponse:
 
     # Entity-level (ad_id or campaign_id)
     if endpoint == "insights" and method == "GET":
-        return _get_entity_insights(resource_id)
+        return await _get_entity_insights(resource_id)
     return await _entity_action(resource_id, request)

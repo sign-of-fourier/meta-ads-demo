@@ -4,6 +4,583 @@ Changes are appended by date. Each entry covers one session or logical chunk of 
 
 ---
 
+## 2026-06-20 (session 8)
+
+### Dashboard UX — three-section layout with Adstac.kr branding
+
+- Restructured `DashboardPage` into three numbered cards: ① Sync (blue), ② Select ads (purple), ③ Run Adstac.kr (green). Each card has a grey instruction header with numbered badge, title, and description.
+- Renamed all user-facing "BO" / "Bayesian Optimisation" labels to "Adstac.kr" throughout `BatchPanel`, `CampaignRow`, `BOPickCard`, `CampaignsPage`, `GoogleCampaignsPage`.
+- `CloneStatusBadge` labels updated: "BO Clone — Paused/Testing/Done/etc." → "Adstac.kr — Paused/Testing/Done/etc."
+- Section 2 legend explains Template vs Static badge meaning in context.
+- All ad types display `ad_id` as their identifier in the table (consistent); Clone badge is the sole differentiator for pushed clones.
+
+### Push abstraction — picks carry their own context
+
+- `DashboardPage.handleRunBO` now enriches every pick with `platform` and `seed_ad_id` before storing in `boState`. Generator picks get the generator's platform/ID; cross-platform picks get per-pick platform + seed resolved from `group_stats`.
+- `BatchPushFooter` simplified: removed `platform`, `seedAdId`, `seedAdIdByPlatform` props. Reads `pick.platform` / `pick.seed_ad_id` directly. Adding a new platform requires no changes here.
+- `PickCard` / `MatchCard` props cleaned up (removed unused `platform`/`seedAdId`).
+- Cross-platform results now show a real push button (was "coming soon"); Google picks are skipped gracefully with a per-pick note.
+
+### Auto-resync after push
+
+- After a successful batch push, `DashboardPage.handlePushDone` scans `structureByKey` to find all campaigns that contained the selected ads and automatically re-ingests each one. New clones appear in the table without manual Re-ingest.
+
+### Backend: `ad_name` in structure response
+
+- `AdStructure` Pydantic model: added `ad_name: str | None`.
+- Both structure endpoints (Meta + Google): `SELECT` now includes `pac.ad_name`; `ads_map` returns it for pushed clones.
+
+### BO metric-selection threshold
+
+- `bo_pipeline/selector.py`: real metrics (ctr/cvr/roas) now require `>= MIN_REAL_OBS` observations before displacing warm-start fallbacks. Previously the threshold was 1 (any observation immediately dropped Qwen scores).
+- Default `MIN_REAL_OBS = 5`; configurable via `BO_MIN_REAL_OBS` env var.
+- "Never mix" rule was already enforced (one metric per run); this closes the "not enough" gap.
+
+### BO config consolidation — `bo_pipeline/config.py`
+
+- Created `backend/bo_pipeline/config.py` as the single home for all BO tuning parameters: `METRIC_PREFERENCE`, `REAL_METRICS`, `MIN_REAL_OBS`, `MIN_TRAINING_POINTS`, `MODAL_BO_PCA_DIMS`, `GOOGLE_BO_PCA_DIMS`, `MODAL_BO_API_URL`, `CONVERGENCE_FLOOR`, `CONVERGENCE_MARGIN`, `CONVERGENCE_MIN_DAYS`.
+- Each constant has a docstring explaining purpose, formula/reasoning behind default, and how to tune it.
+- `bo_pipeline/gpr.py`, `selector.py`, `modal_bo.py`, and `main.py` now import from `config.py`; scattered definitions removed.
+- `backend/.env.example` gained a "Bayesian Optimisation tuning" section listing all 7 env-var-backed params with defaults.
+- `ENV.md` §5 updated with all BO params including previously undocumented `GOOGLE_BO_PCA_DIMS` and `CONVERGENCE_MARGIN_FRACTION`.
+- `TECHNICAL_DEBT.md`: added T9 — `CONVERGENCE_MIN_DAYS` is read from env and documented but not yet enforced in the convergence checkers.
+- `CLAUDE.md`: removed stale "UI dropdown for target_metric not built" entry; added `config.py` to the subsystems index.
+
+---
+
+## 2026-06-20 (session 7)
+
+### Structure view: type-aware badges + inline lifecycle actions (Task 1 / D1)
+
+`CampaignRow.jsx` redesigned with an `AdRow` sub-component. Each ad row now classifies
+as one of three types and renders accordingly:
+
+- **Template** (`creative_type='dynamic'` or `'rsa'`, not a clone): no checkbox; "Template"
+  or "RSA" badge; if ACTIVE, shows "Pause template for cleaner test isolation" in the
+  action cell.
+- **BO Clone** (`is_pushed_clone=1`): no checkbox; `CloneStatusBadge` driven by
+  `clone_stats.clone_status` ("BO Clone — Paused", "Testing", "Done", "Invalidated",
+  "Retained"); Activate button when paused, Keep Running button when converged.
+- **Original static** (everything else): checkbox to include in BO pool; Activate button
+  when paused.
+
+Activate and Keep Running actions call `activatePick`/`retainPick` directly from the
+structure row. Local state (`localCloneStatus`) reflects the action immediately without
+a re-ingest.
+
+Backend D1 fix: both `GET /api/structure/{campaign_id}` and
+`GET /api/google/structure/{campaign_id}` now include `clone_status`, `platform_ad_id`,
+and `combo_id` in `clone_stats` for pushed clones. SCHEMAS.md updated.
+
+**Files:** `frontend/src/components/CampaignRow.jsx`, `backend/main.py`, `SCHEMAS.md`
+
+### BO/batch panel: template vs static sections (Task 2)
+
+`BatchPanel.jsx` rewrites the flat chip list into two labeled sections:
+
+- **Optimize** (Section A): template/RSA ads. BO explores their asset Cartesian product.
+- **Include in pool** (Section B): original static ads. Contribute as pool candidates;
+  their CTR also informs BO if they've run.
+- Informational note: "Combinations you've already pushed are excluded automatically."
+
+`DashboardPage.handleToggleAd` now accepts and stores `adType` on each selection.
+`handleRunBO` maps `adType === 'original_static'` → `contribution_mode: 'static'`,
+everything else → `'dynamic'`.
+
+`canRun` changed from `selectedAds.length >= 2` to `templateAds.length >= 1` (at least
+one template required; statics alone have no pool to explore).
+
+**Files:** `frontend/src/components/BatchPanel.jsx`, `frontend/src/pages/DashboardPage.jsx`
+
+### BO pick results: match detection + batch push selection (Task 3 / T8)
+
+**Backend:**
+- `_find_native_static_match(user_id, combination_key, seed_ad_id)`: reconstructs native
+  static ad combinations from `ad_creative_structures` slot rows and compares
+  `combination_key`. Called by `_enrich_pick` when pick is not already pushed.
+- `BOPick` model gains `matches_existing_ad: dict | None` — returned when BO recommends
+  a combination that exactly matches an existing native static ad.
+- `POST /api/push/match`: records a match in `pushed_ad_combos` pointing at the existing
+  `platform_ad_id`. Sets `clone_status` from `effective_status` (active → `clone_active`,
+  else → `clone_paused`). No new ad created.
+
+**Frontend (`BatchPanel.jsx`):**
+- `PickCard`: not-yet-pushed picks show a checkbox (default unchecked). Click to preview,
+  checkbox to select for batch push.
+- `MatchCard`: picks with `matches_existing_ad` show amber "Matches existing ad" badge
+  with the existing ad_id and current status. Checkbox selects for recording the match.
+- `BatchPushFooter`: collects selected picks, calls `pushPick` for new combinations and
+  `pushMatch` for matches. Shows per-pick result and note to re-ingest.
+- Already-pushed picks show lifecycle label (read-only in this view) — full lifecycle
+  management remains in `BOPickCard` for individual ad BO runs.
+
+**Files:** `backend/main.py`, `frontend/src/components/BatchPanel.jsx`,
+`frontend/src/api.js`
+
+### Fix `_get_pushed_exclude_keys` sibling scope (Task 4 / T7)
+
+`_get_pushed_exclude_keys` now joins `ad_generator_members` to find sibling members
+and their generator_ids. Queries `seed_ad_id IN (self, siblings, generator_ids)`. Per-
+member BO runs now correctly exclude combos pushed from sibling members or generator-level
+runs in the same generator group.
+
+**Files:** `backend/main.py`
+
+### Test baseline
+362 passed, 5 skipped (unchanged).
+
+---
+
+## 2026-06-20 (session 6)
+
+### Meta clone activation learned from platform (not inferred from impressions)
+
+`_check_meta_convergence` was using `impressions > 0` as a proxy for "user activated
+the clone." A FAST_RAMP pushed clone would always have impressions, promoting it to
+`clone_active` even if it was still PAUSED — wrong in principle and wrong in demo.
+
+Fixed: now calls `GET /{ad_id}?fields=effective_status,status` in parallel with the
+insights call (via `asyncio.gather`). Activation driven by `effective_status in
+("ACTIVE", "ENABLED")` — same pattern Google already used.
+
+`fake_ad_server/routes/meta.py` entity GET now returns `effective_status` and `status`.
+`fake_ad_server/state.py` gained `is_fast_ramp()`. When FAST_RAMP=true, the entity GET
+returns `ACTIVE` for pushed clones to simulate the user activating them (otherwise the
+demo loop stalls since no one clicks Activate in the fake server).
+
+**Files:** `backend/main.py`, `fake_ad_server/routes/meta.py`, `fake_ad_server/state.py`
+
+### Wrongly-skipped masking tests restored and fixed
+
+`TestGoogleMaskingProvider` (6 tests in `test_google_demo.py`) had
+`@pytest.mark.skip(reason="masking layer deprecated")`. The masking layer is NOT
+deprecated — `providers/factory.py` uses it on every request when `policy.enabled`.
+
+Root cause of failure: tests used `async def` + `@pytest.mark.asyncio` but `pytest-asyncio`
+is not installed in the system Python (tests run with miniconda, not the venv).
+
+Fix: removed skip decorator; converted all 6 tests from `async def` to `def` using
+`asyncio.run()`, matching the pattern used everywhere else in the test suite.
+
+**Files:** `backend/tests/test_google_demo.py`
+
+### Flaky scoring test fixed at the source
+
+`test_active_variants_are_scored` called the live Qwen endpoint. When Qwen returned 408,
+the variant stayed `status='done'` with `score=None`, which the test counted as unscored.
+
+Fixed in `ad_generation/pipeline.py` `_score()`: the `except` block now calls
+`update_variant(vid, db_path, status="failed", error=str(exc))`. A scoring failure marks
+the variant terminal rather than leaving it in an ambiguous done-but-unscored state.
+
+**Files:** `backend/ad_generation/pipeline.py`
+
+### Test baseline
+362 passed, 5 skipped. Remaining skips are legitimate external-service tests
+(live Google credentials, live Modal endpoint).
+
+### Design — structure view + BO panel UX (no code yet)
+
+Designed the full UX for session 7. See CHECKPOINT.md for full spec. Summary:
+- Three ad types in structure view: Template / Original static / BO Clone — each with
+  distinct badge and context-appropriate action
+- BO/batch panel split into three sections: Optimize (templates) / Include in pool
+  (static ads) / Already testing (BO clones, greyed out)
+- Original static ads in pool: "include in pool" framing — NOT assumed to have CTR signal;
+  user may add many with no impressions for organizational reasons
+- Match detection: if BO pick matches existing static ad → "Activate [Ad Name]" not Push
+- "Push Selected + Resync" combined action
+- Two new tech debt items: T7 (cross-member exclusion scope), T8 (native static match)
+
+---
+
+## 2026-06-19 (session 5)
+
+### Dynamic convergence threshold (learned from baseline CTR)
+
+Replaced the hardcoded `MIN_CONVERGENCE_IMPRESSIONS=500` and `MIN_CONVERGENCE_DAYS=3`
+with a threshold computed from the campaign's observed baseline CTR:
+
+```
+n = z² × (1-p) / (f² × p)
+```
+
+where `p` is the latest campaign CTR from `ad_insights` and `f` is
+`CONVERGENCE_MARGIN_FRACTION` (default 0.20 = ±20% relative CI).
+
+**Impact:**
+- 3.5% CTR campaign → ~2,650 impressions required (was 500, massively under-powered)
+- 0.5% CTR campaign → ~19,000 (fixed count was meaninglessly small for this)
+- 10% CTR campaign → ~850 (fixed count was over-conservative for this)
+- `MIN_CONVERGENCE_DAYS` removed entirely — the impression count already encodes
+  enough sample to make the time-guard redundant
+
+**New env vars:**
+- `CONVERGENCE_MARGIN_FRACTION` (float, default `0.20`) — controls CI tightness
+- `MIN_CONVERGENCE_IMPRESSIONS` repurposed as the floor (default now `100`)
+
+**Demo/FAST_RAMP combo:** set `CONVERGENCE_MARGIN_FRACTION=0.80` in backend `.env`
+alongside `FAST_RAMP=true` on the fake server. At f=0.80, required n drops to ~100–200,
+which FAST_RAMP's 24-hour simulation (~360–1560 impressions) easily clears.
+
+**Files changed:**
+- `backend/main.py` — `_required_impressions()` helper; both convergence checkers updated
+- `FAKE_AD_SERVER.md` — Case 2 command updated with `CONVERGENCE_MARGIN_FRACTION=0.80`
+- `CLAUDE.md` — fake server comment updated
+
+---
+
+## 2026-06-19 (session 4)
+
+### Push BO picks to platform (golden path implementation)
+
+**Goal:** User selects a BO recommendation and pushes it as a PAUSED static clone. Clone
+accumulates metrics; real CTR feeds back into BO. Template (dynamic ad) stays inactive.
+
+**Backend — `backend/main.py`:**
+- `push_pick` now resolves generator_id → first member ad_id for the platform API call,
+  while keeping the generator_id in `pushed_ad_combos` so future generator BO runs still
+  exclude the combination. Previously a generator-based push would 400.
+- Added docstring making the golden path explicit: template stays paused, clone runs.
+- Added `TODO(spend)` comment: pushed clone inherits adset budget; no per-ad spend
+  configuration yet — user must set budget in Ads Manager before activating.
+- Added `REAL META` comment: Live mode required for real accounts; fake server bypasses this.
+- `_clone_dynamic_to_static_ad`: added note that `page_id` is always re-fetched (not in DB)
+  and that image-hash-only creatives will 502 at push time.
+
+**Frontend — `BatchPanel.jsx`:**
+- Extracted `PushFooter` component shared by both `GeneratorResults` and `CrossPlatformResults`.
+- Push button on every pick card (stops propagation so it doesn't open the modal).
+- States: idle → loading ("Pushing…") → pushed (shows ad ID) / error (shows message + retry).
+- Google picks: disabled with "Google push — coming soon".
+- Always-visible note under the button: "Pushed PAUSED — activate in Ads Manager after setting
+  budget" — this is the spend-gap reminder that cannot be missed.
+- `GeneratorResults` passes `data.seed_ad_id` (generator_id) to `PushFooter`; backend resolves it.
+- `CrossPlatformResults` passes `pick.seed_ad_id` (actual ad_id per pick).
+
+**CSS — `app.css`:**
+- `.bo-pick-footer`, `.btn-push`, `.push-live-note`, `.push-success`, `.push-error-text`, `.push-coming-soon`
+
+**TECHNICAL_DEBT.md:**
+- Added T6: spend/budget configuration at push time — full impact description and fix plan.
+
+---
+
+## 2026-06-19 (session 3)
+
+### BO pick explainability — fixed, extended, deduped
+
+**Root cause of missing metrics**: `BatchPanel.jsx` (the component the dashboard actually uses)
+had its own `PickPreviewModal` with the old "Score · EI" inline format. Previous fixes targeted
+`BOPickCard.jsx` (wrong component). Fixed by updating `BatchPanel.jsx` throughout.
+
+**Explainability block in click modal** (`BatchPanel.jsx` + `BOPickCard.jsx`):
+- Relative Score (`Math.exp(gpr_mean)` — display only; backend keeps standard-normal scale)
+- Potential (EI) (`ei_score`)
+- Uncertainty σ (`gpr_std`)
+- Nearest known ads — clickable rows that drill into the full ad (replace-in-modal pattern)
+
+**Nearest known ads drilldown**: clicking a neighbor row swaps modal content to show that ad's
+full text slots with score/distance header and `← Back` link. No stacked modals.
+
+**`combination` field** added to each `nearest_known` dict in `_expl_nearest_known` (both
+`pipeline.py` and `cross_platform.py`) so the frontend can display full slot details on drilldown.
+
+**Deduplication fix** (`bo_pipeline/selector.py` `get_scored_combinations`): was returning
+duplicate rows per `combination_key` when warm-start or re-ingest wrote the same combination
+multiple times. Duplicates caused (a) the same neighbor appearing 3× in nearest-known and
+(b) GPR training bias toward duplicated combinations. Fix: keep last score per `combination_key`.
+
+**`PotentialBadge`** simplified — tooltip removed; badge chip shows Potential (EI) only.
+Full stats are in the click modal.
+
+**Logging**: `_expl_local_gp_stats` except branches now use `logger.exception` (was silent).
+Note: `logger.info` is filtered by uvicorn's default WARNING level — use WARNING if you need
+log lines to appear without configuring basicConfig.
+
+**Tests**: `tests/test_expl_helpers.py` — 16 tests for `_expl_local_gp_stats`,
+`_expl_nearest_known`, `_expl_combo_label` in both `pipeline.py` and `cross_platform.py`.
+Updated to assert `combination` field present in nearest-known results.
+
+**Test suite**: 49 passed (explainability + BO pipeline tests). Full suite baseline unchanged.
+
+## 2026-06-19 (session 2)
+
+### BO pick card explainability (PotentialBadge)
+
+- Added `PotentialBadge` component to each BO pick card (amber chip)
+- Full GP stats (Probable Score, Uncertainty, Nearest known ads) in click modal
+- All `_expl_*` functions in `pipeline.py` and `cross_platform.py` are display-only and never influence selection
+- Modal q-EI path now runs a cheap local GPR after Modal selects, just to populate per-pick display stats (`_expl_local_gp_stats`) — the selection itself is still done by Modal
+- `SHOW_POTENTIAL_BADGE = true` in `PotentialBadge.jsx` acts as a feature flag
+- `BOPick` and `CrossPlatformBOPick` Pydantic models include `nearest_known: list[dict] = []`
+
+---
+
+## 2026-06-19
+
+### Fix cross-platform BO warm-start + backend synthetic data removal
+
+**`backend/main.py`**
+- Deleted `_synthetic_ad_stats()`: backend was generating fake non-zero metrics seeded from ad_id hash, bypassing the fake server entirely. Backend must never generate synthetic data — all metrics come from the server (real or fake).
+- Added `native_ad_insights` table: persists per-ad display metrics fetched from the server (impressions, clicks, spend, ctr, cpm). PRIMARY KEY (user_id, ad_id).
+- Added `_store_native_meta_display_metrics`: background task fired at every structural ingest; fetches `/{ad_id}/insights?fields=...&date_preset=lifetime` for each non-clone Meta ad; writes to `native_ad_insights` including zeros when data=[].
+- Added `_store_native_google_display_metrics`: same pattern via GAQL for Google ads.
+- Updated `get_campaign_structure` and `get_google_campaign_structure`: LEFT JOIN `native_ad_insights` instead of calling `_synthetic_ad_stats`; returns `clone_stats=null` for native ads with no ingest row yet.
+- `run_unified_cross_platform_bo_endpoint`: converted from `def` to `async def`; added warm-start loop — for each pair, calls `get_real_observation_count` and fires `run_warm_start` when below `MIN_TRAINING_POINTS`. Previously the endpoint had no warm-start at all, causing random picks with empty `scored_observations` (COLD_START / Case 2).
+
+**`backend/ad_generation/scorer.py`**
+- `_image_bytes_from_url`: added local filesystem path handling — `/ad-images/<filename>` URLs (stored by structural ingest in `ad_image_embeddings.image_ref`) are now read from `backend/ad_images/` on disk instead of failing with an `httpx.get` on a non-HTTP URL. This unblocks warm-start Qwen scoring for ads with locally-stored images.
+
+**`backend/tests/test_structural_ingest.py`**
+- `test_structure_stats_are_zero_when_server_returns_empty`: seeds `native_ad_insights` with impressions=0; asserts `clone_stats.impressions==0`. Fails if backend generates synthetic non-zero values.
+- `test_structure_stats_echo_server_values_exactly`: seeds `native_ad_insights` with real metrics; asserts exact values are returned. Fails if synthetic data substitutes server values.
+
+**`backend/tests/test_cross_platform_bo.py`**
+- `TestUnifiedBOEndpointWarmStart::test_warm_start_called_for_each_pair_with_no_real_observations`: enforces FAKE_AD_SERVER.md Case 2 — unified endpoint must call `run_warm_start` for every pair when real observations < `MIN_TRAINING_POINTS`.
+- `TestUnifiedBOEndpointWarmStart::test_warm_start_skipped_when_real_observations_present`: asserts warm-start is NOT called when real observations are sufficient.
+
+---
+
+## 2026-06-19 (session 2)
+
+### Fix TestModalBOLive skip guard + stale metrics UX
+
+**`backend/tests/test_modal_bo.py`**
+- `TestModalBOLive`: changed `@pytest.mark.skipif` condition from `not MODAL_API_URL` (never True because of hardcoded fallback URL) to `not os.environ.get("RUN_LIVE_MODAL_TESTS")`. Live tests now only run when `RUN_LIVE_MODAL_TESTS=1` is set explicitly in the shell. `MODAL_BO_API_URL` in `.env` is for the backend server, not a test opt-in signal.
+- Result: 340 passed, 11 skipped, 0 failed (was 340 passed, 4 failed, 7 skipped).
+
+**`frontend/src/pages/DashboardPage.jsx`**
+- Added `staleCampaigns` state (Set of "platform:campaignId").
+- `handleMetaSync`: on success, adds all previously-ingested Meta campaign keys to `staleCampaigns`.
+- `handleGoogleSync`: same for Google campaigns.
+- `handleIngest`: on success, removes the key from `staleCampaigns`.
+- Passes `staleCampaigns` to `UnifiedCampaignsTable`.
+
+**`frontend/src/components/UnifiedCampaignsTable.jsx`**
+- Accepts `staleCampaigns` prop; passes `isStale={staleCampaigns.has(key)}` to each `CampaignRow`.
+
+**`frontend/src/components/CampaignRow.jsx`**
+- Accepts `isStale` prop; renders a yellow "Synced — re-ingest to refresh metrics" banner in the expanded accordion when `isStale=true` and structure is already loaded.
+
+**`frontend/src/app.css`**
+- Added `.stale-metrics-banner-row` and `.stale-metrics-banner` styles (amber, matches `parent-pause-banner`).
+
+---
+
+## 2026-06-18 (session 2)
+
+### Clone-agnostic warm-start + Case 1 / Case 2 fake server modes
+
+**`backend/main.py`**
+- `_write_convergence_observation`: fixed compound-key bug — text embedding lookup now extracts the text-only inner key from the compound `{"combo":{...},"image_slot":N}` key; text_vector was always NULL before this fix
+- `_write_convergence_observation`: added `source` parameter (default `"convergence"`) so native ad observations can be tagged `"ingest_native"`
+- Added `_write_native_ad_observations` (Meta): fire-and-forget task at every structural ingest; fetches lifetime CTR for non-clone static ads and writes to `scored_observations`; warm-start now skips if any native ad has real impressions, not just pushed clones
+- Added `_write_native_google_ad_observations` (Google): same pattern via GAQL
+
+**`fake_ad_server/state.py`**
+- Added `COLD_START` env var: all fixture campaign and ad insights return zero when set; simulates a new account with no delivery history (Case 2)
+- Updated FAST_RAMP comment to clarify its role alongside COLD_START
+
+**`fake_ad_server/routes/meta.py`**
+- `_get_entity_insights`: now returns campaign-level metrics for fixture ad IDs (not just pushed clones); respects COLD_START via `campaign_metrics()`; enables Case 1 native ad observation flow with the fake server
+
+**Docs**
+- `FAKE_AD_SERVER.md`: replaced wrong Case 1 / Case 2 description with accurate model; documented COLD_START + FAST_RAMP interaction and the ingest-driven switch mechanism
+- `CLAUDE.md`: updated fake server cheat sheet to match
+- `TECHNICAL_DEBT.md`: marked T4 partially addressed; added T5 (cross-user observation sharing)
+
+---
+
+## 2026-06-18
+
+### Fix warm-start trigger
+- `bo_pipeline/selector.py` — added `get_real_observation_count` and `REAL_METRICS` constant; counts only ctr/cvr/roas rows (not qwen_warm/synthetic)
+- `backend/main.py` — warm-start now fires when real-metric count < `MIN_TRAINING_POINTS`, not when `scored_observations` is empty; Qwen scores (warm-start output) no longer suppress the trigger
+
+---
+
+## 2026-06-17 (session 2)
+
+### Remove fake_warm_start_server; wire real Qwen into port 9000
+- Deleted `fake_warm_start_server/` entirely — port 9001 never needed; warm-start calls real Qwen directly
+- `warm_start/scorer.py` — removed `FAKE_WARM_START_BASE_URL` branch; only real Qwen path remains
+- `fake_ad_server/routes/meta.py` — `_get_entity_insights` now async; calls Qwen Modal endpoint for pushed clones; derives CTR: `base=0.03`, scaled by `quality/0.5` where `quality=(score-1)/6`; result cached per ad_id in state
+- `fake_ad_server/state.py` — added `get_creative_content_for_ad`, `get_ad_qwen_ctr`, `set_ad_qwen_ctr`; added `_meta_ad_qwen_ctr` cache
+- `fake_ad_server/requirements.txt` — added `httpx`
+- `backend/.env.example`, `start.sh`, `CLAUDE.md`, `DEV_QUICKSTART.md` — removed all port 9001 / `FAKE_WARM_START_BASE_URL` references; Case 2 now described as "cold start with real Qwen"
+
+---
+
+## 2026-06-17
+
+### Warm-start mini BO
+- Added `backend/warm_start/` package: `mini_bo.py` (mini BO loop over 20-candidate universe, GP-guided scoring order), `scorer.py` (VLM oracle or fake server), `__init__.py`
+- `METRIC_PREFERENCE` in `bo_pipeline/selector.py` extended: `(ctr, cvr, roas, qwen, qwen_warm, synthetic)` — `qwen_warm` superseded by any real CTR observation
+- `POST /api/bo/run` made async; warm-start runs automatically on first call when no observations exist (idempotent)
+- Added `POST /api/bo/simulate-run` — dev endpoint that calls fake server and writes a `ctr` observation to `scored_observations`
+
+### Fake warm-start server (port 9001)
+- `fake_warm_start_server/` — separate server, does not modify `fake_ad_server/`
+- Reads same fixture inventory as fake ad server; builds 20-candidate universe (title × body × image) with hidden `true_ctr`, `true_cvr`, `true_quality` per combo
+- `POST /candidates/score` — warm-start oracle (quality score, 0–1 higher=better)
+- `POST /simulate/run` — fake CTR/CVR by creative content (title/body/image_url)
+- `POST /ads/{id}/run` — fake CTR/CVR by candidate ID
+- `GET /status` — total observations, `threshold_met` flag, universe size
+- `POST /reset` — clear observations without restart
+
+### start.sh rewritten as cheat sheet
+- No longer starts anything; prints service commands and ports for the requested env
+- Lists all five services: backend, frontend, ngrok, fake ads (:9000), fake warm-start (:9001)
+- Detects and prints active fake-server env vars from `backend/.env`
+- `./start.sh staging` shows staging ports; prints hint for the other env
+
+### Chi bad ads — score direction corrected
+- `build_ads_jsonl.py` docstring: "badness score" → "quality/appeal score. Higher = better ad"
+- `FINE_TUNING.md`: score field description updated; evidence cited (correlates with good_design, trustworthy, like_product labels at high scores)
+
+### Docs
+- `CLAUDE.md` Commands section: replaced start.sh launch docs with tmux cheat sheet table
+- `DEV_QUICKSTART.md`: replaced preferred/manual/separate-terminal sections with service table; added fake warm-start server section
+- `NGROK_SETUP.md`: removed start.sh tunnel references; start each service separately
+- `FAKE_AD_SERVER.md`: start.sh row marked done; updated note
+
+---
+
+## 2026-06-01 (multioutput GP tests + MULTIOUTPUT_GP.md)
+
+### Tests
+- `test_modal_bo.py::TestModalBOUnit`: added `test_multioutput_payload_includes_d_and_rho` and `test_multioutput_response_parsed_to_index_and_x` — mock `urlopen`, verify `d`/`d_candidates`/`rho` appear in the JSON payload and that the response is correctly parsed; no network
+- `test_cross_platform_bo.py::TestUnifiedBOMultioutput`: 9 new tests covering `run_unified_cross_platform_bo(..., method="modal_multioutput")` end-to-end with `call_modal_api_multioutput` patched; covers pick shape, platform tagging, `_sort_key` cleanup, fallback on empty response, fallback on exception, `d`-array content, `top_n` enforcement
+- `test_modal_bo.py::TestModalBOLive`: added `test_multioutput_server_handles_d_fields` — live smoke test that sends `d`/`d_candidates`/`rho` to the real Modal endpoint, confirming the server branches to `_TorchMultiOutputGP` and returns q candidates in the standard format
+- Suite: 343 passed, 7 skipped (up from 331)
+- Documented test-seeder quirk in `TestUnifiedBOMultioutput` docstring: plain combo keys in `scored_observations` vs compound keys in candidates means `exclude_keys` never fires in the test DB — all 8 candidates per platform are always available
+
+### Docs
+- `MULTIOUTPUT_GP.md` rewritten as a full design document: motivation (zero-padding problems), identity vector `d`, coregionalization matrix B and covariance block arithmetic, per-platform embedding construction (Meta text+image, Google RSA text-only), planned extensions (context vector, Google Display with OCR, multi-platform B), ρ guidance, implementation reference table, client pipeline flow diagram
+
+---
+
+## 2026-05-31 (generator analysis wired to frontend)
+
+### Frontend
+- `BatchPanel`: when all selected ads are the same platform, button shows "Run Generator Analysis" and description explains merged pool behavior; cross-platform selection keeps existing "Run Cross-Platform Analysis" flow
+- `BatchPanel`: added `GeneratorResults` component for generator BO response (scored/candidate counts, member count, picks)
+- `DashboardPage.handleRunBO`: same-platform selection → auto-creates a named generator → calls `/api/bo/run` or `/api/google/bo/run` with `generator_id`; mixed-platform → existing unified cross-platform GP unchanged
+- `api.js`: added `createGenerator(name, members)` and `runBOForGenerator(generatorId, platform, targetMetric)`
+
+---
+
+## 2026-05-31 (ad generators — multi-member BO candidate pool)
+
+### Terminology
+- "dynamic ad" = Meta dynamic ad OR Google RSA (multi-asset, combination generator)
+- "static ad" = Meta static OR fully-pinned Google RSA (single fixed combination)
+
+### Schema
+- New table `ad_generators (id, user_id, name, created_at)`
+- New table `ad_generator_members (generator_id, ad_id, contribution_mode)` — `contribution_mode = 'dynamic' | 'static'`
+
+### Backend
+- `POST /api/generators` — create a named generator from one or more member ads
+- `GET /api/generators` — list all generators for the user
+- `DELETE /api/generators/{id}` — delete a generator
+- `/api/bo/run` and `/api/google/bo/run`: accept optional `generator_id`; when set, candidate pools and scored observations are merged across all member ads; `generator_id` acts as the key in `pushed_ad_combos` / `scored_observations` / `bo_selections`
+- `run_bo()` in `pipeline.py`: added `seed_ad_ids`, `text_source_ids`, `image_ad_ids` optional list params
+- `get_scored_combinations()` in `selector.py`: accepts `seed_ad_ids` list
+- `get_candidate_combinations()` in `selector.py`: accepts `text_source_ids` and `image_ad_ids` lists
+
+---
+
+## 2026-05-31 (architecture review + doc updates)
+
+### AD.md
+- Fixed stale lineage diagram: `ad_generation_variants` → `scored_observations` as BO training data source
+- Added "Universe and Roles" section: candidate universe = per-parent-ad Cartesian product; role taxonomy (parent / test_clone / native_static gap); three sources of scored observations; multi-parent universe constraint
+
+### WORKFLOW.md
+- Marked as complete: convergence checking, clone lifecycle UI states, edit detection (invalidation), Google clone detection, RSA pin-all
+- Updated Gap A (edit detection implemented), Gap B (deleted clone — not yet), Gap D (pin-all partial resolution)
+
+### TECHNICAL_DEBT.md (new)
+- T1: role taxonomy — native statics get `parent` by default; proposed `native_static` role
+- T2: deleted clone handling — clone stuck in convergence checker after platform deletion
+- T3: multi-parent universe not supported — per-ad constraint in `pipeline.py`
+- T4: native static CTR not flowing to scored_observations
+- D1–D4: documentation drift items
+
+### CLAUDE.md
+- Replaced `AD_ROLE_PLAN.md` reference with `TECHNICAL_DEBT.md`
+
+---
+
+## 2026-05-31 (ad role plan — clone lifecycle implementation)
+
+### Schema
+- `ad_creative_structures.role TEXT DEFAULT 'parent'` — `'test_clone'` set at ingest when clone detected
+- `pushed_ad_combos.clone_status TEXT DEFAULT 'clone_paused'` — lifecycle state machine
+- New table `ad_parent_fillers` — stores filler headline/description slots for Google parent RSAs
+
+### Backend
+- **Clone status machine**: `clone_paused` → `clone_active` → `clone_converged` / `clone_retained` / `clone_invalidated`
+- `_check_meta_convergence`: uses `clone_status` filter; impressions > 0 while paused → `clone_active`
+- `_check_google_convergence`: fixed `run_gaql` → `query_gaql` bug; adds `ad_group_ad.status` to GAQL; `ENABLED` → `clone_active`
+- `ingest_campaign_structure` (Meta): sets `role = 'test_clone'` on clones; invalidation detection; returns `parent_should_pause`
+- `ingest_google_campaign_structure`: same + extracts filler slots into `ad_parent_fillers` for parent RSAs
+- `_create_google_rsa_ad`: looks up `ad_parent_fillers`; when present, passes `pin_all=True` so all 5 RSA slots are pinned — CTR measures exactly one combo
+- `google_ads_api.create_rsa`: added `pin_all: bool = False` parameter
+- `_enrich_pick`: now returns `clone_status` and `combo_id` in BO pick response
+- `push_pick`: explicitly sets `clone_status = 'clone_paused'` on push
+- `activate_ad`: also sets `clone_status = 'clone_active'`
+- New endpoint `POST /api/push/retain/{combo_id}`: sets `clone_status = 'clone_retained'`
+
+### Frontend
+- `BOPickCard`: action button driven by `clone_status`; added `clone_invalidated` (grey) and `clone_converged` + "Keep Running" button → calls `/api/push/retain`
+- `CampaignRow`: amber `parent-pause-banner` shown when ingest returns `parent_should_pause: true`
+- `DashboardPage`: captures `parent_should_pause` from ingest results; stored in `pauseWarningByKey` state
+- `api.js`: added `retainPick(comboId)` function
+
+---
+
+## 2026-05-30 (doc reorganization)
+
+### CLAUDE.md slimmed from 457 → 109 lines
+- Moved env var tables → `ENV.md` (new)
+- Moved main.py function reference + provider table → `BACKEND.md` (new)
+- Moved frontend page/component map → `FRONTEND.md` (new)
+- Moved masking env var tables → `STAGING_POLICY.md` (legacy section appended)
+- CLAUDE.md is now a lean index with commands, architecture, subsystem pointers, constraints, open decisions, and not-yet-implemented list
+
+---
+
+## 2026-05-30 (dashboard UX + ad stats session)
+
+### Dashboard: ad rows aligned to table columns + per-ad stats
+
+**Backend**
+- `ad_creative_structures` — new `effective_status TEXT NOT NULL DEFAULT 'UNKNOWN'` column (ALTER TABLE migration); stores the raw platform status (`ACTIVE`, `PAUSED`, `ENABLED`, etc.) per ad, distinct from `lifecycle_status` which is the system's own classification
+- Both Meta and Google structural ingest now write `effective_status = raw_status` (the value returned by the API) to every slot row for an ad
+- `_synthetic_ad_stats(ad_id)` — new helper; generates deterministic fake per-ad stats (impressions, clicks, CTR, spend, CPM) seeded by MD5 of ad_id; used in the structure endpoints for all ads without real pushed-clone data
+- `AdStructure` model — new fields: `is_pushed_clone: bool`, `effective_status: str | None`, `clone_stats: dict | None`
+- Both `GET /api/structure/{campaign_id}` and `GET /api/google/structure/{campaign_id}` now LEFT JOIN `pushed_ad_combos` on `platform_ad_numeric_id = ad_id`; return `clone_stats` with real impressions/days/CTR for pushed clones, synthetic stats for everything else; filter out internal `_`-prefixed slots (e.g. `_placements`) from `components`; prefer the first non-UNKNOWN `effective_status` seen across slot rows (the `_placements` slot sorts first alphabetically and was shadowing the real status)
+- `UnifiedCrossPlatformBORequest` — new `target_metric: str | None = None` field; passed through to `run_unified_cross_platform_bo`
+- `embeddings/embedder.py` — guard in `embed_image_url`: skips values without `http://` or `https://` prefix (Meta image hashes, empty strings) with a logged warning instead of crashing
+
+**Frontend**
+- `CampaignRow.jsx` — fully restructured: ad rows now render as proper `<tr>` elements inside the campaign table, aligned to the 9 table columns (Name / Platform / Status / Daily Budget / 7d Impr. / 7d Clicks / 7d Spend / CTR / CPM); clicking anywhere on a row (except the checkbox) opens the ad preview modal; checkbox stops propagation; a thin sub-header row shows ad count + Re-ingest button; `AdPreviewModal` imported from `AdsPanel`
+- `AdsPanel.jsx` — `AdPreviewModal` exported as named export; modal now shows a Performance section (impressions, clicks, CTR, spend, CPM, days running, converged) above the Creative section; synthetic stats labelled `(synthetic)`; `_`-prefixed slots filtered from display
+- `BatchPanel.jsx` — "Optimize for" `<select>` dropdown (Auto / CTR / CVR / ROAS) added to cross-platform controls; cross-platform pick cards now use `bo-pick-clickable` class with click-to-preview via `PickPreviewModal`
+- `DashboardPage.jsx` — `targetMetric` state added; passed to `BatchPanel` and included in `runUnifiedCrossPlatformBO` call
+- `api.js` — `runUnifiedCrossPlatformBO` accepts optional `targetMetric` param; sent as `target_metric` in request body when set
+- `app.css` — new classes: `metric-select`, `ad-data-row`, `ad-data-row-clickable`, `ad-data-row-selected`, `ad-data-cell-name`, `ad-data-na`, `ad-stat-synthetic`, `ads-subheader-row`, `ads-subheader-hint`, `slot-value-list`
+
+**Bug fixes**
+- `CampaignRow` ingest buttons previously called `onClick={onIngest}` (passing the click event as `campaignId`), causing `GET /api/google/structure/%5Bobject%20Object%5D`; fixed to `onClick={() => onIngest(id, platform)}`
+- `effective_status` showed as `—` for all ads because the `_placements` slot row (alphabetically first) always had `UNKNOWN`; structure endpoints now scan all rows per ad and prefer the first real status value
+- `ad_factory/image_gen.py` — `placeholder()` now uses a random UUID seed instead of a deterministic MD5 of the concept, so repeated runs produce different picsum images
+
+---
+
 ## 2026-05-30 (ad_factory)
 
 ### `ad_factory/` — standalone ad creation tool

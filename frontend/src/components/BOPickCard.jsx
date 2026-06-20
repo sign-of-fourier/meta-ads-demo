@@ -17,7 +17,8 @@
 
 import { useState } from "react";
 import { createPortal } from "react-dom";
-import { pushPick, activatePick } from "../api.js";
+import { pushPick, activatePick, retainPick } from "../api.js";
+import PotentialBadge from "./PotentialBadge.jsx";
 
 const SLOT_LABELS = {
   headline: "Headline",
@@ -40,7 +41,7 @@ function defaultAdName(campaignName, combination) {
   const headline = combination?.headline || "";
   const preview = headline.length > 25 ? headline.slice(0, 25) + "…" : headline;
   const date = new Date().toISOString().slice(0, 10);
-  return `${campaignName || "Ad"} — ${preview || "BO Pick"} (${date})`;
+  return `${campaignName || "Ad"} — ${preview || "Adstac.kr pick"} (${date})`;
 }
 
 /* ── Preview modal ────────────────────────────────────────────────────────── */
@@ -75,11 +76,30 @@ function PreviewModal({ pick, onClose }) {
               </div>
             ))}
         </dl>
-        {pick.gpr_mean != null && (
-          <p className="bo-pick-score">
-            Predicted score: <strong>{pick.gpr_mean.toFixed(2)}</strong>
-            {pick.ei_score != null && <> · EI: {pick.ei_score.toFixed(4)}</>}
-          </p>
+        {(pick.gpr_mean != null || pick.ei_score != null || pick.gpr_std != null || (pick.nearest_known ?? []).length > 0) && (
+          <div className="modal-expl-block">
+            <div className="modal-expl-title">GP model estimates</div>
+            <div className="modal-expl-note">
+              Surrogate model predictions — not observed metrics. Relative Score &gt; 1 means
+              above-median predicted performance; 1 = median. Not comparable to real CTR/ROAS.
+            </div>
+            <div className="modal-expl-rows">
+              {pick.gpr_mean  != null && <div className="modal-expl-row"><span>Relative Score</span><span>{Math.exp(pick.gpr_mean).toFixed(3)}</span></div>}
+              {pick.ei_score  != null && <div className="modal-expl-row"><span>Potential (EI)</span><span>{pick.ei_score.toFixed(4)}</span></div>}
+              {pick.gpr_std   != null && <div className="modal-expl-row"><span>Uncertainty (σ)</span><span>{pick.gpr_std.toFixed(3)}</span></div>}
+            </div>
+            {(pick.nearest_known ?? []).length > 0 && (
+              <div className="modal-expl-neighbors">
+                <div className="modal-expl-neighbors-title">Nearest known ads</div>
+                {pick.nearest_known.map((n, i) => (
+                  <div key={i} className="modal-expl-neighbor-row">
+                    <span className="modal-expl-neighbor-label">{n.label}</span>
+                    <span className="modal-expl-neighbor-stats">score {n.score.toFixed(3)} · dist {n.cosine_distance.toFixed(3)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         )}
       </div>
     </div>,
@@ -140,7 +160,7 @@ function PushModal({ pick, campaignName, platform, seedAdId, onConfirm, onClose 
             className="push-name-input"
             value={name}
             onChange={e => setName(e.target.value)}
-            placeholder="e.g. Summer Sale — BO Pick 2026-05-28"
+            placeholder="e.g. Summer Sale — Adstac.kr 2026-05-28"
             autoFocus
           />
         </label>
@@ -175,6 +195,7 @@ export default function BOPickCard({
   const [showPushModal, setShowPushModal] = useState(false);
   const [activating, setActivating] = useState(false);
   const [activateError, setActivateError] = useState(null);
+  const [retaining, setRetaining] = useState(false);
 
   // Local override for lifecycle state after a push in this session
   const [localState, setLocalState] = useState(null);
@@ -185,9 +206,11 @@ export default function BOPickCard({
   const platformAdId        = localState?.platform_ad_id ?? pick.platform_ad_id;
   const converged           = pick.converged ?? false;
   const currentImpressions  = pick.current_impressions ?? 0;
+  const cloneStatus         = localState?.clone_status   ?? pick.clone_status ?? null;
+  const comboId             = pick.combo_id ?? null;
 
   const selectionLabel =
-    pick.selection_type === "modal_q_ei" ? "Bayesian (Modal)" :
+    pick.selection_type === "modal_q_ei" ? "Adstac.kr" :
     pick.selection_type === "ei"         ? "Best expected" :
     pick.selection_type === "fantasy"    ? "Exploratory" : "Random";
 
@@ -202,7 +225,7 @@ export default function BOPickCard({
     setActivateError(null);
     try {
       await activatePick({ platform, platformAdId });
-      setLocalState(s => ({ ...s, push_status: "active" }));
+      setLocalState(s => ({ ...s, push_status: "active", clone_status: "clone_active" }));
       onActivated?.(pick);
     } catch (err) {
       setActivateError(err.message || "Activate failed");
@@ -211,7 +234,20 @@ export default function BOPickCard({
     }
   }
 
-  /* Action button */
+  async function handleRetain() {
+    if (!comboId) return;
+    setRetaining(true);
+    try {
+      await retainPick(comboId);
+      setLocalState(s => ({ ...s, clone_status: "clone_retained" }));
+    } finally {
+      setRetaining(false);
+    }
+  }
+
+  /* Action button — driven by clone_status when available, push_status as fallback */
+  const effectiveStatus = cloneStatus ?? (pushStatus === "paused" ? "clone_paused" : pushStatus === "active" ? "clone_active" : null);
+
   let actionButton;
   if (!alreadyPushed) {
     actionButton = (
@@ -219,7 +255,11 @@ export default function BOPickCard({
         Push and Run
       </button>
     );
-  } else if (pushStatus === "paused") {
+  } else if (effectiveStatus === "clone_invalidated") {
+    actionButton = (
+      <span className="push-status-badge push-status-invalidated">Invalidated</span>
+    );
+  } else if (effectiveStatus === "clone_paused") {
     actionButton = (
       <>
         <button className="btn-success" onClick={handleActivate} disabled={activating}>
@@ -228,11 +268,20 @@ export default function BOPickCard({
         {activateError && <span className="error-inline">{activateError}</span>}
       </>
     );
-  } else if (pushStatus === "active" && converged) {
+  } else if (effectiveStatus === "clone_converged") {
     actionButton = (
-      <span className="push-status-badge push-status-tested">Running ✓ — Tested</span>
+      <div className="bo-pick-converged-actions">
+        <span className="push-status-badge push-status-tested">Tested ✓</span>
+        <button className="btn-secondary btn-keep-running" onClick={handleRetain} disabled={retaining}>
+          {retaining ? "Saving…" : "Keep Running"}
+        </button>
+      </div>
     );
-  } else if (pushStatus === "active") {
+  } else if (effectiveStatus === "clone_retained") {
+    actionButton = (
+      <span className="push-status-badge push-status-running">Running ✓ — Retained</span>
+    );
+  } else if (effectiveStatus === "clone_active" || pushStatus === "active") {
     actionButton = currentImpressions > 0
       ? (
         <span className="push-status-badge push-status-testing">
@@ -260,14 +309,21 @@ export default function BOPickCard({
             <span className="bo-pick-type">{selectionLabel}</span>
           </div>
           {pick.combination.image_url && (
-            <p className="bo-pick-image-name">{imageNameFromUrl(pick.combination.image_url)}</p>
+            <div className="bo-pick-image-row">
+              <img
+                src={pick.combination.image_url}
+                alt="Ad creative"
+                className="bo-pick-thumbnail"
+              />
+              <span className="bo-pick-image-name">{imageNameFromUrl(pick.combination.image_url)}</span>
+            </div>
           )}
-          {pick.gpr_mean != null && (
-            <p className="bo-pick-score">
-              Score: <strong>{pick.gpr_mean.toFixed(2)}</strong>
-              {pick.ei_score != null && <> · EI: {pick.ei_score.toFixed(4)}</>}
+          {(pick.combination.headline || pick.combination.primary_text) && (
+            <p className="bo-pick-preview">
+              {pick.combination.headline || pick.combination.primary_text}
             </p>
           )}
+          <PotentialBadge pick={pick} />
         </div>
         <div className="bo-pick-actions" onClick={e => e.stopPropagation()}>
           {actionButton}

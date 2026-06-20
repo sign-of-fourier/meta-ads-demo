@@ -79,6 +79,130 @@
           }
         }
       }
+    },
+    {
+      "id": "adgen_7a729d11d9",
+      "name": "Coffee Sub \u2014 AI Ad",
+      "status": "PAUSED",
+      "effective_status": "PAUSED",
+      "campaign_id": "120210001",
+      "adset_id": "120211001",
+      "creative": {
+        "id": "creative_adgen_7a729d11d9",
+        "title": "Elevate Your Coffee Game!",
+        "body": "Get freshly roasted, single-origin pour-over beans delivered weekly. Experience the best in every cup\u2014subscribe now!",
+        "description": "Fresh single-origin coffee",
+        "image_url": "https://picsum.photos/seed/3e2c599f4c/600/315",
+        "thumbnail_url": "https://picsum.photos/seed/3e2c599f4c/600/315",
+        "object_story_spec": {
+          "page_id": "fake_page_999",
+          "link_data": {
+            "name": "Elevate Your Coffee Game!",
+            "description": "Fresh single-origin coffee",
+            "message": "Get freshly roasted, single-origin pour-over beans delivered weekly. Experience the best in every cup\u2014subscribe now!",
+            "link": "https://example-coffee.com/subscribe",
+            "call_to_action": {
+              "type": "SUBSCRIBE",
+              "value": {
+                "link": "https://example-coffee.com/subscribe"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "adgen_af83be170b",
+      "name": "Coffee Sub \u2014 AI Ad",
+      "status": "PAUSED",
+      "effective_status": "PAUSED",
+      "campaign_id": "120210001",
+      "adset_id": "120211001",
+      "creative": {
+        "id": "creative_adgen_af83be170b",
+        "title": "Fresh Single-Origin Coffee!",
+        "body": "Experience the freshest pour-over coffee with our weekly delivery of single-origin beans roasted just for you. Elevate your brew game today!",
+        "description": "Roasted fresh, delivered weekl",
+        "image_url": "https://picsum.photos/seed/3e2c599f4c/600/315",
+        "thumbnail_url": "https://picsum.photos/seed/3e2c599f4c/600/315",
+        "object_story_spec": {
+          "page_id": "fake_page_999",
+          "link_data": {
+            "name": "Fresh Single-Origin Coffee!",
+            "description": "Roasted fresh, delivered weekl",
+            "message": "Experience the freshest pour-over coffee with our weekly delivery of single-origin beans roasted just for you. Elevate your brew game today!",
+            "link": "https://example-coffee.com/subscribe",
+            "call_to_action": {
+              "type": "SUBSCRIBE",
+              "value": {
+                "link": "https://example-coffee.com/subscribe"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "adgen_576b014a86",
+      "name": "Coffee Sub \u2014 AI Ad",
+      "status": "PAUSED",
+      "effective_status": "PAUSED",
+      "campaign_id": "120210001",
+      "adset_id": "120211001",
+      "creative": {
+        "id": "creative_adgen_576b014a86",
+        "title": "Elevate Your Coffee Game",
+        "body": "Discover fresh single-origin pour-over beans, roasted weekly and delivered straight to your door. Experience coffee like never before!",
+        "description": "Fresh, single-origin coffee de",
+        "image_url": "https://picsum.photos/seed/4bf9a5cc14/600/315",
+        "thumbnail_url": "https://picsum.photos/seed/4bf9a5cc14/600/315",
+        "object_story_spec": {
+          "page_id": "fake_page_999",
+          "link_data": {
+            "name": "Elevate Your Coffee Game",
+            "description": "Fresh, single-origin coffee de",
+            "message": "Discover fresh single-origin pour-over beans, roasted weekly and delivered straight to your door. Experience coffee like never before!",
+            "link": "https://example-coffee.com/subscribe",
+            "call_to_action": {
+              "type": "SUBSCRIBE",
+              "value": {
+                "link": "https://example-coffee.com/subscribe"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "adgen_313a553a85",
+      "name": "Coffee Sub \u2014 AI Ad",
+      "status": "PAUSED",
+      "effective_status": "PAUSED",
+      "campaign_id": "120210001",
+      "adset_id": "120211001",
+      "creative": {
+        "id": "creative_adgen_313a553a85",
+        "title": "Discover Fresh Single-Origin Coffee!",
+        "body": "Experience the unique flavors of specialty pour-over coffee. Freshly roasted weekly and delivered straight to your door\u2014subscribe now and elevate your coffee ritual.",
+        "description": "Fresh single-origin beans, del",
+        "image_url": "https://picsum.photos/seed/b24b967924/600/315",
+        "thumbnail_url": "https://picsum.photos/seed/b24b967924/600/315",
+        "object_story_spec": {
+          "page_id": "fake_page_999",
+          "link_data": {
+            "name": "Discover Fresh Single-Origin Coffee!",
+            "description": "Fresh single-origin beans, del",
+            "message": "Experience the unique flavors of specialty pour-over coffee. Freshly roasted weekly and delivered straight to your door\u2014subscribe now and elevate your coffee ritual.",
+            "link": "https://example-coffee.com/subscribe",
+            "call_to_action": {
+              "type": "SUBSCRIBE",
+              "value": {
+                "link": "https://example-coffee.com/subscribe"
+              }
+            }
+          }
+        }
+      }
     }
   ],
   "120210002": [

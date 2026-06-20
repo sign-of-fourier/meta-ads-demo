@@ -7,11 +7,15 @@ Scored observations are read from scored_observations, which is written by:
   - convergence (metric='ctr'|'cvr'|'roas') after a pushed clone converges
 
 get_scored_combinations walks METRIC_PREFERENCE and returns the first metric
-with at least one row, unless target_metric is explicitly given.
+with sufficient rows: real metrics (ctr/cvr/roas) need >= MIN_REAL_OBS to
+displace warm-start fallbacks; synthetic/Qwen accept any non-empty result.
 
-Candidate combinations are unchanged: all rows in ad_text_combination_embeddings
-for text_source_id, each paired with every image in ad_image_embeddings (or the
-seed ad's image_vector as fallback).
+Candidate combinations: all rows in ad_text_combination_embeddings for
+text_source_id (or all source_ids in text_source_ids), each paired with every
+image in ad_image_embeddings for the seed ad (or all image_ad_ids).
+
+Both functions accept optional list overrides for multi-member ad generators.
+When lists are provided, results are merged across all member ads.
 """
 
 from __future__ import annotations
@@ -22,10 +26,9 @@ from pathlib import Path
 
 import numpy as np
 
-DB_PATH = Path(__file__).parent.parent / "app.db"
+from bo_pipeline.config import METRIC_PREFERENCE, MIN_REAL_OBS, REAL_METRICS
 
-# Metric resolution order: prefer real signals over synthetic ones.
-METRIC_PREFERENCE = ("ctr", "cvr", "roas", "qwen", "synthetic")
+DB_PATH = Path(__file__).parent.parent / "app.db"
 
 
 def _conn(db_path: Path) -> sqlite3.Connection:
@@ -47,12 +50,18 @@ def get_scored_combinations(
     user_id: int,
     db_path: Path = DB_PATH,
     target_metric: str | None = None,
+    seed_ad_ids: list[str] | None = None,
 ) -> list[dict]:
     """
     Return scored observations for seed_ad_id from scored_observations.
 
-    Walks METRIC_PREFERENCE and returns the first metric with >= 1 row,
-    unless target_metric is given (in which case only that metric is used).
+    When seed_ad_ids is provided (multi-member generator), observations are
+    merged across all member ad IDs.
+
+    Walks METRIC_PREFERENCE and returns the first metric with enough rows.
+    Real metrics (ctr/cvr/roas) require >= MIN_REAL_OBS rows before displacing
+    warm-start fallbacks. Synthetic/Qwen metrics accept any non-empty result.
+    When target_metric is given explicitly, only that metric is used (no threshold).
 
     Each returned dict:
       combination_key  — str
@@ -64,30 +73,66 @@ def get_scored_combinations(
     from bo_pipeline.storage import ensure_scored_observations_table
     ensure_scored_observations_table(db_path)
 
+    ids = seed_ad_ids if seed_ad_ids else [seed_ad_id]
+    placeholders = ",".join("?" * len(ids))
+
     c = _conn(db_path)
     try:
         metrics_to_try = (target_metric,) if target_metric else METRIC_PREFERENCE
         for metric in metrics_to_try:
             rows = c.execute(
-                """SELECT combination_key, combination, score, text_vector, image_vector
+                f"""SELECT combination_key, combination, score, text_vector, image_vector
                    FROM scored_observations
-                   WHERE user_id = ? AND seed_ad_id = ? AND metric = ?
+                   WHERE user_id = ? AND seed_ad_id IN ({placeholders}) AND metric = ?
                    ORDER BY id""",
-                (user_id, seed_ad_id, metric),
+                (user_id, *ids, metric),
             ).fetchall()
+            # Real metrics need a minimum count before displacing warm-start fallbacks.
+            # One observation is not enough for a meaningful GP fit.
+            if rows and metric in REAL_METRICS and len(rows) < MIN_REAL_OBS:
+                continue
             if rows:
-                return [
-                    {
-                        "combination_key": r["combination_key"],
-                        "combination": json.loads(r["combination"]),
-                        "score": float(r["score"]),
-                        "text_vector": _vec(r["text_vector"]),
-                        "image_vector": _vec(r["image_vector"]),
-                    }
-                    for r in rows
-                    if r["text_vector"] is not None
-                ]
+                # Deduplicate by combination_key, keeping the most recent score.
+                # Duplicates arise when warm-start or re-ingestion writes the same
+                # combination more than once; feeding duplicates to the GPR biases
+                # it toward those combinations and pollutes nearest-neighbor results.
+                seen: dict[str, dict] = {}
+                for r in rows:
+                    if r["text_vector"] is not None:
+                        seen[r["combination_key"]] = {
+                            "combination_key": r["combination_key"],
+                            "combination": json.loads(r["combination"]),
+                            "score": float(r["score"]),
+                            "text_vector": _vec(r["text_vector"]),
+                            "image_vector": _vec(r["image_vector"]),
+                        }
+                if seen:
+                    return list(seen.values())
         return []
+    finally:
+        c.close()
+
+
+def get_real_observation_count(
+    seed_ad_id: str,
+    user_id: int,
+    db_path: Path = DB_PATH,
+    seed_ad_ids: list[str] | None = None,
+) -> int:
+    """Return count of real-platform (ctr/cvr/roas) observations for this ad."""
+    from bo_pipeline.storage import ensure_scored_observations_table
+    ensure_scored_observations_table(db_path)
+    ids = seed_ad_ids if seed_ad_ids else [seed_ad_id]
+    placeholders = ",".join("?" * len(ids))
+    metric_placeholders = ",".join("?" * len(REAL_METRICS))
+    c = _conn(db_path)
+    try:
+        row = c.execute(
+            f"SELECT COUNT(*) FROM scored_observations "
+            f"WHERE user_id=? AND seed_ad_id IN ({placeholders}) AND metric IN ({metric_placeholders})",
+            (user_id, *ids, *REAL_METRICS),
+        ).fetchone()
+        return int(row[0]) if row else 0
     finally:
         c.close()
 
@@ -98,14 +143,20 @@ def get_candidate_combinations(
     user_id: int,
     exclude_keys: set[str] | None = None,
     db_path: Path = DB_PATH,
+    text_source_ids: list[str] | None = None,
+    image_ad_ids: list[str] | None = None,
 ) -> list[dict]:
     """
     Return all (text combination × image) candidates for the seed ad.
 
+    When text_source_ids is provided (multi-member generator), text combinations
+    are merged across all member ads. When image_ad_ids is provided, images are
+    pooled across all member ads.
+
     Each text combination from ad_text_combination_embeddings is paired with
-    every image embedding in ad_image_embeddings for the seed ad, producing
-    N×M candidates. Falls back to the single image_vector in ad_embeddings if
-    no per-image embeddings exist.
+    every image embedding in ad_image_embeddings, producing N×M candidates.
+    Falls back to the single image_vector in ad_embeddings if no per-image
+    embeddings exist (Google RSA zero-pad path).
 
     Each dict:
       combination_key  — str  (compound JSON of text combo + image_slot)
@@ -115,32 +166,37 @@ def get_candidate_combinations(
     """
     c = _conn(db_path)
 
+    img_ids = image_ad_ids if image_ad_ids else [seed_ad_id]
+    img_placeholders = ",".join("?" * len(img_ids))
     image_rows = c.execute(
-        """SELECT slot_index, image_ref, vector
+        f"""SELECT slot_index, image_ref, vector
            FROM ad_image_embeddings
-           WHERE user_id = ? AND ad_id = ?
-           ORDER BY slot_index""",
-        (user_id, seed_ad_id),
+           WHERE user_id = ? AND ad_id IN ({img_placeholders})
+           ORDER BY ad_id, slot_index""",
+        (user_id, *img_ids),
     ).fetchall()
 
     if image_rows:
         image_slots = [
-            {"slot_index": r["slot_index"], "image_ref": r["image_ref"], "image_vec": _vec(r["vector"])}
-            for r in image_rows
+            {"slot_index": i, "image_ref": r["image_ref"], "image_vec": _vec(r["vector"])}
+            for i, r in enumerate(image_rows)
         ]
     else:
+        # Fallback: use seed ad's combined image_vector (zero-padded for Google RSA)
         seed_row = c.execute(
             "SELECT image_vector FROM ad_embeddings WHERE ad_id = ? AND user_id = ?",
             (seed_ad_id, user_id),
         ).fetchone()
         image_slots = [{"slot_index": 0, "image_ref": None, "image_vec": _vec(seed_row["image_vector"]) if seed_row else None}]
 
+    src_ids = text_source_ids if text_source_ids else [text_source_id]
+    src_placeholders = ",".join("?" * len(src_ids))
     text_rows = c.execute(
-        """SELECT combination_key, vector
+        f"""SELECT combination_key, vector
            FROM ad_text_combination_embeddings
-           WHERE source_id = ?
+           WHERE source_id IN ({src_placeholders})
            ORDER BY id""",
-        (text_source_id,),
+        (*src_ids,),
     ).fetchall()
     c.close()
 

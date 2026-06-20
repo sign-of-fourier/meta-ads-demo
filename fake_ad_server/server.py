@@ -22,7 +22,7 @@ from routes.meta import router as meta_router
 from routes.google import router as google_router
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 

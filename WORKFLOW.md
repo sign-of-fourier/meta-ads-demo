@@ -174,10 +174,12 @@ Each pick shows which platform and ad it came from. Push works the same as the p
 | Push and Run modal + per-pick push | ✓ |
 | Activate | ✓ |
 | Fake ad server (for testing push end-to-end) | ✓ |
-| Convergence checking during ingest | ✗ not yet |
-| "Testing… N impr." UI intermediate state | ✗ not yet |
-| Mid-test edit detection (orphan ad handling) | ✗ not yet |
-| Google clone detection via resource name | ✗ not yet |
+| Convergence checking during ingest | ✓ (Meta + Google) |
+| `clone_status` lifecycle state machine | ✓ |
+| "Testing… N impr." UI intermediate state | ✓ |
+| Mid-test edit detection (invalidation at ingest) | ✓ (Meta + Google) |
+| Google clone detection via resource name | ✓ |
+| Google RSA pin-all slots for clean CTR measurement | ✓ (when `ad_parent_fillers` populated) |
 | Ad Library showing pushed clones | ✗ not yet |
 
 ---
@@ -185,19 +187,16 @@ Each pick shows which platform and ad it came from. Push works the same as the p
 ## Open design decisions
 
 **Gap A — User edits a pushed clone on the platform:**
-Detected at ingest by comparing ingested creative fields against `pushed_ad_combos.combination`.
-- Edit before convergence (mid-test): mark `push_status = 'invalidated'`, discard metrics. Modified ad becomes a fresh native static ad.
-- Edit after convergence: locked-in CTR remains valid (reflects original combination). Modified ad spawns as a new native static ad going forward.
-Original combination stays permanently excluded from the candidate space in both cases.
+Implemented at ingest: ingested creative fields compared against `pushed_ad_combos.combination`; mismatch → `clone_status = 'clone_invalidated'`. The edited combination is excluded from future BO runs. See `TECHNICAL_DEBT.md` for the post-convergence edit case (currently treated same as pre-convergence).
 
 **Gap B — User deletes a pushed clone on the platform:**
-If `platform_ad_id` is absent for N consecutive ingests, mark `push_status = 'deleted'`. Combination stays excluded permanently.
+Not yet implemented. Deleted clones show as `lifecycle_status='missing'` in `ad_creative_structures` but `pushed_ad_combos` record persists. Convergence checker keeps querying metrics for a deleted ad until it is manually cleaned up. Tracked in `TECHNICAL_DEBT.md`.
 
 **Gap C — Multiple users sharing one ad account:**
 `pushed_ad_combos` is keyed by `user_id`. Combinations pushed by user A are invisible to user B — they could push duplicates. Acceptable for single-tenant; needs resolution before multi-user accounts.
 
-**Gap D — Google RSA CTR is noisy:**
-We pin headline 1 + description 1; Google freely rotates remaining slots. CTR reflects our pick as lead plus Google's rotation of supporting copy. Accepted: the GPR's uncertainty widens where noise is high, which schedules more exploration there. Revisit post-launch.
+**Gap D — Google RSA CTR signal quality:**
+When `ad_parent_fillers` is populated (first ingest of a parent RSA), all 5 slots are pinned and CTR cleanly measures the BO-selected pair. When fillers are absent (fallback path), only HEADLINE_1 and DESCRIPTION_1 are pinned; Google rotates remaining slots freely and CTR blends our pick with Google's rotation. The fallback path still works — GPR uncertainty widens where noise is high — but is noisier. Resolution: ensure all RSA parents get fillers at first ingest.
 
 **Gap E — GP target metric consistency:**
 All training targets fed to the GP must be on the same scale and measure the same thing. Qwen2-VL scores (1–7, synthetic) and real CTR/CVR/ROAS cannot be mixed — they measure different things and rank-normalisation does not fix the semantic mismatch. Current state: Qwen2-only until real metrics dominate. Future feature: user-selectable KPI (CTR / CVR / ROAS); once selected, only real converged observations on that metric enter the training set.

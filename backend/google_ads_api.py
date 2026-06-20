@@ -10,8 +10,13 @@ _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _GOOGLE_ADS_BASE = os.getenv("FAKE_GOOGLE_BASE_URL", "https://googleads.googleapis.com")
 
 
+_USING_FAKE_SERVER = bool(os.getenv("FAKE_GOOGLE_BASE_URL", ""))
+
+
 async def refresh_access_token(refresh_token: str) -> str:
     """Exchange a refresh token for a fresh access token."""
+    if _USING_FAKE_SERVER:
+        return "fake_google_access_token"
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
             _GOOGLE_TOKEN_URL,
@@ -91,10 +96,14 @@ async def create_rsa(
     final_url: str,
     login_customer_id: str | None = None,
     ad_name: str | None = None,
+    pin_all: bool = False,
 ) -> str:
     """Create a new PAUSED Responsive Search Ad via the Mutate API.
 
-    The first headline and first description are pinned (HEADLINE_1, DESCRIPTION_1).
+    When pin_all=False (default): pins only HEADLINE_1 and DESCRIPTION_1.
+    When pin_all=True: pins all 5 slots so every impression shows the same
+    combination — required for test clones where CTR must reflect exactly one
+    (headline, description) pair.
     Google RSA requires at least 3 headlines and 2 descriptions.
     Returns the resource name of the created ad group ad.
     """
@@ -107,13 +116,26 @@ async def create_rsa(
     if login_customer_id:
         headers["login-customer-id"] = login_customer_id
 
-    headline_assets = [{"text": h} for h in headlines]
-    if headline_assets:
-        headline_assets[0]["pinnedField"] = "HEADLINE_1"
+    _HEADLINE_PINS = ["HEADLINE_1", "HEADLINE_2", "HEADLINE_3"]
+    _DESC_PINS = ["DESCRIPTION_1", "DESCRIPTION_2"]
 
-    description_assets = [{"text": d} for d in descriptions]
-    if description_assets:
-        description_assets[0]["pinnedField"] = "DESCRIPTION_1"
+    headline_assets = []
+    for i, h in enumerate(headlines):
+        asset: dict = {"text": h}
+        if pin_all and i < len(_HEADLINE_PINS):
+            asset["pinnedField"] = _HEADLINE_PINS[i]
+        elif i == 0:
+            asset["pinnedField"] = "HEADLINE_1"
+        headline_assets.append(asset)
+
+    description_assets = []
+    for i, d in enumerate(descriptions):
+        asset = {"text": d}
+        if pin_all and i < len(_DESC_PINS):
+            asset["pinnedField"] = _DESC_PINS[i]
+        elif i == 0:
+            asset["pinnedField"] = "DESCRIPTION_1"
+        description_assets.append(asset)
 
     body = {
         "mutateOperations": [

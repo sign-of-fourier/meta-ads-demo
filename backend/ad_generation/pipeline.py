@@ -385,3 +385,4 @@ async def _score(vid: int, job: dict, db_path: Path) -> None:
         _write_qwen_observation(vid, job, result.score, db_path)
     except Exception as exc:
         logger.warning("job %d variant %d: scoring failed: %s", job["id"], vid, exc)
+        update_variant(vid, db_path, status="failed", error=str(exc))

@@ -677,7 +677,7 @@ export default function CampaignsPage({ onIngest = null, batchedAdIds = [] }) {
                               className="btn-primary"
                               onClick={() => handleGetRecommendations(c.id)}
                               disabled={boStateById[c.id] === "loading"}
-                              title="Bayesian Optimisation: suggests the best headline, copy, and image combinations to test next"
+                              title="Adstac.kr: suggests the best headline, copy, and image combinations to test next"
                             >
                               {boStateById[c.id] === "loading" ? "Running…" : "Get Recommendations"}
                             </button>
@@ -858,7 +858,7 @@ export default function CampaignsPage({ onIngest = null, batchedAdIds = [] }) {
                               </p>
                               {boStateById[c.id].picks.length === 0 ? (
                                 <p className="history-empty">
-                                  Not enough scored data yet — generate a Dynamic Ad first, then run BO again.
+                                  Not enough scored data yet — generate a Dynamic Ad first, then run Adstac.kr again.
                                 </p>
                               ) : (
                                 boStateById[c.id].picks.map((pick, i) => (

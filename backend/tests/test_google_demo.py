@@ -166,7 +166,6 @@ class TestGoogleMaskPolicy:
 
 # ── GoogleMaskingProvider ──────────────────────────────────────────────────────
 
-@pytest.mark.skip(reason="masking layer deprecated — kept for reference only")
 class TestGoogleMaskingProvider:
     def _make_provider(self, live_campaigns, live_metrics, **policy_kwargs):
         from providers.google_mask_policy import GoogleMaskPolicy
@@ -186,30 +185,27 @@ class TestGoogleMaskingProvider:
 
         return GoogleMaskingProvider(mock_live, policy), mock_live
 
-    @pytest.mark.asyncio
-    async def test_mask_status_forces_active(self):
+    def test_mask_status_forces_active(self):
         camps = [{"id": "c1", "status": "PAUSED", "daily_budget": 5000}]
         provider, _ = self._make_provider(
             camps, {"c1": {"impressions": 10, "clicks": 1, "spend": 0.5}},
             mask_status=True, mask_budgets=False, mask_metrics=False, mask_pause_resume=False,
             metric_profile="healthy",
         )
-        result_camps, _, _ = await provider.fetch_campaigns_and_insights(None, "", "")
+        result_camps, _, _ = asyncio.run(provider.fetch_campaigns_and_insights(None, "", ""))
         assert result_camps[0]["status"] == "ACTIVE"
 
-    @pytest.mark.asyncio
-    async def test_mask_budgets_replaces_budget(self):
+    def test_mask_budgets_replaces_budget(self):
         camps = [{"id": "budget_test_id_1", "status": "ACTIVE", "daily_budget": 999}]
         provider, _ = self._make_provider(
             camps, {},
             mask_status=False, mask_budgets=True, mask_metrics=False, mask_pause_resume=False,
             metric_profile="healthy",
         )
-        result_camps, _, _ = await provider.fetch_campaigns_and_insights(None, "", "")
+        result_camps, _, _ = asyncio.run(provider.fetch_campaigns_and_insights(None, "", ""))
         assert result_camps[0]["daily_budget"] != 999
 
-    @pytest.mark.asyncio
-    async def test_mask_metrics_replaces_low_delivery(self):
+    def test_mask_metrics_replaces_low_delivery(self):
         camps = [{"id": "low_camp", "status": "ACTIVE", "daily_budget": 5000}]
         low_metrics = {"low_camp": {"impressions": 10, "clicks": 1, "spend": 0.5}}
         provider, _ = self._make_provider(
@@ -217,11 +213,10 @@ class TestGoogleMaskingProvider:
             mask_status=False, mask_budgets=False, mask_metrics=True, mask_pause_resume=False,
             metric_profile="healthy",
         )
-        _, result_metrics, _ = await provider.fetch_campaigns_and_insights(None, "", "")
+        _, result_metrics, _ = asyncio.run(provider.fetch_campaigns_and_insights(None, "", ""))
         assert result_metrics["low_camp"]["impressions"] > 100
 
-    @pytest.mark.asyncio
-    async def test_mask_metrics_preserves_healthy(self):
+    def test_mask_metrics_preserves_healthy(self):
         camps = [{"id": "healthy_camp", "status": "ACTIVE", "daily_budget": 5000}]
         real_metrics = {"healthy_camp": {"impressions": 50_000, "clicks": 900, "spend": 360.0}}
         provider, _ = self._make_provider(
@@ -229,11 +224,10 @@ class TestGoogleMaskingProvider:
             mask_status=False, mask_budgets=False, mask_metrics=True, mask_pause_resume=False,
             metric_profile="healthy",
         )
-        _, result_metrics, _ = await provider.fetch_campaigns_and_insights(None, "", "")
+        _, result_metrics, _ = asyncio.run(provider.fetch_campaigns_and_insights(None, "", ""))
         assert result_metrics["healthy_camp"]["impressions"] == 50_000
 
-    @pytest.mark.asyncio
-    async def test_pause_noop_when_masked(self):
+    def test_pause_noop_when_masked(self):
         from providers.google_mask_policy import GoogleMaskPolicy
         from providers.google_masking import GoogleMaskingProvider
 
@@ -243,11 +237,10 @@ class TestGoogleMaskingProvider:
         policy.mask_pause_resume = True
 
         p = GoogleMaskingProvider(mock_live, policy)
-        await p.pause_campaign(None, "", "c1")
+        asyncio.run(p.pause_campaign(None, "", "c1"))
         mock_live.pause_campaign.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_pause_delegates_when_unmasked(self):
+    def test_pause_delegates_when_unmasked(self):
         from providers.google_mask_policy import GoogleMaskPolicy
         from providers.google_masking import GoogleMaskingProvider
 
@@ -257,7 +250,7 @@ class TestGoogleMaskingProvider:
         policy.mask_pause_resume = False
 
         p = GoogleMaskingProvider(mock_live, policy)
-        await p.pause_campaign(None, "tok", "c1")
+        asyncio.run(p.pause_campaign(None, "tok", "c1"))
         mock_live.pause_campaign.assert_called_once()
 
 

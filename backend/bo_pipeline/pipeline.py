@@ -23,8 +23,9 @@ Scored observations come from scored_observations (written by the seed script,
 Qwen2-VL pipeline, or convergence checking).  Candidates are text combinations
 from ad_text_combination_embeddings paired with the seed ad's image embedding.
 
-Per-ad constraint: seed_ad_id and text_source_id must refer to the same ad.
-The caller is responsible for providing consistent identifiers.
+For single-ad runs, seed_ad_id and text_source_id refer to the same ad.
+For multi-member generators, pass seed_ad_ids / text_source_ids / image_ad_ids
+to merge asset pools across multiple dynamic ads.
 
 Higher score = better ad (consistent with the 1–7 rating scale).
 If your scorer inverts this, negate scores before calling or pass higher_is_better=False.
@@ -59,6 +60,81 @@ def _build_X(combinations: list[dict], platform: str = "meta") -> np.ndarray:
     if platform == "google":
         return np.vstack([c["text_vector"] for c in combinations])
     return np.vstack([combine(c["text_vector"], c["image_vector"]) for c in combinations])
+
+
+# ---------------------------------------------------------------------------
+# _expl_* helpers — explainability only, never used in BO selection decisions
+# ---------------------------------------------------------------------------
+# Functions prefixed _expl_ compute statistics purely for UI display.
+# They must not influence which candidates are chosen.
+
+def _expl_combo_label(combination: dict) -> str:
+    """Short human-readable label from a combination's text slots."""
+    for key in ("headline", "primary_text", "description"):
+        val = combination.get(key)
+        if val:
+            s = str(val)
+            return s if len(s) <= 50 else s[:50] + "…"
+    return "—"
+
+
+def _expl_nearest_known(
+    pick_vec: np.ndarray,
+    scored: list[dict],
+    X_scored: np.ndarray,
+    k: int = 3,
+) -> list[dict]:
+    """
+    Top-k scored observations nearest to pick_vec by cosine distance.
+    Operates in the original (pre-PCA) embedding space.
+    """
+    if not scored:
+        return []
+    a = pick_vec.ravel().astype(np.float64)
+    na = float(np.linalg.norm(a))
+    out = []
+    for i, s in enumerate(scored):
+        b = X_scored[i].ravel().astype(np.float64)
+        nb = float(np.linalg.norm(b))
+        dist = 1.0 if (na == 0 or nb == 0) else float(1.0 - np.dot(a, b) / (na * nb))
+        out.append({
+            "label": _expl_combo_label(s["combination"]),
+            "score": float(s["score"]),
+            "cosine_distance": round(dist, 4),
+            "combination": s["combination"],
+        })
+    out.sort(key=lambda x: x["cosine_distance"])
+    return out[:k]
+
+
+def _expl_local_gp_stats(
+    picked_indices: list[int],
+    X_train: np.ndarray,
+    y_transformed: np.ndarray,
+    X_cands: np.ndarray,
+    xi: float = 0.01,
+) -> list[dict]:
+    """
+    Fit a local GPR on PCA-projected data to get per-pick GP statistics for display.
+
+    The actual candidate selection was performed by Modal q-EI — this local GPR
+    exists solely so the UI can show Probable Score, Uncertainty, and univariate EI
+    next to each recommendation. It does not affect which candidates were chosen.
+    """
+    try:
+        gpr, scaler = fit_gpr(X_train.astype(np.float64), y_transformed.astype(np.float64))
+        y_best = float(y_transformed.max())
+        out = []
+        for idx in picked_indices:
+            x = X_cands[[idx]].astype(np.float64)
+            mu, sigma = predict_with_std(gpr, scaler, x)
+            ei = expected_improvement(gpr, scaler, x, y_best, xi=xi)
+            out.append({"gpr_mean": float(mu[0]), "gpr_std": float(sigma[0]), "ei_score": float(ei[0])})
+        logger.info("_expl_local_gp_stats [pipeline]: y_best=%.4f results=%s", y_best, out)
+        return out
+    except Exception:
+        logger.exception("_expl_local_gp_stats [pipeline]: failed for indices=%s X_train.shape=%s", picked_indices, X_train.shape)
+        return [{"gpr_mean": None, "gpr_std": None, "ei_score": None}] * len(picked_indices)
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +175,7 @@ def _run_local_bo(
         ei_score=float(ei_scores[pick1_idx]),
         gpr_mean=float(mu1[0]),
         gpr_std=float(sigma1[0]),
+        nearest_known=_expl_nearest_known(X_cands[pick1_idx], scored, X_train),
     )
 
     if len(candidates) == 1:
@@ -120,6 +197,7 @@ def _run_local_bo(
         ei_score=float(ei_scores2[pick2_idx]),
         gpr_mean=float(mu2[0]),
         gpr_std=float(sigma2[0]),
+        nearest_known=_expl_nearest_known(X_cands[remaining_idx[pick2_idx]], scored, X_train),
     )
 
     return [pick1, pick2]
@@ -173,21 +251,38 @@ def _run_modal_bo(
     # returns indices directly — no snap-to-pool step needed.
     suggestions = call_modal_api(
         api_url=api_url,
-        X_train_pca=X_train_pca,
+        X=X_train_pca,
         y=y,
-        X_cands_pca=X_cands_pca,
+        candidates=X_cands_pca,
         q=min(2, len(candidates)),
         xi=xi,
     )
 
-    picks = []
+    # Deduplicate Modal suggestions while preserving rank order.
+    ordered_indices: list[int] = []
     seen_indices: set[int] = set()
     for suggestion in suggestions:
         idx = suggestion["index"]
-        if idx in seen_indices:
-            continue
-        seen_indices.add(idx)
-        picks.append(_make_pick(candidates[idx], _MODAL_TYPE))
+        if idx not in seen_indices:
+            seen_indices.add(idx)
+            ordered_indices.append(idx)
+
+    # EXPLAINABILITY: fit a local GPR on the PCA-projected data to get per-pick
+    # GP statistics for the UI (Probable Score, Uncertainty, univariate EI).
+    # Modal q-EI already chose these candidates — the local GPR only provides display values.
+    y_expl = transform_y(y_raw.astype(np.float64))
+    expl_stats = _expl_local_gp_stats(ordered_indices, X_train_pca, y_expl, X_cands_pca, xi)
+
+    picks = []
+    for i, idx in enumerate(ordered_indices):
+        expl = expl_stats[i]
+        picks.append(_make_pick(
+            candidates[idx], _MODAL_TYPE,
+            ei_score=expl["ei_score"],
+            gpr_mean=expl["gpr_mean"],
+            gpr_std=expl["gpr_std"],
+            nearest_known=_expl_nearest_known(X_cands[idx], scored, X_scored),
+        ))
 
     return picks
 
@@ -207,9 +302,16 @@ def run_bo(
     platform: str = "meta",
     additional_exclude_keys: set[str] | None = None,
     target_metric: str | None = None,
+    seed_ad_ids: list[str] | None = None,
+    text_source_ids: list[str] | None = None,
+    image_ad_ids: list[str] | None = None,
 ) -> tuple[list[dict], str | None, int, int]:
     """
     Select up to 2 combinations to test next via Bayesian Optimisation.
+
+    For single-ad runs: seed_ad_id and text_source_id identify the ad.
+    For multi-member generators: seed_ad_ids / text_source_ids / image_ad_ids
+    override the single-ad params and merge pools across all member ads.
 
     method="modal"  (default) — uses the Modal GP service with PCA preprocessing
                                 and proper batch q-EI; falls back to "local" if
@@ -230,11 +332,18 @@ def run_bo(
     """
     from bo_pipeline.modal_bo import modal_bo_enabled
 
-    scored = get_scored_combinations(seed_ad_id, text_source_id, user_id, db_path, target_metric=target_metric)
+    scored = get_scored_combinations(
+        seed_ad_id, text_source_id, user_id, db_path,
+        target_metric=target_metric,
+        seed_ad_ids=seed_ad_ids,
+    )
     scored_keys = {s["combination_key"] for s in scored}
     all_exclude = scored_keys | (additional_exclude_keys or set())
     candidates = get_candidate_combinations(
-        text_source_id, seed_ad_id, user_id, exclude_keys=all_exclude, db_path=db_path
+        text_source_id, seed_ad_id, user_id,
+        exclude_keys=all_exclude, db_path=db_path,
+        text_source_ids=text_source_ids,
+        image_ad_ids=image_ad_ids,
     )
     scored_count = len(scored)
     candidate_count = len(candidates)
@@ -282,6 +391,7 @@ def _make_pick(
     ei_score: float | None = None,
     gpr_mean: float | None = None,
     gpr_std: float | None = None,
+    nearest_known: list[dict] | None = None,
 ) -> dict:
     return {
         "combination_key": cand["combination_key"],
@@ -290,4 +400,5 @@ def _make_pick(
         "ei_score": ei_score,
         "gpr_mean": gpr_mean,
         "gpr_std": gpr_std,
+        "nearest_known": nearest_known if nearest_known is not None else [],
     }
