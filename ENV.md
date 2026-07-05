@@ -12,6 +12,7 @@ All vars go in `backend/.env`. Copy from `backend/.env.example` and fill in valu
 | `META_API_VERSION` | Defaults to `v19.0` |
 | `JWT_SECRET` | Any random string |
 | `FRONTEND_URL` | Defaults to `http://localhost:5173` |
+| `ADMIN_API_KEY` | Shared secret for `POST /api/admin/users/{id}/tier` (checked via `X-Admin-Key` header, constant-time compare). Unset → the admin route always 503s. Internal use only — never expose to the frontend. See `BACKEND.md` §`permissions.py` |
 
 ## Google Ads
 
@@ -93,7 +94,7 @@ FAKE_META_BASE_URL=http://localhost:9000/meta/v19.0
 FAKE_GOOGLE_BASE_URL=http://localhost:9000/google
 ```
 
-See `FAKE_AD_SERVER.md` for details.
+See `FAKE_ADS_TESTING.md` for details.
 
 ## Masking / demo env vars
 

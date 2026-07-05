@@ -318,12 +318,9 @@ class TestPCADimsForPlatform:
         assert pca_dims_for_platform("tiktok") == pca_dims_for_platform("meta")
 
     def test_google_env_override(self, monkeypatch):
-        monkeypatch.setenv("GOOGLE_BO_PCA_DIMS", "16")
-        from importlib import reload
-        import bo_pipeline.modal_bo as mb
-        reload(mb)
-        assert mb.pca_dims_for_platform("google") == 16
-        reload(mb)  # restore
+        monkeypatch.setattr("bo_pipeline.config.GOOGLE_BO_PCA_DIMS", 16)
+        from bo_pipeline.modal_bo import pca_dims_for_platform
+        assert pca_dims_for_platform("google") == 16
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -331,7 +328,7 @@ class TestPCADimsForPlatform:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestBOGroupBuildX:
-    """Verify build_X returns the correct input dimension per platform."""
+    """Verify build_X dimension is determined by image_vector presence, not platform."""
 
     def _make_obs(self, with_image: bool = True) -> dict:
         return {
@@ -342,50 +339,42 @@ class TestBOGroupBuildX:
             "combination": {},
         }
 
-    def test_meta_group_returns_combined_dim(self):
+    def test_with_image_returns_combined_dim(self):
         from bo_pipeline.cross_platform import BOGroup
-        group = BOGroup(platform="meta", seed_ad_id="x", text_source_id="x")
-        obs = [self._make_obs(with_image=True) for _ in range(3)]
-        X = group.build_X(obs)
-        assert X.shape == (3, COMBINED_DIM), f"Expected (3, {COMBINED_DIM}), got {X.shape}"
+        for platform in ("meta", "google", "manual"):
+            group = BOGroup(platform=platform, seed_ad_id="x", text_source_id="x")
+            obs = [self._make_obs(with_image=True) for _ in range(3)]
+            X = group.build_X(obs)
+            assert X.shape == (3, COMBINED_DIM), f"[{platform}] Expected (3, {COMBINED_DIM}), got {X.shape}"
 
-    def test_google_group_returns_text_dim(self):
+    def test_without_image_returns_text_dim(self):
         from bo_pipeline.cross_platform import BOGroup
-        group = BOGroup(platform="google", seed_ad_id="x", text_source_id="x")
-        obs = [self._make_obs(with_image=False) for _ in range(3)]
-        X = group.build_X(obs)
-        assert X.shape == (3, TEXT_EMBED_DIM), f"Expected (3, {TEXT_EMBED_DIM}), got {X.shape}"
+        for platform in ("meta", "google", "manual"):
+            group = BOGroup(platform=platform, seed_ad_id="x", text_source_id="x")
+            obs = [self._make_obs(with_image=False) for _ in range(3)]
+            X = group.build_X(obs)
+            assert X.shape == (3, TEXT_EMBED_DIM), f"[{platform}] Expected (3, {TEXT_EMBED_DIM}), got {X.shape}"
 
-    def test_meta_and_google_have_different_input_dims(self):
-        """The key property: different lengths prevent accidental GPR mixing."""
+    def test_image_presence_determines_dim_not_platform(self):
+        """Same observation with image → combined; without image → text-only, regardless of platform."""
         from bo_pipeline.cross_platform import BOGroup
-        meta_group = BOGroup(platform="meta", seed_ad_id="x", text_source_id="x")
-        google_group = BOGroup(platform="google", seed_ad_id="y", text_source_id="y")
-        obs = [self._make_obs(with_image=True)]
+        meta_with = BOGroup(platform="meta", seed_ad_id="x", text_source_id="x")
+        google_with = BOGroup(platform="google", seed_ad_id="y", text_source_id="y")
+        obs_with = [self._make_obs(with_image=True)]
+        assert meta_with.build_X(obs_with).shape[1] == google_with.build_X(obs_with).shape[1] == COMBINED_DIM
 
-        X_meta = meta_group.build_X(obs)
-        X_google = google_group.build_X(obs)
-        assert X_meta.shape[1] != X_google.shape[1], (
-            "Meta and Google must have different feature dimensions"
-        )
-        assert X_meta.shape[1] == COMBINED_DIM
-        assert X_google.shape[1] == TEXT_EMBED_DIM
-
-    def test_meta_with_none_image_still_works(self):
-        """combine() zero-pads when image_vector is None — must not crash."""
-        from bo_pipeline.cross_platform import BOGroup
-        group = BOGroup(platform="meta", seed_ad_id="x", text_source_id="x")
-        obs = [self._make_obs(with_image=False)]
-        X = group.build_X(obs)
-        assert X.shape == (1, COMBINED_DIM)
+        meta_without = BOGroup(platform="meta", seed_ad_id="x", text_source_id="x")
+        google_without = BOGroup(platform="google", seed_ad_id="y", text_source_id="y")
+        obs_without = [self._make_obs(with_image=False)]
+        assert meta_without.build_X(obs_without).shape[1] == google_without.build_X(obs_without).shape[1] == TEXT_EMBED_DIM
 
     def test_output_dtype_is_float32(self):
         from bo_pipeline.cross_platform import BOGroup
-        for platform in ("meta", "google"):
+        for platform, with_image in (("meta", True), ("google", False), ("manual", True), ("manual", False)):
             group = BOGroup(platform=platform, seed_ad_id="x", text_source_id="x")
-            obs = [self._make_obs(with_image=(platform == "meta"))]
+            obs = [self._make_obs(with_image=with_image)]
             X = group.build_X(obs)
-            assert X.dtype == np.float32, f"Expected float32 for {platform}"
+            assert X.dtype == np.float32, f"Expected float32 for {platform} with_image={with_image}"
 
     def test_google_pca_dims_smaller_than_meta(self):
         from bo_pipeline.cross_platform import BOGroup
@@ -657,6 +646,19 @@ class TestCrossPlatformBO:
         t_google_max = transform(np.array([4.4]))[0]
         assert t_meta_high > t_google_max
 
+    def test_pca_warning_surfaced_when_capped(self, cp_db):
+        """
+        T12 (testing an approach, not yet signed off): cp_db has far fewer
+        samples per platform (Meta 4+8=12, Google 3+8=11) than each platform's
+        configured PCA dims, so both groups' PCA gets capped — group_stats
+        should carry pca_warning for each.
+        """
+        from bo_pipeline.cross_platform import run_cross_platform_bo
+        method = os.getenv("BO_TEST_METHOD", "local")
+        _, group_stats = run_cross_platform_bo(_PAIRS, TEST_USER_ID, db_path=cp_db, method=method)
+        for stats in group_stats:
+            assert stats.get("pca_warning"), f"expected pca_warning for {stats['platform']}"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TestCrossPlatformBOEndpoint — FastAPI route (mocked pipeline)
@@ -922,6 +924,17 @@ class TestUnifiedBOMultioutput:
     def test_top_n_respected(self, cp_db):
         picks, _ = self._run(cp_db, top_n=1)
         assert len(picks) <= 1
+
+    def test_pca_warning_surfaced_when_capped(self, cp_db):
+        """
+        T12 (testing an approach, not yet signed off): the cp_db fixture has far
+        fewer samples per platform (Meta 4+8=12, Google 3+8=11) than
+        MODAL_BO_PCA_DIMS (64), so PCA is capped for both platforms — this
+        should show up as pca_warning on each platform's group_stats entry.
+        """
+        _, group_stats = self._run(cp_db)
+        for stats in group_stats:
+            assert stats.get("pca_warning"), f"expected pca_warning for {stats['platform']}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

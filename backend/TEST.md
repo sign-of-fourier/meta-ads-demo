@@ -380,3 +380,70 @@ python tests/test_finetune_embed.py
 - `tests/test_google_campaigns.py::test_google_campaigns_live_smoke` — 1 test skipped; requires real Google credentials in `.env`.
 
 All other pure tests (no API keys needed) pass cleanly.
+
+---
+
+## Manual / curl tests — Masking layer
+
+For verifying the masking layer behaviour against a live Meta account.
+
+```bash
+export API="http://localhost:8000"
+export TOKEN="<paste JWT here>"   # from POST /auth/login
+```
+
+### Campaigns
+
+```bash
+curl -s "$API/api/campaigns" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+Run twice and diff to verify determinism when masking is on:
+
+```bash
+curl -s "$API/api/campaigns" -H "Authorization: Bearer $TOKEN" | jq > /tmp/c1.json
+curl -s "$API/api/campaigns" -H "Authorization: Bearer $TOKEN" | jq > /tmp/c2.json
+diff /tmp/c1.json /tmp/c2.json   # should be empty
+```
+
+### Sync + ingest
+
+```bash
+curl -s -X POST "$API/api/ingest" -H "Authorization: Bearer $TOKEN" | jq
+
+export CAMPAIGN_ID="<id from /api/campaigns>"
+curl -s -X POST "$API/api/ingest/structure/$CAMPAIGN_ID" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+### Verify embeddings after structural ingest
+
+```bash
+# Seed embedding per ad
+sqlite3 backend/app.db "SELECT ad_id, CASE WHEN text_vector IS NULL THEN 'no' ELSE 'yes' END as has_text, CASE WHEN image_vector IS NULL THEN 'no' ELSE 'yes' END as has_image FROM ad_embeddings;"
+
+# Per-image-slot embeddings
+sqlite3 backend/app.db "SELECT ad_id, slot_index, image_ref, CASE WHEN vector IS NULL THEN 'no' ELSE 'yes' END as embedded FROM ad_image_embeddings;"
+
+# Text combination embeddings — a 4×4×4 dynamic ad produces 64 rows
+sqlite3 backend/app.db "SELECT source_id, COUNT(*) as combinations FROM ad_text_combination_embeddings GROUP BY source_id;"
+```
+
+If `has_image` is `no`, `AZURE_INFERENCE_KEY` is likely missing or wrong. If `has_text` is `no`, check `OPENAI_KEY`. Hit "Reingest" after fixing keys — the backend skips already-complete embeddings.
+
+### Pause / Resume
+
+```bash
+curl -s -X POST "$API/api/campaigns/$CAMPAIGN_ID/pause"  -H "Authorization: Bearer $TOKEN" | jq
+curl -s -X POST "$API/api/campaigns/$CAMPAIGN_ID/resume" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+With `MASK_PAUSE_RESUME=true` both return success without hitting Meta.
+
+### Reference env configs
+
+| Scenario | Env vars |
+|---|---|
+| Real baseline | `APP_MODE=live MASK_MODE=off` |
+| Full selective mask | `MASK_MODE=selective MASK_STATUS=true MASK_BUDGETS=true MASK_METRICS=true MASK_PAUSE_RESUME=true MASK_AD_STATUSES=true METRIC_PROFILE=healthy` |
+| Weak delivery story | `MASK_MODE=selective MASK_STATUS=true MASK_METRICS=true METRIC_PROFILE=weak` |
+| Full demo (no Meta) | `APP_MODE=demo` |

@@ -12,17 +12,19 @@ Create `backend/.env` (gitignored). Never commit secrets.
 ```env
 META_APP_ID=your_meta_app_id
 META_APP_SECRET=your_meta_app_secret
-META_REDIRECT_URI=https://<your-ngrok-subdomain>.ngrok-free.dev/auth/meta/callback
-FRONTEND_URL=https://<your-ngrok-subdomain>.ngrok-free.dev
+META_REDIRECT_URI=https://adstackers.com/auth/meta/callback
+FRONTEND_URL=https://adstackers.com
 JWT_SECRET=any_random_string
 META_API_VERSION=v19.0
 ```
+
+`META_REDIRECT_URI` and `FRONTEND_URL` must use the public HTTPS domain nginx serves (see Section 8) — Meta/Google OAuth reject plain `http://localhost` redirects.
 
 ### Required — Google Ads (optional until Google integration activated)
 ```env
 GOOGLE_CLIENT_ID=your_google_oauth_client_id
 GOOGLE_CLIENT_SECRET=your_google_oauth_client_secret
-GOOGLE_REDIRECT_URI=https://<your-ngrok-subdomain>.ngrok-free.dev/auth/google/callback
+GOOGLE_REDIRECT_URI=https://adstackers.com/auth/google/callback
 GOOGLE_DEVELOPER_TOKEN=your_google_developer_token
 GOOGLE_ADS_API_VERSION=v18
 ```
@@ -58,7 +60,7 @@ AZURE_TEXT_GEN_DEPLOYMENT=gpt-4.1-nano
 
 # Image generation (deAPI / FLUX)
 DEAPI_API_KEY=...
-IMAGES_SERVE_BASE_URL=/images   # use relative path — absolute localhost URLs break when accessed via ngrok
+IMAGES_SERVE_BASE_URL=/images   # use relative path — absolute localhost URLs break when accessed from a different origin (e.g. through nginx/adstackers.com)
 
 # Modal GP service — Bayesian Optimisation (optional; falls back to local sklearn GPR if unset)
 # The Modal app is deployed separately (not in this repo). Set this to the deployed endpoint URL.
@@ -95,8 +97,8 @@ The app has up to four processes. Two are required; the others are optional or p
 | Process | Required | How to start |
 |---|---|---|
 | Backend (FastAPI) | Yes | `cd backend && source .venv/bin/activate && python main.py` → :8000 |
-| Frontend (React/Vite) | Yes | `cd frontend && npm run dev` → :5173 |
-| ngrok | Yes for OAuth | `ngrok http 5173` — required so Meta/Google OAuth callbacks reach localhost |
+| Frontend (React/Vite) | Yes for dev; not needed in prod | `cd frontend && npm run dev` → :5173. In prod, nginx serves `frontend/dist/` directly — run `npm run build` instead. |
+| nginx | Yes for OAuth / public access | Runs as a systemd service (`systemctl status nginx`), not started per-session. Proxies `/api/`, `/auth/`, `/me` to FastAPI :8000 and terminates TLS for `adstackers.com`. See Section 8. |
 | Modal GP service | No | Already deployed in the cloud; set `MODAL_BO_API_URL` in `.env`. BO falls back to local sklearn GPR if unset. The Modal app source is not in this repo — deploy once via Modal's CLI if you need to redeploy. |
 | Fake ad server | No | `cd fake_ad_server && uvicorn server:app --port 9000 --reload` — replaces live Meta/Google calls with fixture data. Add `FAST_RAMP=true` for Case 2 (cold-start demo with Qwen-derived CTR). |
 
@@ -107,11 +109,10 @@ Run `./start.sh` (or `./start.sh staging`) to print all commands and ports as a 
 | Service | Prod | Staging | Command |
 |---|---|---|---|
 | backend | :8000 | :8001 | `cd backend && source .venv/bin/activate && python main.py` |
-| frontend | :5173 | :5174 | `cd frontend && npm run dev` |
-| ngrok | — | — | `ngrok http 5173` (or 5174 for staging) |
+| frontend | :80/:443 (nginx + `dist/`) | :5174 (`npm run dev`) | `npm run build` (prod) / `npm run dev` (staging) |
 | fake ads | :9000 | :9000 | `cd fake_ad_server && uvicorn server:app --port 9000 --reload` |
 
-See `NGROK_SETUP.md` for the checklist when the ngrok URL changes.
+See Section 8 (nginx / HTTPS Setup) below for the full checklist when the domain or cert changes.
 
 ### Fake ad server (optional — replaces live Meta/Google data calls)
 
@@ -347,3 +348,79 @@ sqlite3 backend/app.db "SELECT v.id, v.suggestion, v.status, v.score, v.qa_statu
 ```bash
 sqlite3 backend/app.db "SELECT slot_index, value FROM ad_creative_structures WHERE ad_id = '<ad_id>' AND slot = 'image' ORDER BY slot_index;"
 ```
+
+---
+
+## 12 — nginx / HTTPS Setup
+
+### Architecture
+
+```
+Browser
+  └──▶ https://adstackers.com   (nginx :443, certbot-issued cert)
+              ├──▶ /api/, /auth/, /me   → proxied to localhost:8000  (FastAPI backend)
+              └──▶ everything else      → served from frontend/dist/  (static build)
+```
+
+nginx runs as a systemd service on the EC2 instance and terminates TLS itself — no tunnel process is needed. Meta and Google OAuth redirect straight to `https://adstackers.com/...`, which nginx routes to the backend.
+
+### One-time setup on a new instance
+
+1. Point the domain's DNS `A` record at the instance's public IP.
+2. Install nginx and certbot, then issue the cert:
+   ```bash
+   sudo apt install nginx certbot python3-certbot-nginx
+   sudo certbot --nginx -d adstackers.com -d www.adstackers.com
+   ```
+3. nginx config (`/etc/nginx/sites-enabled/adstacker`) proxies `/api/`, `/auth/`, `/me` to `127.0.0.1:8000` and serves `frontend/dist/` for everything else — certbot inserts the SSL block automatically.
+4. Enable on boot: `sudo systemctl enable nginx`.
+
+### Publishing frontend changes
+
+```bash
+cd frontend && npm run build
+```
+
+nginx serves the rebuilt `dist/` immediately — no nginx restart needed. The Vite dev server (`npm run dev`, :5173) is only used for local development, not for prod traffic.
+
+### Backend `.env`
+
+```env
+META_REDIRECT_URI=https://adstackers.com/auth/meta/callback
+FRONTEND_URL=https://adstackers.com
+GOOGLE_REDIRECT_URI=https://adstackers.com/auth/google/callback
+```
+
+Restart the backend after changing these — FastAPI reads `.env` at startup.
+
+### Meta Developer App settings
+
+Go to https://developers.facebook.com → your app:
+
+- **App Settings → Basic:** set App Domains to `adstackers.com` and Site URL to `https://adstackers.com`
+- **Facebook Login → Settings:** add the full callback URL to Valid OAuth Redirect URIs: `https://adstackers.com/auth/meta/callback`
+
+All three must be set — App Domains alone is not enough. A `URL Blocked` error at login means the redirect URI isn't in this list yet.
+
+### Google OAuth
+
+Go to Google Cloud Console → APIs & Services → Credentials → your OAuth 2.0 client → Authorized redirect URIs → `https://adstackers.com/auth/google/callback`
+
+### Checklist when the domain changes
+
+- [ ] Update `FRONTEND_URL` + `META_REDIRECT_URI` + `GOOGLE_REDIRECT_URI` in `backend/.env`
+- [ ] Restart the FastAPI backend
+- [ ] Re-run `certbot --nginx -d <new-domain>` and update the nginx `server_name` directive
+- [ ] Update App Domains, Site URL, Valid OAuth Redirect URIs in Meta Developer App
+- [ ] Update Authorized redirect URIs in Google Cloud Console
+
+### Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| "URL Blocked: ... redirect URI is not whitelisted" | `META_REDIRECT_URI` in `.env` doesn't match an entry in Valid OAuth Redirect URIs on the Meta app — add it |
+| "The domain of this URL isn't included in the app's domains" | App Domains not set, or typo in domain |
+| OAuth callback still redirecting to old URL | Backend not restarted after `.env` change |
+| 502 Bad Gateway from nginx | FastAPI backend not running on :8000 |
+| Frontend changes not showing up | Forgot `npm run build` — nginx serves the last built `dist/`, not live source |
+| Cert expired / browser TLS warning | certbot auto-renewal failed — run `sudo certbot renew` and check `systemctl status certbot.timer` |

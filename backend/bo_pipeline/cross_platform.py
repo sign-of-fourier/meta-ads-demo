@@ -62,6 +62,7 @@ from ad_embedding_combiner import combine
 from bo_pipeline.ecdf import fit_ecdf
 from bo_pipeline.gpr import (
     MIN_TRAINING_POINTS,
+    confidence_label,
     expected_improvement,
     fantasize,
     fit_gpr,
@@ -91,13 +92,13 @@ class BOGroup:
     """
     All data for one platform's contribution to a cross-platform BO run.
 
-    ``platform`` controls how build_X assembles the feature matrix:
-      "google"        — text_vector only (1536-dim raw; PCA → GOOGLE_BO_PCA_DIMS)
-      anything else   — combine(text_vector, image_vector) (3072-dim raw; PCA → MODAL_BO_PCA_DIMS)
+    ``platform`` identifies the source platform for coregionalization (d-value
+    assignment) and PCA dim selection.  It no longer controls how build_X
+    assembles the feature matrix — that is determined by whether observations
+    carry an image_vector.
 
-    The different raw dimensions mean the two groups will always produce
-    different-length feature vectors, making it physically impossible to mix
-    them into a single GPR.
+    Text-only observations (image_vector is None) → 1536-dim raw (→ GOOGLE_BO_PCA_DIMS).
+    Observations with image vectors               → 3072-dim raw (→ MODAL_BO_PCA_DIMS).
     """
 
     platform: str
@@ -108,7 +109,7 @@ class BOGroup:
 
     @property
     def pca_dims(self) -> int:
-        """PCA output dimension for this group's platform."""
+        """PCA output dimension, keyed by platform as a heuristic for input size."""
         return pca_dims_for_platform(self.platform)
 
     def build_X(self, observations: list[dict]) -> np.ndarray:
@@ -118,10 +119,10 @@ class BOGroup:
         Each dict must have ``text_vector`` (np.ndarray float32) and optionally
         ``image_vector`` (np.ndarray float32 | None).
 
-        Google:      stacks text_vector rows                  → (N, 1536)
-        Other (Meta): stacks combine(text_vec, image_vec) rows → (N, 3072)
+        No image vector → stacks text_vector rows          → (N, 1536)
+        Image vector present → stacks combine(text, image) → (N, 3072)
         """
-        if self.platform == "google":
+        if observations[0].get("image_vector") is None:
             return np.vstack(
                 [obs["text_vector"] for obs in observations]
             ).astype(np.float32)
@@ -152,6 +153,11 @@ def _expl_combo_label(combination: dict) -> str:
     """Short human-readable label from a combination's text slots."""
     for key in ("headline", "primary_text", "description"):
         val = combination.get(key)
+        if val:
+            s = str(val)
+            return s if len(s) <= 50 else s[:50] + "…"
+    # Fallback for arbitrary slot names (e.g. manual platform)
+    for val in combination.values():
         if val:
             s = str(val)
             return s if len(s) <= 50 else s[:50] + "…"
@@ -231,6 +237,7 @@ def _make_pick(
     _sort_key: float = _RANDOM_SORT_KEY,
 ) -> dict:
     """Build a pick dict.  _sort_key is stripped before the public return."""
+    nearest_known = nearest_known if nearest_known is not None else []
     return {
         "combination_key": cand["combination_key"],
         "combination": cand["combination"],
@@ -238,7 +245,8 @@ def _make_pick(
         "ei_score": ei_score,
         "gpr_mean": gpr_mean,
         "gpr_std": gpr_std,
-        "nearest_known": nearest_known if nearest_known is not None else [],
+        "nearest_known": nearest_known,
+        "confidence": confidence_label(gpr_std, nearest_known),
         "platform": platform,
         "seed_ad_id": seed_ad_id,
         "text_source_id": text_source_id,
@@ -269,7 +277,7 @@ def _run_group_bo(
     ecdf_transform,         # callable returned by fit_ecdf
     xi: float,
     sign: float = 1.0,      # 1.0 = higher-is-better; -1.0 = flip for minimisation
-) -> list[dict]:
+) -> tuple[list[dict], str | None]:
     """
     Run GPR + EI (+ fantasy pick) for one group using the shared ECDF transform.
 
@@ -280,16 +288,19 @@ def _run_group_bo(
 
     Falls back to random if the group has fewer than MIN_TRAINING_POINTS scored
     observations or an empty candidate pool.
+
+    Returns (picks, pca_warning) — pca_warning set (T12, not yet signed off)
+    when PCA got capped below its requested dimensionality for this group.
     """
     if not group.candidates:
-        return []
+        return [], None
 
     if len(group.scored) < MIN_TRAINING_POINTS:
         logger.info(
             "cross_platform_bo[%s]: insufficient scored data (%d < %d) — random fallback",
             group.platform, len(group.scored), MIN_TRAINING_POINTS,
         )
-        return _random_picks(group)
+        return _random_picks(group), None
 
     # ── Targets: apply shared ECDF to this group's (possibly sign-flipped) scores ──
     y_raw = np.array([s["score"] * sign for s in group.scored], dtype=np.float64)
@@ -303,7 +314,7 @@ def _run_group_bo(
     # Fit PCA on union of scored + candidates so the projection captures the
     # full candidate space (same strategy as _run_modal_bo in pipeline.py).
     X_all = np.vstack([X_scored_raw, X_cands_raw])
-    _, X_all_pca = fit_pca(X_all, n_components=group.pca_dims)
+    _, X_all_pca, pca_warning = fit_pca(X_all, n_components=group.pca_dims)
     X_train_pca = X_all_pca[: len(group.scored)].astype(np.float64)
     X_cands_pca = X_all_pca[len(group.scored) :].astype(np.float64)
 
@@ -331,7 +342,7 @@ def _run_group_bo(
     ]
 
     if len(group.candidates) == 1:
-        return picks
+        return picks, pca_warning
 
     # ── Pick 2: fantasy step ───────────────────────────────────────────────────
     gpr2, scaler2 = fantasize(gpr, scaler, X_train_pca, y, X_cands_pca[[p1_idx]])
@@ -358,7 +369,7 @@ def _run_group_bo(
         )
     )
 
-    return picks
+    return picks, pca_warning
 
 
 def _run_group_modal_bo(
@@ -366,7 +377,7 @@ def _run_group_modal_bo(
     ecdf_transform,         # callable returned by fit_ecdf
     xi: float,
     sign: float = 1.0,
-) -> list[dict]:
+) -> tuple[list[dict], str | None]:
     """
     Modal q-EI path for one group (single-output gpytorch path).
 
@@ -376,18 +387,21 @@ def _run_group_modal_bo(
 
     Returned picks carry ``selection_type="modal_q_ei"``.  Sort keys are
     rank-based: first suggestion > second > random (_RANDOM_SORT_KEY = -1.0).
+
+    Returns (picks, pca_warning) — pca_warning set (T12, not yet signed off)
+    when PCA got capped below its requested dimensionality for this group.
     """
     from bo_pipeline.modal_bo import _api_url, call_modal_api
 
     if not group.candidates:
-        return []
+        return [], None
 
     if len(group.scored) < MIN_TRAINING_POINTS:
         logger.info(
             "cross_platform_bo[%s]: insufficient scored data (%d < %d) — random fallback",
             group.platform, len(group.scored), MIN_TRAINING_POINTS,
         )
-        return _random_picks(group)
+        return _random_picks(group), None
 
     # Apply shared ECDF to this group's (possibly sign-flipped) scores
     y_raw = np.array([s["score"] * sign for s in group.scored], dtype=np.float64)
@@ -398,7 +412,7 @@ def _run_group_modal_bo(
     X_cands_raw  = group.build_X(group.candidates).astype(np.float32)
     X_all        = np.vstack([X_scored_raw, X_cands_raw])
 
-    _, X_all_pca = fit_pca(X_all, n_components=group.pca_dims)
+    _, X_all_pca, pca_warning = fit_pca(X_all, n_components=group.pca_dims)
     X_train_pca  = X_all_pca[: len(group.scored)]
     X_cands_pca  = X_all_pca[len(group.scored) :]
 
@@ -439,7 +453,7 @@ def _run_group_modal_bo(
             _sort_key=float(n_picks - rank),
         ))
 
-    return picks
+    return picks, pca_warning
 
 
 def _run_unified_modal_bo_multioutput(
@@ -449,7 +463,7 @@ def _run_unified_modal_bo_multioutput(
     top_n: int,
     xi: float,
     rho: float = 0.5,
-) -> list[dict]:
+) -> tuple[list[dict], dict[str, str]]:
     """
     Multioutput Modal path for run_unified_cross_platform_bo.
 
@@ -461,8 +475,11 @@ def _run_unified_modal_bo_multioutput(
     Meta–Google correlation.  rho=0.5 is a conservative prior; update it
     from real CTR data when available.
 
-    Returns a list of pick dicts with _sort_key set (to be stripped by caller).
-    Returns [] on any error so the caller can fall back to the shared-PCA path.
+    Returns (picks, platform_pca_warnings) — picks is a list of pick dicts
+    with _sort_key set (to be stripped by caller); platform_pca_warnings maps
+    platform -> warning string (T12, not yet signed off) for platforms whose
+    per-platform PCA got capped below K.
+    Returns ([], {}) on any error so the caller can fall back to the shared-PCA path.
     """
     from bo_pipeline.modal_bo import (
         _api_url,
@@ -506,6 +523,7 @@ def _run_unified_modal_bo_multioutput(
     # ── fit PCA per platform, project ───────────────────────────────────────
     X_scored_by_platform: dict[str, np.ndarray] = {}
     X_cands_by_platform:  dict[str, np.ndarray] = {}
+    platform_pca_warnings: dict[str, str] = {}
 
     for p in seen_platforms:
         raw_s = per_platform_scored_raw[p]
@@ -520,8 +538,9 @@ def _run_unified_modal_bo_multioutput(
         all_raw_parts.append(np.vstack(raw_c))
         X_all_raw = np.vstack(all_raw_parts).astype(np.float32)
 
-        n_comp = min(K, X_all_raw.shape[0], X_all_raw.shape[1])
-        _, X_all_pca = fit_pca(X_all_raw, n_components=n_comp)
+        _, X_all_pca, pca_warning = fit_pca(X_all_raw, n_components=K)
+        if pca_warning:
+            platform_pca_warnings[p] = pca_warning
 
         if n_scored_p > 0:
             X_scored_by_platform[p] = X_all_pca[:n_scored_p]
@@ -556,7 +575,7 @@ def _run_unified_modal_bo_multioutput(
             cand_entries_ordered.extend(per_platform_cands_entries[p])
 
     if not cands_X_parts or not scored_X_parts:
-        return []
+        return [], platform_pca_warnings
 
     X_scored_pool = np.vstack(scored_X_parts).astype(np.float32)
     d_scored_pool = np.concatenate(scored_d_parts)
@@ -593,7 +612,7 @@ def _run_unified_modal_bo_multioutput(
             _sort_key=float(n_picks - rank),
         ))
 
-    return picks
+    return picks, platform_pca_warnings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -701,22 +720,30 @@ def run_cross_platform_bo(
         logger.info("cross_platform_bo: using Modal q-EI path")
 
     all_picks: list[dict] = []
-    for g in groups:
+    for i, g in enumerate(groups):
         if not g.candidates:
             continue
+        pca_warning: str | None = None
         if ecdf_transform is None:
             all_picks.extend(_random_picks(g))
         elif use_modal:
             try:
-                all_picks.extend(_run_group_modal_bo(g, ecdf_transform, xi=xi, sign=sign))
+                picks, pca_warning = _run_group_modal_bo(g, ecdf_transform, xi=xi, sign=sign)
+                all_picks.extend(picks)
             except Exception as exc:
                 logger.warning(
                     "cross_platform_bo[%s]: Modal API failed (%s) — local GPR fallback",
                     g.platform, exc,
                 )
-                all_picks.extend(_run_group_bo(g, ecdf_transform, xi=xi, sign=sign))
+                picks, pca_warning = _run_group_bo(g, ecdf_transform, xi=xi, sign=sign)
+                all_picks.extend(picks)
         else:
-            all_picks.extend(_run_group_bo(g, ecdf_transform, xi=xi, sign=sign))
+            picks, pca_warning = _run_group_bo(g, ecdf_transform, xi=xi, sign=sign)
+            all_picks.extend(picks)
+        # T12 (testing an approach, not yet signed off): surface PCA capping the
+        # same way run_bo's Modal-fallback warning is already surfaced.
+        if pca_warning:
+            group_stats[i]["pca_warning"] = pca_warning
 
     if not all_picks:
         return [], group_stats
@@ -819,13 +846,19 @@ def run_unified_cross_platform_bo(
             logger.warning("unified_cross_platform_bo: modal_multioutput requested but MODAL_BO_API_URL unset — falling back to shared-PCA path")
         elif ecdf_transform is not None:
             try:
-                all_picks = _run_unified_modal_bo_multioutput(
+                all_picks, platform_pca_warnings = _run_unified_modal_bo_multioutput(
                     groups=groups,
                     ecdf_transform=ecdf_transform,
                     sign=sign,
                     top_n=top_n,
                     xi=xi,
                 )
+                # T12 (testing an approach, not yet signed off): surface per-platform
+                # PCA capping the same way run_bo's Modal-fallback warning is surfaced.
+                for stats in group_stats:
+                    w = platform_pca_warnings.get(stats["platform"])
+                    if w:
+                        stats["pca_warning"] = w
                 if all_picks:
                     all_picks.sort(key=lambda p: p["_sort_key"], reverse=True)
                     result = all_picks[:top_n]
@@ -901,8 +934,12 @@ def run_unified_cross_platform_bo(
     # embeddings (both 3072-dim) are jointly projected and directly comparable.
     X_all_raw = np.vstack(scored_raw_rows + cands_raw_rows).astype(np.float32)
     n_scored_total = sum(r.shape[0] for r in scored_raw_rows)
-    n_components = min(K, X_all_raw.shape[0], X_all_raw.shape[1])
-    _, X_all_pca = fit_pca(X_all_raw, n_components=n_components)
+    _, X_all_pca, pca_warning = fit_pca(X_all_raw, n_components=K)
+    # T12 (testing an approach, not yet signed off): this is exactly the silent
+    # zero-pad-degradation case named in TECHNICAL_DEBT.md T12 — surface it.
+    if pca_warning:
+        for stats in group_stats:
+            stats["pca_warning"] = pca_warning
 
     X_scored_pool = X_all_pca[:n_scored_total].astype(np.float64)
     X_cands_pool_raw = X_all_pca[n_scored_total:].astype(np.float64)

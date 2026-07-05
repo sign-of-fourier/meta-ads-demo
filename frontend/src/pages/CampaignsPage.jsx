@@ -18,7 +18,7 @@ import {
   getDynamicGenStatus,
   seedScoredVariants,
 } from "../api.js";
-import { useUser } from "../UserContext.js";
+import { useUser, tierCanWrite } from "../UserContext.js";
 
 const SLOT_LABELS = {
   headline: "Headline",
@@ -621,9 +621,13 @@ export default function CampaignsPage({ onIngest = null, batchedAdIds = [] }) {
                     {(c.status === "ACTIVE" || c.status === "PAUSED") && (
                       <button
                         onClick={() => handleToggle(c)}
-                        disabled={!!actionLoading[c.id]}
+                        disabled={!!actionLoading[c.id] || !tierCanWrite(tier)}
                         className={c.status === "ACTIVE" ? "btn-warn" : "btn-success"}
-                        title={c.status === "ACTIVE" ? "Pause this campaign in Meta" : "Resume this campaign in Meta"}
+                        title={
+                          !tierCanWrite(tier)
+                            ? "Your plan is view-only — upgrade to pause or resume campaigns"
+                            : c.status === "ACTIVE" ? "Pause this campaign in Meta" : "Resume this campaign in Meta"
+                        }
                       >
                         {actionLoading[c.id] ? "..." : c.status === "ACTIVE" ? "Pause" : "Resume"}
                       </button>
@@ -677,7 +681,7 @@ export default function CampaignsPage({ onIngest = null, batchedAdIds = [] }) {
                               className="btn-primary"
                               onClick={() => handleGetRecommendations(c.id)}
                               disabled={boStateById[c.id] === "loading"}
-                              title="Adstac.kr: suggests the best headline, copy, and image combinations to test next"
+                              title="AdStackers: suggests the best headline, copy, and image combinations to test next"
                             >
                               {boStateById[c.id] === "loading" ? "Running…" : "Get Recommendations"}
                             </button>
@@ -858,7 +862,7 @@ export default function CampaignsPage({ onIngest = null, batchedAdIds = [] }) {
                               </p>
                               {boStateById[c.id].picks.length === 0 ? (
                                 <p className="history-empty">
-                                  Not enough scored data yet — generate a Dynamic Ad first, then run Adstac.kr again.
+                                  Not enough scored data yet — generate a Dynamic Ad first, then run AdStackers again.
                                 </p>
                               ) : (
                                 boStateById[c.id].picks.map((pick, i) => (
@@ -900,7 +904,7 @@ export default function CampaignsPage({ onIngest = null, batchedAdIds = [] }) {
 
                           {tier === "free" && (
                             <p className="upsell-note">
-                              Premium plan includes continuous improvement. Adstac.kr will
+                              Premium plan includes continuous improvement. AdStackers will
                               automatically check your stats and periodically create new ads
                               and make new suggestions.
                             </p>

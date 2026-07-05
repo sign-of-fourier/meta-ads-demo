@@ -1,8 +1,9 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { AdPreviewModal } from "./AdsPanel.jsx";
 import { activatePick, pauseAd, retainPick } from "../api.js";
 
-const PLATFORM_LABELS = { meta: "Meta", google: "Google" };
+const PLATFORM_LABELS = { meta: "Meta", google: "Google", manual: "Manual" };
 
 const UNSUPPORTED_TYPES = new Set(["shopping", "unknown"]);
 
@@ -33,13 +34,13 @@ function StatusBadge({ status }) {
 
 function CloneStatusBadge({ cloneStatus }) {
   const cfg = {
-    clone_paused:      { label: "Adstac.kr — Paused",      cls: "clone-paused" },
-    clone_active:      { label: "Adstac.kr — Testing",     cls: "clone-active" },
-    clone_converged:   { label: "Adstac.kr — Done",        cls: "clone-converged" },
-    clone_invalidated: { label: "Adstac.kr — Invalidated", cls: "clone-invalidated" },
-    clone_retained:    { label: "Adstac.kr — Retained",    cls: "clone-retained" },
+    clone_paused:      { label: "AdStackers — Paused",      cls: "clone-paused" },
+    clone_active:      { label: "AdStackers — Testing",     cls: "clone-active" },
+    clone_converged:   { label: "AdStackers — Done",        cls: "clone-converged" },
+    clone_invalidated: { label: "AdStackers — Invalidated", cls: "clone-invalidated" },
+    clone_retained:    { label: "AdStackers — Retained",    cls: "clone-retained" },
   };
-  const { label, cls } = cfg[cloneStatus] ?? { label: "Adstac.kr clone", cls: "" };
+  const { label, cls } = cfg[cloneStatus] ?? { label: "AdStackers clone", cls: "" };
   return <span className={`clone-status-badge clone-status-${cls}`}>{label}</span>;
 }
 
@@ -277,7 +278,110 @@ export default function CampaignRow({
   const {
     id, name, platform, status, daily_budget,
     impressions_7d, clicks_7d, spend_7d, ctr_7d, cpm_7d,
+    ad_count, obs_count,
   } = campaign;
+
+  // ── Manual platform: simplified campaign row + selectable ad rows ────────────
+  if (platform === "manual") {
+    return (
+      <>
+        <tr>
+          <td>
+            <button className="btn-link campaign-name" onClick={() => onToggle(compositeKey)}>
+              {name}
+            </button>
+          </td>
+          <td>
+            <span className="platform-badge platform-badge-manual">Manual</span>
+          </td>
+          <td>—</td>
+          <td>
+            <Link to="/app/studio" className="btn-small" style={{ textDecoration: "none" }}>
+              Studio →
+            </Link>
+          </td>
+          <td>{ad_count ?? "—"}</td>
+          <td>{obs_count ?? "—"}</td>
+          <td>—</td>
+          <td>—</td>
+          <td>—</td>
+        </tr>
+
+        {isExpanded && (
+          <>
+            <tr className="ads-subheader-row">
+              <td colSpan={9}>
+                {!structure ? (
+                  <span className="ads-panel-status">Loading…</span>
+                ) : structure.length === 0 ? (
+                  <span className="ads-subheader-hint">
+                    No ads yet —{" "}
+                    <Link to="/app/studio" style={{ fontSize: "inherit" }}>add one in Studio</Link>
+                  </span>
+                ) : (
+                  <span className="ads-subheader-hint">
+                    {structure.length} ad{structure.length !== 1 ? "s" : ""}
+                    {" · "}
+                    <button className="btn-small" onClick={() => onIngest(id, platform)}>Refresh</button>
+                    {" · "}
+                    <Link to="/app/studio" style={{ fontSize: "inherit" }}>Open in Studio →</Link>
+                  </span>
+                )}
+              </td>
+            </tr>
+
+            {structure?.map((ad) => {
+              const adType = ad.creative_type === "dynamic" ? "template" : "original_static";
+              const selKey = `${platform}:${ad.ad_id}`;
+              const isSelected = selectedAdIds.has(selKey);
+              const slotSummary = ad.slots
+                ?.map((s) => `${s.name} (${s.values.length})`)
+                .join(" × ");
+              return (
+                <tr key={ad.ad_id} className={isSelected ? "ad-data-row ad-data-row-selected" : "ad-data-row"}>
+                  <td className="ad-data-cell-name">
+                    <input
+                      type="checkbox"
+                      checked={isSelected}
+                      onChange={() => onToggleAd({
+                        platform,
+                        seed_ad_id: ad.ad_id,
+                        label: `${name} — ${ad.ad_id}`,
+                        adType,
+                      })}
+                    />
+                    <span className={`creative-type-badge ${ad.creative_type === "dynamic" ? "dynamic" : "static"}`}>
+                      {ad.creative_type === "dynamic" ? "Template" : "Static"}
+                    </span>
+                    <span className="ad-id-text">{ad.ad_id}</span>
+                    {slotSummary && (
+                      <span style={{ fontSize: "0.78rem", color: "var(--text-muted, #6b7280)", marginLeft: 6 }}>
+                        {slotSummary}
+                      </span>
+                    )}
+                  </td>
+                  <td />
+                  <td>
+                    {ad.obs_count > 0 && (
+                      <span style={{ fontSize: "0.78rem", background: "#eff6ff", color: "#1d4ed8", borderRadius: 10, padding: "0.1rem 0.5rem" }}>
+                        {ad.obs_count} obs
+                      </span>
+                    )}
+                  </td>
+                  <td />
+                  <td>—</td>
+                  <td>—</td>
+                  <td>—</td>
+                  <td>—</td>
+                  <td>—</td>
+                </tr>
+              );
+            })}
+          </>
+        )}
+      </>
+    );
+  }
 
   return (
     <>

@@ -4,13 +4,175 @@ Changes are appended by date. Each entry covers one session or logical chunk of 
 
 ---
 
+## 2026-07-05 — Documentation audit: fixed drift across README/FRONTEND/BACKEND/SCHEMAS/CLAUDE/ENV
+
+No code changes in this entry — a two-agent audit compared every doc-map file against current code to find staleness after a run of unreviewed sessions. Findings and fixes:
+
+- **README.md**: route table was missing ~19 routes added across recent sessions — added sections for Ad Generators (`/api/generators*`), Cross-Platform BO (`/api/bo/cross-platform*`, `/api/bo/seed-scored-variants`), Push Lifecycle (`/api/push/pick`, `/api/push/match`, `/api/activate`, `/api/pause-ad`, `/api/push/retain/{id}`), and the full 9-route Manual Platform (Studio) group.
+- **FRONTEND.md**: added three undocumented routed pages — `LandingPageAlt.jsx` (`/b`), `DocsPage.jsx` (`/docs`), `DashboardMock.jsx` (public no-auth mockup at top-level `/dashboard`, distinct from the real `/app/dashboard`).
+- **CLAUDE.md**: fixed a wrong claim (pMax was said to be blocked from text-gen/BO like Shopping — it isn't, only Shopping is); fixed a broken doc link (`ad_embedding_combiner/README.md` doesn't exist); added a missing subsystems-table row for `backend/permissions.py`; corrected the Ad Library/Google row — it previously said Google ads are simply excluded from `GET /api/ads/local`, but they're actually included and mislabeled "Meta" (see new T14 below).
+- **TECHNICAL_DEBT.md**: added **T14** — `ad_creative_structures.platform` is correctly set per row (`'meta'`/`'google'`/`'manual'`), but `GET /api/ads/local` doesn't SELECT it and `LocalAd` has no `platform` field, so Google-sourced ads get labeled "Meta" by `AdsPage.jsx`'s `SOURCE_LABELS` (which falls back to `data_source`, `'real'` for both platforms). Previously undocumented as a live bug, only as an "undecided UX" item. *(Correction same day: the first write-up of this entry wrongly said the `platform` column didn't exist at all — it does, added via an `ALTER TABLE` migration; the actual gap is narrower, just the API/frontend not using it.)*
+- **BACKEND.md**: documented the T12 confidence/PCA-warning additions from this session (`confidence_label`, `fit_pca`'s new 3-tuple return, `pca_warning`).
+- **SCHEMAS.md**: added a `scored_observations` table section (previously undocumented despite being the central table BO fits on) and added the `nearest_known`/`confidence`/`matches_existing_ad` fields to the `BOPick` schema block, which had drifted from the real Pydantic model.
+- **ENV.md**: fixed a dangling reference to the deleted `FAKE_AD_SERVER.md` → `FAKE_ADS_TESTING.md`.
+- **DEV_QUICKSTART.md**: fixed out-of-order section numbering (nginx section was "8", placed after "11").
+- New standalone doc **`GP_CONFIDENCE.md`** — the design-rationale writeup for T12 (why gpr_std + nearest_known are combined with OR not AND, why binary tiering, why the specific threshold values, why PCA over PLS), following the same pattern as `MULTIOUTPUT_GP.md`.
+
+---
+
+## 2026-07-05 — T12 confidence label + PCA-cap warning drafted (NOT SIGNED OFF)
+
+**Not a finished feature — testing an approach.** `TECHNICAL_DEBT.md` T12 still carries the full status and is the source of truth; do not consider this closed or move it further in the doc map until the user signs off on thresholds/tiering/badge wording.
+
+- `bo_pipeline/gpr.py`: new `confidence_label(gpr_std, nearest_known)` — returns `"low"` or `None` from two new env-var-tunable thresholds in `bo_pipeline/config.py` (`LOW_CONFIDENCE_GPR_STD`, `LOW_CONFIDENCE_COSINE_DISTANCE`).
+- New `confidence` field on `BOPick` / `CrossPlatformBOPick`, wired through `_make_pick` in both `pipeline.py` and `cross_platform.py`. `BOPickCard.jsx` shows a warning badge when `confidence === "low"`.
+- `fit_pca` (`bo_pipeline/modal_bo.py`) now returns `(pca, X_reduced, warning)` instead of a 2-tuple — a breaking change to its return shape, updated at all 5 call sites plus `test_modal_bo.py`. The warning threads into `run_bo`'s existing `modal_warning` return slot and a new `pca_warning` key on cross-platform `group_stats` entries, surfaced in `BatchPanel.jsx`.
+- Tests added: `TestConfidenceLabel` (`test_bo_pipeline.py`), PCA-cap tests in `test_modal_bo.py`, `test_pca_warning_surfaced_when_capped` in `test_cross_platform_bo.py`. Full suite: 372 passed, 5 skipped.
+- Also decided (not code): sticking with PCA over PLS for T12's dimensionality reduction — see `TECHNICAL_DEBT.md` T12 for the reasoning and the empirical test that supports it.
+
+---
+
+## 2026-07-03 — Fixed duplicate-row root cause shared by `/api/ingest` and BO runs
+
+Both bugs came from the same pattern: a write path with no uniqueness constraint, so repeated or concurrent calls accumulated duplicate rows silently instead of superseding the old ones.
+
+- **`ad_insights`**: added `UNIQUE(user_id, ad_account_id, level, object_id, date)` (`idx_ad_insights_unique`). A one-time startup migration dedupes any pre-existing duplicate rows first (keeps highest `id` per key). `POST /api/ingest`'s `INSERT` is now `INSERT ... ON CONFLICT DO UPDATE` — a second same-day ingest updates that day's snapshot instead of adding a row. Fixes `GET /api/campaigns/{id}/history` showing multiple points for the same date after re-ingesting.
+- **`bo_selections`**: `save_bo_run()` (`bo_pipeline/storage.py`) now deletes any not-yet-pushed picks (`google_ad_resource_name IS NULL`) for the same `(seed_ad_id, text_source_id)` before inserting the new run's picks, in one `BEGIN IMMEDIATE` transaction — a fresh BO run supersedes the old recommendation instead of piling up next to it. Rows already pushed to Google are exempt and persist as permanent push history. Added `run_id` (UUID4 hex, shared by a run's picks) so `get_latest_bo_run()` no longer relies on fragile `MAX(created_at)` string matching. Added a partial `UNIQUE(seed_ad_id, text_source_id, combination_key) WHERE google_ad_resource_name IS NULL` index as a concurrency backstop — turns a race between two concurrent `save_bo_run()` calls for the same ad into a loud `IntegrityError` instead of silent duplicates. `push_google_ads`'s query simplified accordingly (dropped its own `MAX(created_at)` subquery, no longer needed). A discovered side bug — the combination-table annotation query at `main.py`'s `bo_keys` lookup had **zero** "latest run" filtering, silently including every historical pick ever made — is now effectively fixed since duplicates can no longer accumulate.
+- Both `get_db()` (`main.py`) and `bo_pipeline/storage.py`'s `_conn()` now set `PRAGMA busy_timeout = 5000` so concurrent writers queue briefly instead of failing immediately with "database is locked".
+- Docs: `SCHEMAS.md` (`ad_insights`, `bo_selections`).
+
+---
+
+## 2026-07-03 — Tier boundary tightened to premium/enterprise only; new signups default to beta; mini admin screen
+
+Follow-up to the same-day tier-gating work below, before Stripe billing exists at all:
+
+- **Write-tier boundary moved**: `backend/permissions.py`'s `WRITE_TIERS` is now `{premium, enterprise}` only — `basic` moved into `READ_ONLY_TIERS` (`{free, trial, beta, basic}`). Test fixtures in `test_google_push.py`/`test_google_login_customer_id.py` bumped from `tier='basic'` to `tier='premium'` accordingly (they exercise push mechanics, not the permission gate).
+- **New signups default to `tier='beta'`**, not `'free'` — `signup()` now inserts it explicitly rather than relying on the column default (which stays `'free'` for the rare row created some other way). Beta is read-only and has no expiry by default; wide open until an admin closes or upgrades the account.
+- **Login tracking**: `users.last_login_at` / `login_count` (new ALTER TABLE columns) updated on every successful `/auth/login`.
+- **`users.tier_expires_at`** (new column) — admin-set, purely informational. Deliberately **not** auto-enforced: no cron/lazy-expiry check reverts a user's tier when this date passes. An admin reads it and manually downgrades the tier via the admin screen — a conscious choice over building auto-revocation, since nothing asked for it and it adds a real "did the auto-revoke fire correctly" failure surface for no requested benefit.
+- **`GET /api/admin/users`** (new) — lists every user with tier/tier_source/tier_expires_at/login stats. **`POST /api/admin/users/{id}/tier`** extended to accept `tier` and/or `tier_expires_at` independently (partial updates via `model_dump(exclude_unset=True)` — sending just one field leaves the other untouched; sending `tier_expires_at: null` explicitly clears it).
+- **`frontend/src/pages/AdminPage.jsx`** (new) — mini user-management UI at `/admin`, not linked from the app nav or nested under the logged-in `App` shell (its auth is independent of regular user JWTs). One-time prompt for `ADMIN_API_KEY`, kept in `localStorage` (not session-only — it's a long generated secret, not something to retype every visit) and sent as `X-Admin-Key`. Table of all users with an inline tier dropdown + expiry date input + per-row Save.
+- **`api.js`**: new `adminRequest()` helper, deliberately separate from the shared `request()` — a wrong/missing admin key must not clear the caller's own login token or bounce them to `/app/auth` (the shared helper's 401 handling does exactly that, which would be a bad surprise for an admin key typo). `adminListUsers`, `adminSetUserTier` use it.
+- Docs: `BACKEND.md`, `SCHEMAS.md`, `FRONTEND.md`, `README.md` (new Admin route table section), `TECHNICAL_DEBT.md` T11 updated for the new boundary + admin-screen details, `CLAUDE.md`.
+
+---
+
+## 2026-07-03 — Backend-enforced read-only tiers; tier taxonomy designed for future Stripe billing
+
+Fixes a pre-beta audit finding: there was no read-only/view-only mode at all — Meta/Google OAuth always requested write scopes, and every push/activate/pause endpoint checked only a valid JWT, never the user's `tier`. `SettingsPage.jsx`'s onboarding copy already claims "AdStackers connects read-only" — this change makes that actually true for read-only tiers instead of aspirational.
+
+- **`backend/permissions.py`** (new) — single source of truth for the tier taxonomy: `READ_ONLY_TIERS = {free, trial, beta}`, `WRITE_TIERS = {basic, premium, enterprise}`, `tier_can_write()`, `meta_oauth_scopes()`.
+- **`require_write_access()`** (new dependency, `main.py`) — 403s with a structured `{"error": "upgrade_required", ...}` body; applied to `push_generated_ads`, `push_google_ads`, `push_pick`, `push_match`, `activate_ad`, `pause_ad`, `pause_campaign`, `resume_campaign`. This is the actual enforcement boundary — not just hiding frontend buttons.
+- **`require_admin_key()`** + **`POST /api/admin/users/{id}/tier`** (new) — internal escape hatch (static `ADMIN_API_KEY`, not a user JWT) that sets any tier directly, bypassing Stripe. For beta testers and comped/sales-assisted deals ahead of real billing.
+- **Meta OAuth scope now branches by tier** (`meta_login_url`) — read-only tiers request `ads_read,business_management` only, dropping `ads_management`, so the consent screen itself reflects the account's capability. Google Ads has no equivalent narrower scope (single `adwords` scope for all access) — Google relies entirely on the backend gate. Upgrading tiers doesn't retroactively widen an already-issued Meta token; reconnect required.
+- **Schema**: `users.tier_source` (`'default' | 'admin' | 'stripe'`), `stripe_customer_id`, `stripe_subscription_id` added (nullable, reserved). No Stripe webhook handler yet — see `TECHNICAL_DEBT.md` T11 for what's required when that's built (signature verification, idempotency, `tier_source` reconciliation).
+- **Frontend**: `api.js`'s `request()` now surfaces structured error `detail` objects correctly (was rendering `[object Object]` for non-string `detail`). `UserContext.js` exports `tierCanWrite()`. Write-triggering buttons in `CampaignsPage.jsx` (campaign pause/resume), `BOPickCard.jsx` (push/activate), and `BatchPanel.jsx` (batch push) are disabled with an upgrade tooltip for read-only tiers — cosmetic only, the backend gate above is the real boundary.
+- **Tests**: `test_google_push.py` / `test_google_login_customer_id.py` fixtures updated to seed `tier='basic'` — these tests exercise push mechanics, not the new permission gate, and were failing 403 against the (correct) new default of `tier='free'`.
+- **`CLAUDE.md`**: removed "User tier enforcement on backend (UI display only for now)" from "What's not implemented yet"; added a note pointing at the Stripe gap instead.
+
+---
+
+## 2026-07-03 — optunahub BatchSampler PR merged upstream; decided against BO adoption
+
+- **`samplers/batch_sampler`** (the `optunahub-registry` PR, formerly `q_ei_sampler`) merged to `optuna/optunahub-registry` main on 2026-06-22 (`5277f63`). Confirmed via `gh pr view` and a live smoke test — `optunahub.load_module("samplers/batch_sampler")` now pulls from the official repo, no PyPI release step needed.
+- **Decision: not adopting BatchSampler in meta-ads-demo's BO pipeline.** `backend/` has no Optuna Study/ask-tell loop anywhere — `bo_pipeline/pipeline.py` calls `call_modal_api` directly in one batch call per request, so BatchSampler's ask-bridging cache/lock has nothing to bridge. Full reasoning and what a real adoption would require: see `TECHNICAL_DEBT.md` T10.
+- **CLAUDE.md** external-dependencies table updated to reflect the merge (was "PR #376 submitted, not yet merged").
+- No code changes in this repo. (`quantecarlo/demos/demo.py`/`demo7.py` were swapped to `load_module`, and `quantecarlo` was bumped to 0.3.0 and published to PyPI — that's `quantecarlo`'s own history, tracked in its `TECH_DEBT.md`, not duplicated here. meta-ads-demo's `requirements.txt` pin, `quantecarlo>=0.2.0`, still resolves correctly and is unaffected since this backend never used `qEISampler`/`BatchSampler`.)
+
+---
+
+## 2026-07-03 — Settings page renamed to "Connect", onboarding copy overhaul
+
+- **Nav label**: `App.jsx` navbar link "Settings" → "Connect" (route stays `/app/settings`; no backend redirect changes needed).
+- **`SettingsPage.jsx`**: heading → "Connect Your Accounts"; intro copy now explains AdStackers connects read-only and lets you pick which existing ads to build an experiment from, with a link to add ads manually in the Studio. "How it works" list now links directly to `/app/dashboard` and `/app/studio` instead of naming them as plain text.
+- **Pro tip callout** added to the "How it works" card: recommends using a dynamic ad (Meta multi-asset or Google RSA) to define the search space, and to pause it in the campaign once used as a template. Links to `/guide#dynamic-ads`.
+- **`GuidePage.jsx`**: new "Pro tip" callout with `id="dynamic-ads"` anchor inside the "Setting up an experiment" section, explaining dynamic ads as the template AdStackers recombines into candidates. Added a `useEffect` hash-scroll so `/guide#dynamic-ads` scrolls to it on load from an external link.
+
+---
+
+## 2026-06-22 — nginx, AdStackers branding, logo + wordmark
+
+### Infrastructure
+- **nginx replaces ngrok** — static files served from `frontend/dist/`; `/api/`, `/auth/`, `/me` proxied to FastAPI on port 8000; certbot SSL for `adstackers.com`; nginx enabled on boot via systemd. No tunnel process needed.
+- **Frontend deploy workflow** — `npm run build` in `frontend/` publishes changes; no nginx restart required.
+
+### Branding
+- **Domain / name**: renamed throughout from "Adstac.kr" → "AdStackers" (adstackers.com) across all `.jsx`, `.js`, `.md` files.
+- **Browser title**: `<title>Meta Ads Demo</title>` → `<title>AdStackers</title>` in `index.html`.
+- **Navbar cleanup**: removed "Ad Library" and "Explorer" nav links (pages preserved, just unlinked). Tier badge now renders "Free Tier" instead of raw `"free"`.
+
+### Logo + wordmark
+- **`frontend/public/logo.svg`** — pixel-block upward arrow; 15 blocks in a 5×5 grid; ember palette top→bottom: `#f59e0b` → `#b45309` → `#92400e` → `#374151` → `#1f2937` (all existing app colors).
+- **Wordmark font**: Big Shoulders Display 700 (Google Fonts) with `linear-gradient(90deg, #f59e0b, #b45309)` text fill. Reusable `.wordmark` class added to `app.css`.
+- **Placed in**: `App.jsx` navbar, `GuidePage.jsx` top bar, `EvidencePage.jsx` top bar, `LandingPageV2.jsx` page header.
+
+---
+
+## 2026-06-22 — Landing page redesign + public content layer
+
+### New pages and routes
+- **`/` (landing)** — `LandingPageV2.jsx` replaces the original landing page. Hero A copy ("Improve creative performance through disciplined experimentation"), punchy 3-step how-it-works ("This is how the best teams pull ahead — and stay there"), two research-backed feature cards (Meta experimenting-firms finding; BO beats random), aspirational dashboard mockup in place of screenshot.
+- **`/guide`** — `GuidePage.jsx`: user-facing product documentation. Sticky sidebar nav, 7 sections (what is it / three things to believe / setup / reading recommendations / signals / cross-platform / FAQ), accordion FAQ, layered from plain intro through step-by-step walkthrough.
+- **`/evidence`** — `EvidencePage.jsx`: research and evidence layer. Three-tier BO story (random / BO-512 / BO-4096), `BoComparisonChart` built from CHI-BAD-ADS data, 8 numbered findings with citations, CTA framing competitive urgency.
+- **`/landing-classic`** — original `landingPage.jsx` preserved for reference.
+
+### New components
+- **`DashboardMockup.jsx`** — purpose-built aspirational dashboard UI: ranked recommendations panel with confidence scores and expected lift, CTR-over-experiment SVG sparkline with convergence annotation, budget allocation bar chart, explainability signal bars ("What's working"), experiment status footer with live/converging/new/paused chips. No image file dependency.
+- **`BoComparisonChart.jsx`** — SVG chart from raw CHI-BAD-ADS benchmark data: three lines (random / BO-512 / BO-4096) with ±1 std dev confidence bands, green "AdStackers operates here" callout on the 4096 line, gap bracket at final round, three-row legend with plain-language sub-labels.
+
+---
+
+## 2026-06-21 — Fix 12 pre-existing test failures (3 root causes)
+
+- **`_api_url` missing from `modal_bo.py`** (9 `TestUnifiedBOMultioutput` failures) — `cross_platform.py` imported `_api_url` which was deleted when the URL moved to a constant in `config.py`. Added `def _api_url() -> str: return MODAL_BO_API_URL` back to `modal_bo.py`.
+- **`modal_bo_enabled()` read cached constant** (1 failure) — `config.py` reads `MODAL_BO_API_URL` at module load time; `monkeypatch.delenv` after import had no effect. Changed `modal_bo_enabled()` to call `os.getenv("MODAL_BO_API_URL", "")` fresh each invocation.
+- **`fit_pca` read cached `MODAL_BO_PCA_DIMS`** (1 failure) — same pattern. Changed `fit_pca` to use `os.getenv("MODAL_BO_PCA_DIMS", ...)` when `n_components=None`.
+- **`test_google_env_override` was test-order-dependent** (1 failure) — test relied on reloading `modal_bo` to pick up a patched env var, but `config.py` (where the constant lives) was not reloaded. Fixed test to use `monkeypatch.setattr("bo_pipeline.config.GOOGLE_BO_PCA_DIMS", 16)` directly.
+
+Suite result: **361 passed, 5 skipped, 0 failures**.
+
+---
+
+## 2026-06-21 — Manual Platform (Studio)
+
+### Backend
+- **`manual_campaigns` table** added to `init_db()` in `main.py` — `id TEXT PK` (`man_cmp_{hex12}`), `user_id`, `name`, `created_at`
+- **9 new `/api/manual/*` routes** in `main.py`:
+  - `POST/GET /api/manual/campaigns` — create and list campaigns
+  - `PATCH/DELETE /api/manual/campaigns/{id}` — rename and delete
+  - `POST/GET /api/manual/campaigns/{id}/ads` — create and list ads (dynamic templates + static)
+  - `DELETE /api/manual/ads/{ad_id}` — delete ad and its observations
+  - `GET /api/manual/ads/{ad_id}/combinations` — list Cartesian combos with scores and BO picks
+  - `POST /api/manual/ads/{ad_id}/score` — write a manual score to `scored_observations`
+- **`_expl_combo_label`** in `bo_pipeline/pipeline.py` and `bo_pipeline/cross_platform.py` updated to fall back to first non-empty value from any slot (handles arbitrary slot names for manual ads)
+- Pydantic models: `ManualCampaignCreate`, `ManualCampaignPatch`, `ManualSlotDef`, `ManualAdCreate`, `ManualScoreIn`
+
+### Frontend
+- **Studio nav link** added to `App.jsx` (between Ad Library and Explorer)
+- **`/app/studio` route** added to `main.jsx`
+- **`StudioPage.jsx`** — campaign list, create/rename/delete; drills into `ManualCampaignView`
+- **`ManualCampaignView.jsx`** — per-campaign view with Dynamic Template and Static Ad creation, BO run per template, combination table
+- **`ManualTemplateForm.jsx`** — free-form slot builder (add/remove slots and values)
+- **`ManualStaticForm.jsx`** — static ad form with pool-only or record-a-result modes
+- **`CombinationScoreTable.jsx`** — Cartesian combo table with inline `+Score` cells; BO picks shown first
+- **`api.js`** — added `createManualCampaign`, `listManualCampaigns`, `renameManualCampaign`, `deleteManualCampaign`, `createManualAd`, `listManualAds`, `deleteManualAd`, `listManualCombinations`, `scoreManualCombination`
+- **`DashboardPage.jsx`** — calls `listManualCampaigns()` on mount; manual campaigns appended to `allCampaigns`
+- **`CampaignRow.jsx`** — `platform==='manual'` branch renders simplified row (no metrics, Studio link) with expand showing ad/obs counts
+
+### Docs
+- `SCHEMAS.md` — `manual_campaigns` table documented
+- `FRONTEND.md` — new pages and components documented; nav and table descriptions updated
+
+---
+
 ## 2026-06-20 (session 8)
 
-### Dashboard UX — three-section layout with Adstac.kr branding
+### Dashboard UX — three-section layout with AdStackers branding
 
-- Restructured `DashboardPage` into three numbered cards: ① Sync (blue), ② Select ads (purple), ③ Run Adstac.kr (green). Each card has a grey instruction header with numbered badge, title, and description.
-- Renamed all user-facing "BO" / "Bayesian Optimisation" labels to "Adstac.kr" throughout `BatchPanel`, `CampaignRow`, `BOPickCard`, `CampaignsPage`, `GoogleCampaignsPage`.
-- `CloneStatusBadge` labels updated: "BO Clone — Paused/Testing/Done/etc." → "Adstac.kr — Paused/Testing/Done/etc."
+- Restructured `DashboardPage` into three numbered cards: ① Sync (blue), ② Select ads (purple), ③ Run AdStackers (green). Each card has a grey instruction header with numbered badge, title, and description.
+- Renamed all user-facing "BO" / "Bayesian Optimisation" labels to "AdStackers" throughout `BatchPanel`, `CampaignRow`, `BOPickCard`, `CampaignsPage`, `GoogleCampaignsPage`.
+- `CloneStatusBadge` labels updated: "BO Clone — Paused/Testing/Done/etc." → "AdStackers — Paused/Testing/Done/etc."
 - Section 2 legend explains Template vs Static badge meaning in context.
 - All ad types display `ad_id` as their identifier in the table (consistent); Clone badge is the sole differentiator for pushed clones.
 

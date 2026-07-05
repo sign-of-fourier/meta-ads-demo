@@ -38,27 +38,43 @@ class TestModalBOUnit:
     def test_fit_pca_output_shape(self):
         from bo_pipeline.modal_bo import fit_pca
         X = self._make_X()
-        pca, X_pca = fit_pca(X, n_components=16)
+        pca, X_pca, warning = fit_pca(X, n_components=16)
         assert X_pca.shape == (30, 16)
         assert X_pca.dtype == np.float32
+        assert warning is None
 
     def test_fit_pca_capped_at_n_samples(self):
         from bo_pipeline.modal_bo import fit_pca
         X = self._make_X(n=5, d=256)
         # Asking for more components than samples — should be capped to 5
-        pca, X_pca = fit_pca(X, n_components=64)
+        pca, X_pca, warning = fit_pca(X, n_components=64)
         assert X_pca.shape[1] <= 5
 
     def test_fit_pca_capped_at_n_features(self):
         from bo_pipeline.modal_bo import fit_pca
         X = self._make_X(n=100, d=10)
-        pca, X_pca = fit_pca(X, n_components=64)
+        pca, X_pca, warning = fit_pca(X, n_components=64)
         assert X_pca.shape[1] <= 10
+
+    def test_fit_pca_warning_set_when_capped(self):
+        """T12 (testing an approach, not yet signed off): fit_pca reports capping."""
+        from bo_pipeline.modal_bo import fit_pca
+        X = self._make_X(n=5, d=256)
+        pca, X_pca, warning = fit_pca(X, n_components=64)
+        assert warning is not None
+        assert "capped" in warning
+        assert "5" in warning and "64" in warning
+
+    def test_fit_pca_warning_none_when_not_capped(self):
+        from bo_pipeline.modal_bo import fit_pca
+        X = self._make_X(n=100, d=256)
+        pca, X_pca, warning = fit_pca(X, n_components=16)
+        assert warning is None
 
     def test_project_consistent_with_fit(self):
         from bo_pipeline.modal_bo import fit_pca, project
         X = self._make_X()
-        pca, X_pca = fit_pca(X, n_components=8)
+        pca, X_pca, warning = fit_pca(X, n_components=8)
         X_proj = project(pca, X)
         np.testing.assert_allclose(X_pca, X_proj, atol=1e-4)
 
@@ -95,7 +111,7 @@ class TestModalBOUnit:
         X = self._make_X(n=50, d=256)
         monkeypatch.setenv("MODAL_BO_PCA_DIMS", "32")
         # Pass n_components=None to trigger env-var read
-        _, X_pca = fit_pca(X, n_components=None)
+        _, X_pca, _ = fit_pca(X, n_components=None)
         assert X_pca.shape[1] == 32
 
     # ── call_modal_api_multioutput — payload and response (urlopen mocked) ────
@@ -246,7 +262,7 @@ class TestModalBOLive:
         X_scored = np.vstack([combine(s["text_vector"], s["image_vector"]) for s in scored]).astype(np.float32)
         X_cands  = np.vstack([combine(c["text_vector"], c["image_vector"]) for c in candidates]).astype(np.float32)
         X_all    = np.vstack([X_scored, X_cands])
-        _, X_all_pca = fit_pca(X_all, n_components=self.PCA_DIM)
+        _, X_all_pca, _ = fit_pca(X_all, n_components=self.PCA_DIM)
         return X_all_pca[: len(scored)], X_all_pca[len(scored):]
 
     def test_call_modal_api_returns_q_candidates(self):

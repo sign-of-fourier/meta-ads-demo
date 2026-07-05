@@ -128,7 +128,7 @@ function BOPicksPanel({ result, campaignName, seedAdId, onPushed }) {
     return (
       <div className="bo-results">
         <p className="history-empty">
-          No candidates yet — ingest the campaign and generate RSA text, then run Adstac.kr once
+          No candidates yet — ingest the campaign and generate RSA text, then run AdStackers once
           the embedding pipeline finishes.
         </p>
         <p className="bo-meta">
@@ -466,7 +466,7 @@ export default function GoogleCampaignsPage({ onIngest = null, batchedAdIds = []
                           className="btn-primary"
                           onClick={() => handleRunBO(c.id)}
                           disabled={boStateById[c.id]?.status === "loading"}
-                          title="Adstac.kr: suggests the best headline and description combinations to test next"
+                          title="AdStackers: suggests the best headline and description combinations to test next"
                         >
                           {boStateById[c.id]?.status === "loading"
                             ? "Running…"

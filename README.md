@@ -15,11 +15,11 @@ No more spreadsheet-driven split tests. Just signal.
 ### Getting Started
 - [Quick Start](QUICK_START.md) — fastest path to a running demo
 - [Dev Quickstart](DEV_QUICKSTART.md) — local dev setup from scratch
-- [Ngrok / EC2 Setup](NGROK_SETUP.md) — expose local backend to Meta's OAuth redirect
+- [nginx / HTTPS Setup](DEV_QUICKSTART.md#8--nginx--https-setup) — expose the backend for Meta/Google OAuth redirects
 
 ### Reference
 - [Schemas](SCHEMAS.md) — full SQLite table definitions
-- [Tests](TEST.md) — test catalog, individual test descriptions, manual curl tests
+- [Tests](backend/TEST.md) — test catalog, individual test descriptions, manual curl tests
 - [Staging Policy](STAGING_POLICY.md) — what is and isn't safe to run against live Meta accounts
 - [Claude Code Instructions](CLAUDE.md) — instructions for AI-assisted development in this repo
 
@@ -201,7 +201,7 @@ Azure AI Inference and Azure OpenAI are **different resources** with different e
 
 ## Setup
 
-See [`DEV_QUICKSTART.md`](DEV_QUICKSTART.md) for the full environment setup, server startup, curl workflow, and BO seeding guide. See [`TEST.md`](TEST.md) for the test catalog.
+See [`DEV_QUICKSTART.md`](DEV_QUICKSTART.md) for the full environment setup, server startup, curl workflow, and BO seeding guide. See [`backend/TEST.md`](backend/TEST.md) for the test catalog.
 
 ---
 
@@ -273,6 +273,15 @@ All routes except auth require `Authorization: Bearer <jwt>`.
 | POST | `/auth/signup` | Create account, returns JWT |
 | POST | `/auth/login` | Login, returns JWT |
 | GET | `/me` | Current user's email and tier |
+
+### Admin (internal — `X-Admin-Key` header, not a user JWT)
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/admin/users` | List all users with tier, tier_source, tier_expires_at, login stats |
+| POST | `/api/admin/users/{id}/tier` | Set tier and/or tier_expires_at (partial updates supported); bypasses Stripe entirely — see `BACKEND.md` §`permissions.py` |
+
+Mini UI at `/admin` (`frontend/src/pages/AdminPage.jsx`) — not linked from the app nav.
 
 ### Auth — Meta
 
@@ -366,6 +375,49 @@ All routes except auth require `Authorization: Bearer <jwt>`.
 |---|---|---|
 | POST | `/api/google/push` | Push unpushed BO picks to Google Ads as PAUSED RSA ads |
 
+### Ad Generators (cross-platform candidate pools)
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/generators` | Create a named ad generator from one or more member ads (multi-member BO candidate pool) |
+| GET | `/api/generators` | List all ad generators for the current user |
+| DELETE | `/api/generators/{generator_id}` | Delete an ad generator and its members |
+
+### Cross-Platform Bayesian Optimisation
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/bo/cross-platform` | Run BO jointly across Meta and Google (per-platform GPR, shared ECDF); returns up to 2 globally-ranked picks |
+| POST | `/api/bo/cross-platform/unified` | Unified BO: per-group PCA to shared K-dim space, single pooled GP/Modal call; returns top_n picks (`top_n` in body, default 4). Wired to the Dashboard UI |
+| POST | `/api/bo/seed-scored-variants` | Seed synthetic scored observations for BO testing without API keys |
+
+### Push Lifecycle (cross-platform)
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/push/pick` | Push a specific BO-recommended combination as a new PAUSED ad (Meta static clone or Google RSA) |
+| POST | `/api/push/match` | Record that a BO pick matches an existing native static ad — no new ad created |
+| POST | `/api/activate` | Enable a PAUSED pushed clone on the platform |
+| POST | `/api/pause-ad` | Pause any ad (template or clone) on the platform |
+| POST | `/api/push/retain/{combo_id}` | Mark a converged test clone as retained — keeps running, BO stops writing new observations for it |
+
+### Manual Platform (Studio)
+
+Ads with no source platform (created directly in-app) — see `AD.md` / `FRONTEND.md` for the Studio UI.
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/manual/campaigns` | Create a manual campaign |
+| GET | `/api/manual/campaigns` | List manual campaigns for the current user |
+| PATCH | `/api/manual/campaigns/{campaign_id}` | Rename a manual campaign |
+| DELETE | `/api/manual/campaigns/{campaign_id}` | Delete a manual campaign |
+| POST | `/api/manual/upload-image` | Upload an image for use in a manual ad |
+| POST | `/api/manual/campaigns/{campaign_id}/ads` | Create a manual ad (static or template) in a campaign |
+| GET | `/api/manual/campaigns/{campaign_id}/ads` | List manual ads in a campaign |
+| DELETE | `/api/manual/ads/{ad_id}` | Delete a manual ad |
+| GET | `/api/manual/ads/{ad_id}/combinations` | List BO-candidate combinations for a manual template ad |
+| POST | `/api/manual/ads/{ad_id}/score` | Write a scored observation for a manual combination |
+
 ### Other
 
 | Method | Path | Description |
@@ -424,4 +476,4 @@ See [`STAGING_POLICY.md`](STAGING_POLICY.md) for what is and isn't safe to run a
 - **Google RSA BO:** Operates on text combinations only — no image dimension. The combiner zero-pads the image half, so the BO pipeline code is identical for both platforms.
 
 For schema details see [`SCHEMAS.md`](SCHEMAS.md).
-For running on EC2/ngrok see [`NGROK_SETUP.md`](NGROK_SETUP.md).
+For running on EC2 with nginx/HTTPS see [Section 8 of DEV_QUICKSTART.md](DEV_QUICKSTART.md#8--nginx--https-setup).

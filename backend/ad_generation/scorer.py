@@ -4,13 +4,17 @@ Step 5 — Score a generated ad image using the fine-tuned Qwen2-VL model on Mod
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import logging
 import os
 import re
 
 import httpx
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 
 MODAL_ENDPOINT = os.getenv(
@@ -85,13 +89,29 @@ async def score_variant(
     image_bytes = _image_bytes_from_url(image_url)
     prompt = f"Headline: {headline}\nShort text: {short_text}"
 
+    _max_retries = 3
+    _retry_delay = 15  # seconds between attempts; Modal cold-start typically takes 10–25s
+
     async with httpx.AsyncClient(timeout=120) as client:
-        response = await client.post(
-            MODAL_ENDPOINT,
-            files={"file": ("ad.png", image_bytes, "image/png")},
-            data={"prompt": prompt},
-        )
-        response.raise_for_status()
+        for attempt in range(1, _max_retries + 1):
+            response = await client.post(
+                MODAL_ENDPOINT,
+                files={"file": ("ad.png", image_bytes, "image/png")},
+                data={"prompt": prompt},
+            )
+            try:
+                response.raise_for_status()
+                break  # success
+            except httpx.HTTPStatusError as exc:
+                if response.status_code == 408 and attempt < _max_retries:
+                    logger.warning(
+                        "Qwen scorer: Modal cold-start timeout (attempt %d/%d) — "
+                        "container is warming up, will retry in %ds",
+                        attempt, _max_retries, _retry_delay,
+                    )
+                    await asyncio.sleep(_retry_delay)
+                else:
+                    raise
 
     raw_output = response.json().get("raw_output", "")
     modal_score = _extract_score(raw_output)

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { createPortal } from "react-dom";
 import PotentialBadge from "./PotentialBadge";
 import { pushPick, pushMatch, activatePick } from "../api";
+import { useUser, tierCanWrite } from "../UserContext.js";
 
 const PLATFORM_LABELS = { meta: "Meta", google: "Google" };
 
@@ -133,7 +134,7 @@ function PickPreviewModal({ pick, index, onClose }) {
 /* ── Per-pick card in results ──────────────────────────────────────────────── */
 function PickCard({ pick, index, isSelected, onToggleSelect, onPreview }) {
   const selLabel =
-    pick.selection_type === "modal_q_ei" ? "Adstac.kr" :
+    pick.selection_type === "modal_q_ei" ? "AdStackers" :
     pick.selection_type === "ei"         ? "Best expected" :
     pick.selection_type === "fantasy"    ? "Exploratory" : "Random";
 
@@ -252,13 +253,15 @@ function MatchCard({ pick, index, isSelected, onToggleSelect, onPreview }) {
 function BatchPushFooter({ picks, selectedIndices, onDone }) {
   const [pushing, setPushing] = useState(false);
   const [results, setResults] = useState(null); // null | {pushed, failed, details}
+  const { tier } = useUser();
+  const canWrite = tierCanWrite(tier);
 
   const selected = picks.filter((_, i) => selectedIndices.has(i));
 
   function defaultName(pick, i) {
     const headline = pick.combination?.headline || pick.combination?.primary_text || "Pick";
     const preview = headline.length > 30 ? headline.slice(0, 30) + "…" : headline;
-    return `Adstac.kr ${i + 1} — ${preview}`;
+    return `AdStackers ${i + 1} — ${preview}`;
   }
 
   async function handlePushSelected() {
@@ -325,13 +328,16 @@ function BatchPushFooter({ picks, selectedIndices, onDone }) {
     <div className="batch-push-footer">
       <button
         className="btn-primary"
-        disabled={pushing || selected.length === 0}
+        disabled={pushing || selected.length === 0 || !canWrite}
         onClick={handlePushSelected}
+        title={canWrite ? undefined : "Your plan is view-only — upgrade to push ads"}
       >
         {pushing ? "Pushing…" : selected.length > 0 ? `Push ${selected.length} selected` : "Push selected"}
       </button>
       <span className="batch-push-note">
-        {selected.length === 0
+        {!canWrite
+          ? "Your plan is view-only — upgrade to push these recommendations live."
+          : selected.length === 0
           ? "Check recommendations above to select them for push."
           : "Clones will be created PAUSED — activate in Ads Manager after setting budget."}
       </span>
@@ -442,6 +448,9 @@ function CrossPlatformResults({ data, onPushDone }) {
             {stat.scored_count === 0 && (
               <span className="stat-random-note"> (random — no scored variants yet)</span>
             )}
+            {stat.pca_warning && (
+              <span className="stat-random-note" title={stat.pca_warning}> ⚠ reduced PCA dims</span>
+            )}
           </span>
         ))}
       </div>
@@ -481,7 +490,7 @@ function CrossPlatformResults({ data, onPushDone }) {
                     <span className="bo-pick-type">
                       {pick.selection_type === "ei"         ? "Best expected" :
                        pick.selection_type === "fantasy"    ? "Exploratory" :
-                       pick.selection_type === "modal_q_ei" ? "Adstac.kr" : "Random"}
+                       pick.selection_type === "modal_q_ei" ? "AdStackers" : "Random"}
                     </span>
                   </div>
                   {pick.combination.image_url && (
@@ -645,7 +654,7 @@ export default function BatchPanel({
             onClick={onRunBO}
             disabled={!canRun || boState?.status === "loading"}
           >
-            {boState?.status === "loading" ? "Analyzing…" : "Run Adstac.kr"}
+            {boState?.status === "loading" ? "Analyzing…" : "Run AdStackers"}
           </button>
         </div>
       </div>

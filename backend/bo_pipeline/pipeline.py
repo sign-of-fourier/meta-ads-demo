@@ -39,7 +39,7 @@ from pathlib import Path
 import numpy as np
 
 from ad_embedding_combiner import combine
-from bo_pipeline.gpr import MIN_TRAINING_POINTS, expected_improvement, fantasize, fit_gpr, predict_with_std, transform_y
+from bo_pipeline.gpr import MIN_TRAINING_POINTS, confidence_label, expected_improvement, fantasize, fit_gpr, predict_with_std, transform_y
 from bo_pipeline.selector import get_candidate_combinations, get_scored_combinations
 from bo_pipeline.storage import DB_PATH
 
@@ -51,13 +51,13 @@ _FANTASY_TYPE   = "fantasy"
 _MODAL_TYPE     = "modal_q_ei"
 
 
-def _build_X(combinations: list[dict], platform: str = "meta") -> np.ndarray:
+def _build_X(combinations: list[dict]) -> np.ndarray:
     """Stack feature vectors for a list of combination dicts.
 
-    Google RSA ads have no image embeddings; use text-only (1536-dim).
-    All other platforms use combine(text_vec, image_vec) → 3072-dim.
+    Text-only (1536-dim) when no image vector is present; text+image concat
+    (3072-dim) otherwise.  Determined by data, not platform name.
     """
-    if platform == "google":
+    if combinations[0].get("image_vector") is None:
         return np.vstack([c["text_vector"] for c in combinations])
     return np.vstack([combine(c["text_vector"], c["image_vector"]) for c in combinations])
 
@@ -72,6 +72,11 @@ def _expl_combo_label(combination: dict) -> str:
     """Short human-readable label from a combination's text slots."""
     for key in ("headline", "primary_text", "description"):
         val = combination.get(key)
+        if val:
+            s = str(val)
+            return s if len(s) <= 50 else s[:50] + "…"
+    # Fallback for arbitrary slot names (e.g. manual platform)
+    for val in combination.values():
         if val:
             s = str(val)
             return s if len(s) <= 50 else s[:50] + "…"
@@ -146,7 +151,6 @@ def _run_local_bo(
     candidates: list[dict],
     xi: float,
     higher_is_better: bool,
-    platform: str = "meta",
 ) -> list[dict]:
     """
     GPR + EI pick 1, fantasy-step pick 2.  Pure local sklearn — no network.
@@ -159,8 +163,8 @@ def _run_local_bo(
     y = transform_y(y_raw)
     y_best = float(y.max())
 
-    X_train = _build_X(scored, platform).astype(np.float64)
-    X_cands = _build_X(candidates, platform).astype(np.float64)
+    X_train = _build_X(scored).astype(np.float64)
+    X_cands = _build_X(candidates).astype(np.float64)
 
     gpr, scaler = fit_gpr(X_train, y)
 
@@ -212,12 +216,13 @@ def _run_modal_bo(
     candidates: list[dict],
     xi: float,
     higher_is_better: bool,
-    platform: str = "meta",
-) -> list[dict]:
+) -> tuple[list[dict], str | None]:
     """
     PCA → Modal GP q-EI → nearest-pool-member snap.
 
-    Returns picks in the same format as _run_local_bo.
+    Returns (picks, pca_warning) — picks in the same format as _run_local_bo,
+    pca_warning set (T12, not yet signed off) when PCA got capped below its
+    requested dimensionality.
     Raises on any error so the caller can fall back gracefully.
     """
     from bo_pipeline.modal_bo import (
@@ -237,12 +242,12 @@ def _run_modal_bo(
     y = y_raw if higher_is_better else -y_raw  # noqa: SIM210 (dead branch, intentional)
 
     # Build full embedding pool for PCA fitting (scored ∪ candidates)
-    X_scored = _build_X(scored, platform).astype(np.float32)
-    X_cands  = _build_X(candidates, platform).astype(np.float32)
+    X_scored = _build_X(scored).astype(np.float32)
+    X_cands  = _build_X(candidates).astype(np.float32)
     X_all    = np.vstack([X_scored, X_cands])
 
     # Fit PCA on the union so the projection captures the full space
-    pca, X_all_pca = fit_pca(X_all)
+    pca, X_all_pca, pca_warning = fit_pca(X_all)
     X_train_pca = X_all_pca[: len(scored)]
     X_cands_pca = X_all_pca[len(scored) :]
 
@@ -284,7 +289,7 @@ def _run_modal_bo(
             nearest_known=_expl_nearest_known(X_cands[idx], scored, X_scored),
         ))
 
-    return picks
+    return picks, pca_warning
 
 
 # ---------------------------------------------------------------------------
@@ -373,12 +378,13 @@ def run_bo(
 
     if use_modal:
         try:
-            return _run_modal_bo(scored, candidates, xi=xi, higher_is_better=higher_is_better, platform=platform), None, scored_count, candidate_count
+            picks, pca_warning = _run_modal_bo(scored, candidates, xi=xi, higher_is_better=higher_is_better)
+            return picks, pca_warning, scored_count, candidate_count
         except Exception as exc:
             logger.warning("run_bo: Modal BO failed (%s) — falling back to local GPR", exc)
             modal_warning = f"Modal GP failed ({type(exc).__name__}: {exc}) — used local GPR"
 
-    return _run_local_bo(scored, candidates, xi=xi, higher_is_better=higher_is_better, platform=platform), modal_warning, scored_count, candidate_count
+    return _run_local_bo(scored, candidates, xi=xi, higher_is_better=higher_is_better), modal_warning, scored_count, candidate_count
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +399,7 @@ def _make_pick(
     gpr_std: float | None = None,
     nearest_known: list[dict] | None = None,
 ) -> dict:
+    nearest_known = nearest_known if nearest_known is not None else []
     return {
         "combination_key": cand["combination_key"],
         "combination": cand["combination"],
@@ -400,5 +407,6 @@ def _make_pick(
         "ei_score": ei_score,
         "gpr_mean": gpr_mean,
         "gpr_std": gpr_std,
-        "nearest_known": nearest_known if nearest_known is not None else [],
+        "nearest_known": nearest_known,
+        "confidence": confidence_label(gpr_std, nearest_known),
     }

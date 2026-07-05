@@ -18,6 +18,7 @@
 import { useState } from "react";
 import { createPortal } from "react-dom";
 import { pushPick, activatePick, retainPick } from "../api.js";
+import { useUser, tierCanWrite } from "../UserContext.js";
 import PotentialBadge from "./PotentialBadge.jsx";
 
 const SLOT_LABELS = {
@@ -41,7 +42,7 @@ function defaultAdName(campaignName, combination) {
   const headline = combination?.headline || "";
   const preview = headline.length > 25 ? headline.slice(0, 25) + "…" : headline;
   const date = new Date().toISOString().slice(0, 10);
-  return `${campaignName || "Ad"} — ${preview || "Adstac.kr pick"} (${date})`;
+  return `${campaignName || "Ad"} — ${preview || "AdStackers pick"} (${date})`;
 }
 
 /* ── Preview modal ────────────────────────────────────────────────────────── */
@@ -79,6 +80,11 @@ function PreviewModal({ pick, onClose }) {
         {(pick.gpr_mean != null || pick.ei_score != null || pick.gpr_std != null || (pick.nearest_known ?? []).length > 0) && (
           <div className="modal-expl-block">
             <div className="modal-expl-title">GP model estimates</div>
+            {pick.confidence === "low" && (
+              <div className="modal-confidence-badge">
+                ⚠ Novel combination — no close precedent
+              </div>
+            )}
             <div className="modal-expl-note">
               Surrogate model predictions — not observed metrics. Relative Score &gt; 1 means
               above-median predicted performance; 1 = median. Not comparable to real CTR/ROAS.
@@ -160,7 +166,7 @@ function PushModal({ pick, campaignName, platform, seedAdId, onConfirm, onClose 
             className="push-name-input"
             value={name}
             onChange={e => setName(e.target.value)}
-            placeholder="e.g. Summer Sale — Adstac.kr 2026-05-28"
+            placeholder="e.g. Summer Sale — AdStackers 2026-05-28"
             autoFocus
           />
         </label>
@@ -210,7 +216,7 @@ export default function BOPickCard({
   const comboId             = pick.combo_id ?? null;
 
   const selectionLabel =
-    pick.selection_type === "modal_q_ei" ? "Adstac.kr" :
+    pick.selection_type === "modal_q_ei" ? "AdStackers" :
     pick.selection_type === "ei"         ? "Best expected" :
     pick.selection_type === "fantasy"    ? "Exploratory" : "Random";
 
@@ -247,11 +253,19 @@ export default function BOPickCard({
 
   /* Action button — driven by clone_status when available, push_status as fallback */
   const effectiveStatus = cloneStatus ?? (pushStatus === "paused" ? "clone_paused" : pushStatus === "active" ? "clone_active" : null);
+  const { tier } = useUser();
+  const canWrite = tierCanWrite(tier);
+  const upgradeTitle = "Your plan is view-only — upgrade to push or launch ads";
 
   let actionButton;
   if (!alreadyPushed) {
     actionButton = (
-      <button className="btn-primary btn-push-run" onClick={() => setShowPushModal(true)}>
+      <button
+        className="btn-primary btn-push-run"
+        onClick={() => setShowPushModal(true)}
+        disabled={!canWrite}
+        title={canWrite ? undefined : upgradeTitle}
+      >
         Push and Run
       </button>
     );
@@ -262,7 +276,12 @@ export default function BOPickCard({
   } else if (effectiveStatus === "clone_paused") {
     actionButton = (
       <>
-        <button className="btn-success" onClick={handleActivate} disabled={activating}>
+        <button
+          className="btn-success"
+          onClick={handleActivate}
+          disabled={activating || !canWrite}
+          title={canWrite ? undefined : upgradeTitle}
+        >
           {activating ? "Activating…" : "Activate"}
         </button>
         {activateError && <span className="error-inline">{activateError}</span>}
@@ -292,7 +311,12 @@ export default function BOPickCard({
       );
   } else {
     actionButton = (
-      <button className="btn-warn" onClick={() => setShowPushModal(true)}>
+      <button
+        className="btn-warn"
+        onClick={() => setShowPushModal(true)}
+        disabled={!canWrite}
+        title={canWrite ? undefined : upgradeTitle}
+      >
         Push failed — retry
       </button>
     );

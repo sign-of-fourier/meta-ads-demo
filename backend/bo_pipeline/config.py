@@ -135,7 +135,7 @@ Set MODAL_BO_API_URL in .env to enable. Leave blank for fully offline operation.
 
 def modal_bo_enabled() -> bool:
     """Return True if MODAL_BO_API_URL is configured to a non-empty string."""
-    return bool(MODAL_BO_API_URL)
+    return bool(os.getenv("MODAL_BO_API_URL", "").strip())
 
 
 def pca_dims_for_platform(platform: str) -> int:
@@ -186,4 +186,30 @@ main.py). Those functions currently check impressions only. Wiring this in is
 a known gap — see TECHNICAL_DEBT.md.
 
 Default 3. Set MIN_CONVERGENCE_DAYS in .env (no effect until the gap is closed).
+"""
+
+
+# ── Pick confidence (T12 — testing, not yet signed off) ─────────────────────
+
+LOW_CONFIDENCE_GPR_STD: float = float(os.getenv("LOW_CONFIDENCE_GPR_STD", "0.85"))
+"""
+Posterior GPR std (sigma) above which a pick is labelled low-confidence.
+
+y is always rank-transformed to ~N(0,1) before fitting (transform_y), so sigma
+is comparable call-to-call: a value near the marginal variance of the target
+(~1) means the GP learned little from training data at that point (no nearby
+observations pulled the posterior away from the prior) — i.e. a genuinely
+novel combination, not just a low-scoring one.
+
+Default 0.85. Set LOW_CONFIDENCE_GPR_STD in .env to tune.
+"""
+
+LOW_CONFIDENCE_COSINE_DISTANCE: float = float(os.getenv("LOW_CONFIDENCE_COSINE_DISTANCE", "0.35"))
+"""
+Cosine distance (in the pre-PCA embedding space) to the single nearest scored
+observation, above which a pick is labelled low-confidence regardless of its
+gpr_std. Catches cases where the GP posterior looks deceptively confident far
+from any real precedent.
+
+Default 0.35. Set LOW_CONFIDENCE_COSINE_DISTANCE in .env to tune.
 """

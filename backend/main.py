@@ -25,7 +25,7 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,6 +42,7 @@ if _app_env:
 from providers.factory import get_meta_provider, get_google_provider  # noqa: E402 – must follow load_dotenv
 from providers.mask_policy import MaskPolicy  # noqa: E402 – must follow load_dotenv
 import google_ads_api  # noqa: E402 – must follow load_dotenv
+from permissions import KNOWN_TIERS, meta_oauth_scopes, tier_can_write  # noqa: E402 – must follow load_dotenv
 meta_provider = get_meta_provider()
 google_provider = get_google_provider()
 APP_MODE = os.getenv("APP_MODE", "live").lower()
@@ -61,6 +62,11 @@ JWT_SECRET = os.getenv("JWT_SECRET", "change-me")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 24
 
+# Static key for internal/admin calls that set a user's tier directly, bypassing
+# Stripe (comped accounts, beta testers, sales-assisted deals). Not a user-facing
+# credential — required non-empty for the admin endpoint to respond.
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
 _FAKE_META_BASE_URL = os.getenv("FAKE_META_BASE_URL", "")
 META_GRAPH = _FAKE_META_BASE_URL if _FAKE_META_BASE_URL else f"https://graph.facebook.com/{META_API_VERSION}"
 
@@ -78,6 +84,10 @@ def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # Let concurrent writers (e.g. overlapping ingest/BO requests) queue behind
+    # the writer lock briefly instead of failing immediately with "database is
+    # locked".
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -202,6 +212,7 @@ def init_db() -> None:
             gpr_mean                REAL,
             gpr_std                 REAL,
             google_ad_resource_name TEXT,
+            run_id                  TEXT,
             created_at              TEXT NOT NULL DEFAULT (datetime('now'))
         );
         """
@@ -229,6 +240,28 @@ def init_db() -> None:
     except Exception:
         pass  # Column already exists
     try:
+        # One snapshot per (account, object, day): dedupe pre-existing duplicate
+        # rows from repeated /api/ingest calls before the unique index can apply,
+        # keeping the most recently written row for each key.
+        conn.execute(
+            """
+            DELETE FROM ad_insights
+            WHERE id NOT IN (
+                SELECT MAX(id) FROM ad_insights
+                GROUP BY user_id, ad_account_id, level, object_id, date
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_insights_unique
+            ON ad_insights(user_id, ad_account_id, level, object_id, date)
+            """
+        )
+        conn.commit()
+    except Exception:
+        logger.warning("ad_insights dedupe/unique-index migration failed", exc_info=True)
+    try:
         conn.execute(
             "ALTER TABLE ad_creative_structures ADD COLUMN data_source TEXT NOT NULL DEFAULT 'real'"
         )
@@ -245,6 +278,42 @@ def init_db() -> None:
     try:
         conn.execute(
             "ALTER TABLE users ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN tier_source TEXT NOT NULL DEFAULT 'default'"
+        )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN stripe_customer_id TEXT")
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN stripe_subscription_id TEXT")
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        # Admin-set, informational only — nothing auto-enforces this; an admin
+        # reads it and manually downgrades the tier when it's time to close access.
+        conn.execute("ALTER TABLE users ADD COLUMN tier_expires_at TEXT")
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN last_login_at TEXT")
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN login_count INTEGER NOT NULL DEFAULT 0"
         )
         conn.commit()
     except Exception:
@@ -302,6 +371,11 @@ def init_db() -> None:
         conn.execute(
             "ALTER TABLE bo_selections ADD COLUMN google_ad_resource_name TEXT"
         )
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    try:
+        conn.execute("ALTER TABLE bo_selections ADD COLUMN run_id TEXT")
         conn.commit()
     except Exception:
         pass  # Column already exists
@@ -368,6 +442,16 @@ def init_db() -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS manual_campaigns (
+            id          TEXT PRIMARY KEY,
+            user_id     INTEGER NOT NULL,
+            name        TEXT NOT NULL,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
     conn.commit()
     conn.execute(
         """
@@ -402,6 +486,8 @@ def init_db() -> None:
     _ensure_combo_table()
     from bo_pipeline.storage import ensure_scored_observations_table as _ensure_scored_obs
     _ensure_scored_obs()
+    from bo_pipeline.storage import ensure_table as _ensure_bo_selections
+    _ensure_bo_selections()
     from ad_text_generation.storage import ensure_tables as _ensure_text_gen_tables
     _ensure_text_gen_tables()
 
@@ -564,6 +650,37 @@ def get_current_user_id(request: Request) -> int:
         return int(payload["sub"])
     except (JWTError, KeyError, ValueError):
         raise HTTPException(401, "Invalid token")
+
+
+def require_write_access(user_id: int = Depends(get_current_user_id)) -> int:
+    """Gate for any route that pushes/launches/pauses ads on a connected platform.
+    Read-only tiers (free/trial/beta) get a 403 here regardless of what the frontend
+    shows — the backend, not the UI, is the actual boundary."""
+    db = get_db()
+    row = db.execute("SELECT tier FROM users WHERE id = ?", (user_id,)).fetchone()
+    db.close()
+    tier = row["tier"] if row else "free"
+    if not tier_can_write(tier):
+        raise HTTPException(
+            403,
+            detail={
+                "error": "upgrade_required",
+                "message": "Your plan is view-only. Upgrade to launch or manage ads on your connected accounts.",
+                "tier": tier,
+            },
+        )
+    return user_id
+
+
+def require_admin_key(request: Request) -> None:
+    """Auth for internal/admin calls — a static shared key, not a user JWT. Deliberately
+    separate from get_current_user_id so no logged-in user can ever reach this by having
+    a valid session; only whoever holds ADMIN_API_KEY can."""
+    if not ADMIN_API_KEY:
+        raise HTTPException(503, "Admin API not configured")
+    provided = request.headers.get("X-Admin-Key", "")
+    if not secrets.compare_digest(provided, ADMIN_API_KEY):
+        raise HTTPException(401, "Invalid admin key")
 
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
@@ -737,6 +854,33 @@ class SuggestionResponse(BaseModel):
     created_at: str
 
 
+# ── Manual platform models ────────────────────────────────────────────────────
+
+class ManualCampaignCreate(BaseModel):
+    name: str
+
+class ManualCampaignPatch(BaseModel):
+    name: str
+
+class ManualSlotDef(BaseModel):
+    name: str
+    values: list[str]
+
+class ManualAdCreate(BaseModel):
+    name: str = ""
+    creative_type: str = "dynamic"
+    slots: list[ManualSlotDef]  # slot name "image" → image URLs; everything else → text
+    pool_only: bool = True
+    score: float | None = None
+    metric: str | None = None
+
+class ManualScoreIn(BaseModel):
+    combination_key: str
+    combination: dict
+    score: float
+    metric: str = "ctr"
+
+
 # ── Auth routes (local) ───────────────────────────────────────────────────────
 @app.post("/auth/signup", response_model=TokenResponse)
 def signup(body: SignupLogin):
@@ -747,7 +891,9 @@ def signup(body: SignupLogin):
     if existing:
         raise HTTPException(409, "Email already registered")
     cur = db.execute(
-        "INSERT INTO users (email, pw_hash) VALUES (?, ?)",
+        # tier='beta' — no Stripe billing yet (TECHNICAL_DEBT.md T11), so every new
+        # signup is open/read-only by default until an admin extends or upgrades it.
+        "INSERT INTO users (email, pw_hash, tier) VALUES (?, ?, 'beta')",
         (body.email, pwd_ctx.hash(body.password)),
     )
     db.commit()
@@ -760,14 +906,20 @@ def signup(body: SignupLogin):
 def login(body: SignupLogin):
     db = get_db()
     row = db.execute("SELECT id, pw_hash FROM users WHERE email = ?", (body.email,)).fetchone()
-    db.close()
     try:
         password_ok = row and pwd_ctx.verify(body.password, row["pw_hash"])
     except ValueError:
         # bcrypt rejects passwords > 72 bytes — treat as wrong password
         password_ok = False
     if not password_ok:
+        db.close()
         raise HTTPException(401, "Invalid email or password")
+    db.execute(
+        "UPDATE users SET last_login_at = datetime('now'), login_count = login_count + 1 WHERE id = ?",
+        (row["id"],),
+    )
+    db.commit()
+    db.close()
     return TokenResponse(token=create_token(row["id"]))
 
 
@@ -778,6 +930,84 @@ def get_me(user_id: int = Depends(get_current_user_id)):
     row = db.execute("SELECT email, tier FROM users WHERE id = ?", (user_id,)).fetchone()
     db.close()
     return UserInfo(email=row["email"], tier=row["tier"])
+
+
+# ── Admin: user management (bypasses Stripe — comped accounts, beta testers) ─────
+class AdminUserRow(BaseModel):
+    id: int
+    email: str
+    tier: str
+    tier_source: str
+    tier_expires_at: str | None = None
+    created_at: str
+    last_login_at: str | None = None
+    login_count: int
+
+
+class AdminUsersResponse(BaseModel):
+    users: list[AdminUserRow]
+
+
+class SetTierRequest(BaseModel):
+    tier: str | None = None
+    # Free-form ISO date/datetime string, or explicit null to clear. Purely
+    # informational — nothing reads this to auto-revoke access; an admin is
+    # expected to look at it and manually downgrade the tier when it's time.
+    tier_expires_at: str | None = None
+
+
+_ADMIN_USER_COLUMNS = (
+    "id, email, tier, tier_source, tier_expires_at, created_at, last_login_at, login_count"
+)
+
+
+@app.get("/api/admin/users", response_model=AdminUsersResponse)
+def admin_list_users(_admin: None = Depends(require_admin_key)):
+    db = get_db()
+    rows = db.execute(
+        f"SELECT {_ADMIN_USER_COLUMNS} FROM users ORDER BY id"
+    ).fetchall()
+    db.close()
+    return AdminUsersResponse(users=[AdminUserRow(**dict(r)) for r in rows])
+
+
+@app.post("/api/admin/users/{user_id}/tier", response_model=AdminUserRow)
+def admin_set_tier(
+    user_id: int, body: SetTierRequest, _admin: None = Depends(require_admin_key)
+):
+    """Directly sets a user's tier and/or tier_expires_at without going through
+    Stripe. This is the escape hatch for beta testers and comped/sales-assisted
+    deals — it can set any tier, including write-enabled ones, so ADMIN_API_KEY
+    must stay internal-only. Once a user has a real Stripe subscription, the
+    (future) Stripe webhook handler takes tier back over — it should always
+    overwrite tier_source to 'stripe' on any subscription event, regardless of
+    what's currently stored.
+    """
+    data = body.model_dump(exclude_unset=True)
+    if not data:
+        raise HTTPException(400, "Nothing to update — pass tier and/or tier_expires_at")
+
+    updates, params = [], []
+    if "tier" in data:
+        if data["tier"] not in KNOWN_TIERS:
+            raise HTTPException(
+                400, f"Unknown tier '{data['tier']}'. Must be one of: {', '.join(sorted(KNOWN_TIERS))}"
+            )
+        updates += ["tier = ?", "tier_source = 'admin'"]
+        params.append(data["tier"])
+    if "tier_expires_at" in data:
+        updates.append("tier_expires_at = ?")
+        params.append(data["tier_expires_at"])
+
+    db = get_db()
+    result = db.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", (*params, user_id))
+    db.commit()
+    if result.rowcount == 0:
+        db.close()
+        raise HTTPException(404, "User not found")
+    row = db.execute(f"SELECT {_ADMIN_USER_COLUMNS} FROM users WHERE id = ?", (user_id,)).fetchone()
+    db.close()
+    return AdminUserRow(**dict(row))
 
 
 # ── Meta connection routes ─────────────────────────────────────────────────────
@@ -801,10 +1031,14 @@ def meta_login_url(user_id: int = Depends(get_current_user_id)):
         "INSERT OR REPLACE INTO oauth_states (state, user_id) VALUES (?, ?)",
         (state, user_id),
     )
+    tier_row = db.execute("SELECT tier FROM users WHERE id = ?", (user_id,)).fetchone()
     db.commit()
     db.close()
 
-    scopes = "ads_read,ads_management,business_management"
+    # Read-only tiers never request ads_management — the consent screen itself
+    # reflects what this account can do, not just an in-app button being hidden.
+    # If the user later upgrades, they must reconnect Meta to get a write-scoped token.
+    scopes = meta_oauth_scopes(tier_row["tier"] if tier_row else "free")
     url = (
         f"https://www.facebook.com/{META_API_VERSION}/dialog/oauth"
         f"?client_id={META_APP_ID}"
@@ -1567,6 +1801,16 @@ async def run_ingest(user_id: int = Depends(get_current_user_id)):
                  impressions, clicks, spend, ctr, cpm, cpc,
                  data_source, mask_profile)
             VALUES (?, ?, 'campaign', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (user_id, ad_account_id, level, object_id, date) DO UPDATE SET
+                impressions = excluded.impressions,
+                clicks = excluded.clicks,
+                spend = excluded.spend,
+                ctr = excluded.ctr,
+                cpm = excluded.cpm,
+                cpc = excluded.cpc,
+                data_source = excluded.data_source,
+                mask_profile = excluded.mask_profile,
+                created_at = datetime('now')
             """,
             (
                 user_id, ad_account_id, cid, today,
@@ -2804,7 +3048,7 @@ def campaign_history(
 
 @app.post("/api/campaigns/{campaign_id}/pause", response_model=CampaignActionResponse)
 async def pause_campaign(
-    campaign_id: str, user_id: int = Depends(get_current_user_id)
+    campaign_id: str, user_id: int = Depends(require_write_access)
 ):
     access_token, _ = _meta_creds(user_id)
     async with httpx.AsyncClient(timeout=30) as client:
@@ -2814,7 +3058,7 @@ async def pause_campaign(
 
 @app.post("/api/campaigns/{campaign_id}/resume", response_model=CampaignActionResponse)
 async def resume_campaign(
-    campaign_id: str, user_id: int = Depends(get_current_user_id)
+    campaign_id: str, user_id: int = Depends(require_write_access)
 ):
     access_token, _ = _meta_creds(user_id)
     async with httpx.AsyncClient(timeout=30) as client:
@@ -3161,6 +3405,7 @@ class BOPick(BaseModel):
     gpr_mean: float | None = None
     gpr_std: float | None = None
     nearest_known: list[dict] = []   # explainability: cosine-nearest scored ads (pre-PCA space)
+    confidence: str | None = None    # T12 (testing an approach, not yet signed off): "low" or None
     placements: list[dict] = []
     # Lifecycle — populated by _enrich_pick after checking pushed_ad_combos
     ad_name: str | None = None
@@ -3545,6 +3790,7 @@ class CrossPlatformBOPick(BaseModel):
     gpr_mean: float | None = None
     gpr_std: float | None = None
     nearest_known: list[dict] = []   # explainability: cosine-nearest scored ads (pre-PCA space)
+    confidence: str | None = None    # T12 (testing an approach, not yet signed off): "low" or None
     platform: str               # "meta" | "google"
     seed_ad_id: str
     text_source_id: str
@@ -3566,6 +3812,7 @@ class CrossPlatformBOGroupStat(BaseModel):
     seed_ad_id: str
     scored_count: int
     candidate_count: int
+    pca_warning: str | None = None  # T12 (testing an approach, not yet signed off)
 
 
 class CrossPlatformBOResponse(BaseModel):
@@ -3811,7 +4058,7 @@ class PushResponse(BaseModel):
 
 
 @app.post("/api/push", response_model=PushResponse)
-async def push_generated_ads(user_id: int = Depends(get_current_user_id)):
+async def push_generated_ads(user_id: int = Depends(require_write_access)):
     """Push all unpushed completed generated ads to Meta as static ads (PAUSED)."""
     try:
         access_token, ad_account_id = _meta_creds(user_id)
@@ -4011,7 +4258,7 @@ async def _create_google_rsa_ad(
 
 
 @app.post("/api/google/push", response_model=GooglePushResponse)
-async def push_google_ads(user_id: int = Depends(get_current_user_id)):
+async def push_google_ads(user_id: int = Depends(require_write_access)):
     """Push all unpushed BO-recommended RSA configurations to Google Ads (PAUSED)."""
     try:
         access_token, customer_id, login_customer_id = await _google_creds(user_id)
@@ -4019,16 +4266,13 @@ async def push_google_ads(user_id: int = Depends(get_current_user_id)):
         return GooglePushResponse(pushed=0, failed=0, note="Google Ads not connected")
 
     db = get_db()
+    # One unpushed row per (seed_ad_id, text_source_id, combination_key) is
+    # guaranteed by save_bo_run()'s delete-then-insert + partial unique index
+    # (see bo_pipeline/storage.py), so no "latest run" disambiguation is needed.
     rows = db.execute(
         """
         SELECT bs.id, bs.seed_ad_id, bs.combination
         FROM bo_selections bs
-        INNER JOIN (
-            SELECT seed_ad_id, MAX(created_at) AS max_ts
-            FROM bo_selections
-            WHERE pick_rank = 1 AND google_ad_resource_name IS NULL
-            GROUP BY seed_ad_id
-        ) latest ON bs.seed_ad_id = latest.seed_ad_id AND bs.created_at = latest.max_ts
         WHERE bs.pick_rank = 1 AND bs.google_ad_resource_name IS NULL
           AND bs.seed_ad_id IN (
               SELECT DISTINCT ad_id FROM ad_creative_structures
@@ -4092,7 +4336,7 @@ class PushPickResponse(BaseModel):
 
 
 @app.post("/api/push/pick", response_model=PushPickResponse)
-async def push_pick(body: PushPickRequest, user_id: int = Depends(get_current_user_id)):
+async def push_pick(body: PushPickRequest, user_id: int = Depends(require_write_access)):
     """
     Push a specific BO-recommended combination as a new PAUSED ad.
 
@@ -4226,7 +4470,7 @@ class PushMatchResponse(BaseModel):
 
 
 @app.post("/api/push/match", response_model=PushMatchResponse)
-def push_match(body: PushMatchRequest, user_id: int = Depends(get_current_user_id)):
+def push_match(body: PushMatchRequest, user_id: int = Depends(require_write_access)):
     """Record that a BO pick matches an existing native static ad — no new ad is created.
 
     Writes a pushed_ad_combos row pointing at the existing ad so future BO runs
@@ -4270,7 +4514,7 @@ class ActivateRequest(BaseModel):
 
 
 @app.post("/api/activate")
-async def activate_ad(body: ActivateRequest, user_id: int = Depends(get_current_user_id)):
+async def activate_ad(body: ActivateRequest, user_id: int = Depends(require_write_access)):
     """Enable a PAUSED pushed clone on the platform."""
     if body.platform == "meta":
         access_token, ad_account_id = _meta_creds(user_id)
@@ -4324,7 +4568,7 @@ async def activate_ad(body: ActivateRequest, user_id: int = Depends(get_current_
 
 
 @app.post("/api/pause-ad")
-async def pause_ad(body: ActivateRequest, user_id: int = Depends(get_current_user_id)):
+async def pause_ad(body: ActivateRequest, user_id: int = Depends(require_write_access)):
     """Pause any ad (template or clone) on the platform."""
     if body.platform == "meta":
         access_token, _ = _meta_creds(user_id)
@@ -4832,6 +5076,373 @@ def get_dynamic_gen_status(
 
     db.close()
     return result
+
+
+# ── Manual platform routes ────────────────────────────────────────────────────
+
+def _manual_id(prefix: str) -> str:
+    return f"man_{prefix}_{secrets.token_hex(6)}"
+
+
+@app.post("/api/manual/campaigns")
+def create_manual_campaign(
+    body: ManualCampaignCreate,
+    user_id: int = Depends(get_current_user_id),
+):
+    campaign_id = _manual_id("cmp")
+    db = get_db()
+    db.execute(
+        "INSERT INTO manual_campaigns (id, user_id, name) VALUES (?, ?, ?)",
+        (campaign_id, user_id, body.name),
+    )
+    db.commit()
+    db.close()
+    return {"id": campaign_id, "name": body.name, "ad_count": 0, "obs_count": 0, "platform": "manual"}
+
+
+@app.get("/api/manual/campaigns")
+def list_manual_campaigns(user_id: int = Depends(get_current_user_id)):
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, name, created_at FROM manual_campaigns WHERE user_id = ? ORDER BY created_at DESC",
+        (user_id,),
+    ).fetchall()
+    result = []
+    for row in rows:
+        ad_count = db.execute(
+            "SELECT COUNT(DISTINCT ad_id) FROM ad_creative_structures WHERE user_id = ? AND campaign_id = ?",
+            (user_id, row["id"]),
+        ).fetchone()[0]
+        obs_count = db.execute(
+            """SELECT COUNT(*) FROM scored_observations so
+               WHERE so.user_id = ? AND so.seed_ad_id IN (
+                   SELECT DISTINCT ad_id FROM ad_creative_structures
+                   WHERE user_id = ? AND campaign_id = ?
+               )""",
+            (user_id, user_id, row["id"]),
+        ).fetchone()[0]
+        result.append({
+            "id": row["id"],
+            "name": row["name"],
+            "created_at": row["created_at"],
+            "ad_count": ad_count,
+            "obs_count": obs_count,
+            "platform": "manual",
+        })
+    db.close()
+    return result
+
+
+@app.patch("/api/manual/campaigns/{campaign_id}")
+def rename_manual_campaign(
+    campaign_id: str,
+    body: ManualCampaignPatch,
+    user_id: int = Depends(get_current_user_id),
+):
+    db = get_db()
+    db.execute(
+        "UPDATE manual_campaigns SET name = ? WHERE id = ? AND user_id = ?",
+        (body.name, campaign_id, user_id),
+    )
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.delete("/api/manual/campaigns/{campaign_id}")
+def delete_manual_campaign(
+    campaign_id: str,
+    user_id: int = Depends(get_current_user_id),
+):
+    db = get_db()
+    ad_ids = [
+        r[0]
+        for r in db.execute(
+            "SELECT DISTINCT ad_id FROM ad_creative_structures WHERE user_id = ? AND campaign_id = ?",
+            (user_id, campaign_id),
+        ).fetchall()
+    ]
+    db.execute("DELETE FROM manual_campaigns WHERE id = ? AND user_id = ?", (campaign_id, user_id))
+    db.execute(
+        "DELETE FROM ad_creative_structures WHERE campaign_id = ? AND user_id = ?",
+        (campaign_id, user_id),
+    )
+    if ad_ids:
+        placeholders = ",".join("?" * len(ad_ids))
+        db.execute(
+            f"DELETE FROM scored_observations WHERE user_id = ? AND seed_ad_id IN ({placeholders})",
+            [user_id, *ad_ids],
+        )
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.post("/api/manual/upload-image")
+async def upload_manual_image(
+    file: UploadFile = File(...),
+    user_id: int = Depends(get_current_user_id),
+):
+    ext = Path(file.filename).suffix.lower() if file.filename else ""
+    if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+        ext = ".jpg"
+    filename = f"manual_{secrets.token_hex(8)}{ext}"
+    dest = _AD_IMAGES_DIR / filename
+    content = await file.read()
+    dest.write_bytes(content)
+    return {"url": f"/ad-images/{filename}"}
+
+
+@app.post("/api/manual/campaigns/{campaign_id}/ads")
+async def create_manual_ad(
+    campaign_id: str,
+    body: ManualAdCreate,
+    user_id: int = Depends(get_current_user_id),
+):
+    db = get_db()
+    camp = db.execute(
+        "SELECT id FROM manual_campaigns WHERE id = ? AND user_id = ?",
+        (campaign_id, user_id),
+    ).fetchone()
+    if not camp:
+        db.close()
+        raise HTTPException(404, "Campaign not found")
+
+    prefix = "dyn" if body.creative_type == "dynamic" else "sta"
+    ad_id = _manual_id(prefix)
+
+    text_components: list[dict] = []
+    image_components: list[dict] = []
+    for slot_def in body.slots:
+        is_image = slot_def.name == "image"
+        for idx, value in enumerate(slot_def.values):
+            db.execute(
+                """INSERT INTO ad_creative_structures
+                   (user_id, ad_account_id, campaign_id, adset_id, ad_id,
+                    creative_type, slot, slot_index, value, platform, data_source)
+                   VALUES (?, 'manual', ?, 'manual', ?, ?, ?, ?, ?, 'manual', 'manual')""",
+                (user_id, campaign_id, ad_id, body.creative_type, slot_def.name, idx, value),
+            )
+            c = {"slot": slot_def.name, "slot_index": idx, "value": value}
+            (image_components if is_image else text_components).append(c)
+
+    db.commit()
+
+    # If static + record result, write score immediately
+    if body.creative_type == "static" and not body.pool_only and body.score is not None:
+        text_slots = [s for s in body.slots if s.name != "image"]
+        img_slots = [s for s in body.slots if s.name == "image"]
+        text_combo = {s.name: s.values[0] for s in text_slots if s.values}
+        if img_slots and img_slots[0].values:
+            combo_key = json.dumps(
+                {"combo": text_combo, "image_slot": 0},
+                sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+            )
+        else:
+            combo_key = json.dumps(text_combo, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        _write_convergence_observation(
+            db, user_id, ad_id, combo_key, combo_key, body.score, body.metric or "ctr", "manual"
+        )
+        db.commit()
+
+    db.close()
+
+    # Text combination embeddings (image slot excluded)
+    text_slot_names = [s.name for s in body.slots if s.name != "image"]
+    from ad_combination_embeddings.pipeline import embed_all_combinations as _embed_manual
+    asyncio.create_task(_embed_manual(source_id=ad_id, components=text_components, slots=text_slot_names))
+
+    # Image embeddings
+    if image_components:
+        from embeddings.pipeline import embed_images as _embed_images
+        asyncio.create_task(_embed_images(user_id, ad_id, campaign_id, image_components))
+
+    return {"ad_id": ad_id, "campaign_id": campaign_id, "creative_type": body.creative_type}
+
+
+@app.get("/api/manual/campaigns/{campaign_id}/ads")
+def list_manual_ads(
+    campaign_id: str,
+    user_id: int = Depends(get_current_user_id),
+):
+    db = get_db()
+    ad_rows = db.execute(
+        """SELECT DISTINCT ad_id, creative_type, MIN(ingested_at) AS created_at
+           FROM ad_creative_structures
+           WHERE user_id = ? AND campaign_id = ?
+           GROUP BY ad_id, creative_type
+           ORDER BY created_at""",
+        (user_id, campaign_id),
+    ).fetchall()
+
+    result = []
+    for ad_row in ad_rows:
+        ad_id = ad_row["ad_id"]
+        slots_raw = db.execute(
+            """SELECT slot, slot_index, value FROM ad_creative_structures
+               WHERE user_id = ? AND ad_id = ? ORDER BY slot, slot_index""",
+            (user_id, ad_id),
+        ).fetchall()
+        slot_map: dict[str, list[str]] = {}
+        image_urls: list[str] = []
+        for sr in slots_raw:
+            if sr["slot"] == "image":
+                image_urls.append(sr["value"])
+            else:
+                slot_map.setdefault(sr["slot"], []).append(sr["value"])
+        obs_count = db.execute(
+            "SELECT COUNT(*) FROM scored_observations WHERE seed_ad_id = ? AND user_id = ?",
+            (ad_id, user_id),
+        ).fetchone()[0]
+        result.append({
+            "ad_id": ad_id,
+            "creative_type": ad_row["creative_type"],
+            "slots": [{"name": k, "values": v} for k, v in slot_map.items()],
+            "image_urls": image_urls,
+            "obs_count": obs_count,
+            "created_at": ad_row["created_at"],
+        })
+    db.close()
+    return result
+
+
+@app.delete("/api/manual/ads/{ad_id}")
+def delete_manual_ad(
+    ad_id: str,
+    user_id: int = Depends(get_current_user_id),
+):
+    db = get_db()
+    db.execute(
+        "DELETE FROM ad_creative_structures WHERE ad_id = ? AND user_id = ?",
+        (ad_id, user_id),
+    )
+    db.execute(
+        "DELETE FROM scored_observations WHERE seed_ad_id = ? AND user_id = ?",
+        (ad_id, user_id),
+    )
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.get("/api/manual/ads/{ad_id}/combinations")
+def list_manual_combinations(
+    ad_id: str,
+    user_id: int = Depends(get_current_user_id),
+):
+    from ad_combination_embeddings.combinations import build_combinations as _build, combination_key as _key
+
+    db = get_db()
+    slots_raw = db.execute(
+        """SELECT slot, slot_index, value FROM ad_creative_structures
+           WHERE ad_id = ? AND user_id = ? ORDER BY slot, slot_index""",
+        (ad_id, user_id),
+    ).fetchall()
+    if not slots_raw:
+        db.close()
+        raise HTTPException(404, "Ad not found")
+
+    # Separate image and text components (image slot name is "image")
+    image_variants: list[tuple[int, str]] = []  # (slot_index, url)
+    text_components: list[dict] = []
+    seen: set[str] = set()
+    text_slot_names: list[str] = []
+    for r in slots_raw:
+        if r["slot"] == "image":
+            image_variants.append((r["slot_index"], r["value"]))
+        else:
+            text_components.append({"slot": r["slot"], "slot_index": r["slot_index"], "value": r["value"]})
+            if r["slot"] not in seen:
+                seen.add(r["slot"])
+                text_slot_names.append(r["slot"])
+
+    text_combos = _build(text_components, text_slot_names)
+
+    obs_rows = db.execute(
+        "SELECT combination_key, score, metric, source FROM scored_observations WHERE seed_ad_id = ? AND user_id = ?",
+        (ad_id, user_id),
+    ).fetchall()
+    scores_by_key = {
+        r["combination_key"]: {"score": r["score"], "metric": r["metric"], "source": r["source"]}
+        for r in obs_rows
+    }
+
+    bo_rows = db.execute(
+        "SELECT combination_key, pick_rank FROM bo_selections WHERE seed_ad_id = ? ORDER BY pick_rank",
+        (ad_id,),
+    ).fetchall()
+    bo_keys = {r["combination_key"]: r["pick_rank"] for r in bo_rows}
+
+    db.close()
+
+    result = []
+    if image_variants:
+        # text × image cross-product; key format matches _write_convergence_observation
+        for combo in text_combos:
+            text_key_parsed = json.loads(_key(combo))
+            for img_idx, img_url in sorted(image_variants):
+                full_key = json.dumps(
+                    {"combo": text_key_parsed, "image_slot": img_idx},
+                    sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+                )
+                obs = scores_by_key.get(full_key, {})
+                result.append({
+                    "combination_key": full_key,
+                    "combination": combo,
+                    "image_slot": img_idx,
+                    "image_url": img_url,
+                    "score": obs.get("score"),
+                    "metric": obs.get("metric"),
+                    "source": obs.get("source"),
+                    "is_bo_pick": full_key in bo_keys,
+                    "bo_rank": bo_keys.get(full_key),
+                })
+    else:
+        for combo in text_combos:
+            key = _key(combo)
+            obs = scores_by_key.get(key, {})
+            result.append({
+                "combination_key": key,
+                "combination": combo,
+                "image_slot": None,
+                "image_url": None,
+                "score": obs.get("score"),
+                "metric": obs.get("metric"),
+                "source": obs.get("source"),
+                "is_bo_pick": key in bo_keys,
+                "bo_rank": bo_keys.get(key),
+            })
+
+    # BO picks first (by rank), then scored, then unscored
+    result.sort(key=lambda x: (
+        0 if x["is_bo_pick"] else (1 if x["score"] is not None else 2),
+        x.get("bo_rank") or 99,
+    ))
+    return result
+
+
+@app.post("/api/manual/ads/{ad_id}/score")
+def score_manual_combination(
+    ad_id: str,
+    body: ManualScoreIn,
+    user_id: int = Depends(get_current_user_id),
+):
+    db = get_db()
+    ad = db.execute(
+        "SELECT ad_id FROM ad_creative_structures WHERE ad_id = ? AND user_id = ? LIMIT 1",
+        (ad_id, user_id),
+    ).fetchone()
+    if not ad:
+        db.close()
+        raise HTTPException(404, "Ad not found")
+
+    combo_json = json.dumps(body.combination, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    _write_convergence_observation(
+        db, user_id, ad_id, body.combination_key, combo_json, body.score, body.metric, "manual"
+    )
+    db.commit()
+    db.close()
+    return {"ok": True}
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

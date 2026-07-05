@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import SyncBar from "../components/SyncBar.jsx";
 import UnifiedCampaignsTable from "../components/UnifiedCampaignsTable.jsx";
 import BatchPanel from "../components/BatchPanel.jsx";
@@ -15,6 +16,8 @@ import {
   runUnifiedCrossPlatformBO,
   createGenerator,
   runBOForGenerator,
+  listManualCampaigns,
+  listManualAds,
 } from "../api.js";
 
 const META_LAST_SYNCED_KEY = "meta_last_synced";
@@ -49,6 +52,7 @@ function saveSelectedAds(ads) {
 export default function DashboardPage() {
   const [metaCampaigns, setMetaCampaigns] = useState([]);
   const [googleCampaigns, setGoogleCampaigns] = useState([]);
+  const [manualCampaigns, setManualCampaigns] = useState([]);
   const [metaLoading, setMetaLoading] = useState(true);
   const [googleLoading, setGoogleLoading] = useState(true);
   const [metaError, setMetaError] = useState(null);
@@ -92,6 +96,10 @@ export default function DashboardPage() {
       .then(setGoogleCampaigns)
       .catch((err) => setGoogleError(err.message))
       .finally(() => setGoogleLoading(false));
+
+    listManualCampaigns()
+      .then(setManualCampaigns)
+      .catch(() => {});
   }, []);
 
   // ── Silently restore structure for previously-ingested campaigns ──────────
@@ -191,6 +199,13 @@ export default function DashboardPage() {
   // ── Accordion: one row open at a time ─────────────────────────────────────
   function handleToggle(compositeKey) {
     setExpandedKey((prev) => (prev === compositeKey ? null : compositeKey));
+    // Auto-load manual ads on first expand (no explicit ingest step)
+    if (compositeKey.startsWith("manual:") && structureByKey[compositeKey] === undefined) {
+      const campaignId = compositeKey.slice("manual:".length);
+      listManualAds(campaignId)
+        .then((ads) => setStructureByKey((prev) => ({ ...prev, [compositeKey]: ads })))
+        .catch(() => {});
+    }
   }
 
   // ── Ingest ─────────────────────────────────────────────────────────────────
@@ -198,7 +213,10 @@ export default function DashboardPage() {
     const key = `${platform}:${campaignId}`;
     setIngestingKey(key);
     try {
-      if (platform === "meta") {
+      if (platform === "manual") {
+        const ads = await listManualAds(campaignId);
+        setStructureByKey((prev) => ({ ...prev, [key]: ads }));
+      } else if (platform === "meta") {
         const ingestResult = await ingestCampaignStructure(campaignId);
         const ads = await getCampaignStructure(campaignId);
         setStructureByKey((prev) => ({ ...prev, [key]: ads }));
@@ -328,6 +346,7 @@ export default function DashboardPage() {
   const allCampaigns = [
     ...metaCampaigns.map((c) => ({ ...c, platform: "meta" })),
     ...googleCampaigns.map((c) => ({ ...c, platform: "google" })),
+    ...manualCampaigns,
   ];
 
   // Set of "platform:seed_ad_id" for O(1) checkbox lookup in AdsPanel
@@ -374,13 +393,21 @@ export default function DashboardPage() {
             <div className="dash-select-legend">
               <div className="dash-legend-row">
                 <span className="creative-type-badge dynamic">Template</span>
-                <span>Check a Dynamic or RSA ad — Adstac.kr will explore all its headline, description, and image combinations.</span>
+                <span>Check a Dynamic or RSA ad — AdStackers will explore all its headline, description, and image combinations.</span>
               </div>
               <div className="dash-legend-row">
                 <span className="creative-type-badge static">Static</span>
                 <span>Check a static ad to add it to the candidate pool. Its past performance (if any) will also inform the recommendations.</span>
               </div>
             </div>
+            <p className="pro-tip">
+              <strong>Pro tip:</strong> check a dynamic ad (or Google RSA) to pull its full set of
+              headlines, images, and text into the space of experiments — the richer that dynamic
+              ad, the wider the space AdStackers can search. No live campaign to pull from, or want
+              full control over the assets? <Link to="/app/studio">Add ads manually</Link> in the
+              Studio instead.{" "}
+              <Link to="/guide#dynamic-ads">Read more →</Link>
+            </p>
           </div>
         </div>
         <div className="dash-section-body" style={{ padding: 0 }}>
@@ -399,14 +426,14 @@ export default function DashboardPage() {
         </div>
       </section>
 
-      {/* ── Step 3: Adstac.kr ────────────────────────────────────────────────── */}
+      {/* ── Step 3: AdStackers ────────────────────────────────────────────────── */}
       <section className="dash-section">
         <div className="dash-step-hd">
           <span className="dash-step-num s3">3</span>
           <div>
-            <h3 className="dash-step-title">Run Adstac.kr</h3>
+            <h3 className="dash-step-title">Run AdStackers</h3>
             <p className="dash-step-desc">
-              Review the ads you've selected, then run Adstac.kr to get ranked combination recommendations. Check any recommendation to push it as a new static ad.
+              Review the ads you've selected, then run AdStackers to get ranked combination recommendations. Check any recommendation to push it as a new static ad.
             </p>
           </div>
         </div>

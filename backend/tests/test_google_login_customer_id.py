@@ -73,7 +73,9 @@ def client(tmp_db):
 def user_token(tmp_db):
     db = sqlite3.connect(str(tmp_db))
     cur = db.execute(
-        "INSERT INTO users (email, pw_hash) VALUES (?, ?)", ("test@example.com", "hashed")
+        # tier='premium' — these tests exercise push mechanics, not the write-access
+        # gate (free/trial/beta are read-only; see backend/permissions.py).
+        "INSERT INTO users (email, pw_hash, tier) VALUES (?, ?, 'premium')", ("test@example.com", "hashed")
     )
     user_id = cur.lastrowid
     db.commit()

@@ -12,6 +12,7 @@ re-exported here so existing callers don't need to change their import paths.
 from __future__ import annotations
 
 import logging
+import os
 
 import numpy as np
 from sklearn.decomposition import PCA
@@ -38,7 +39,13 @@ __all__ = [
     "fit_pca",
     "project",
     "dim_bounds",
+    "_api_url",
 ]
+
+
+def _api_url() -> str:
+    """Return the configured Modal GP endpoint URL."""
+    return MODAL_BO_API_URL
 
 logger = logging.getLogger(__name__)
 
@@ -47,15 +54,22 @@ logger = logging.getLogger(__name__)
 # PCA helpers
 # ---------------------------------------------------------------------------
 
-def fit_pca(X: np.ndarray, n_components: int | None = None) -> tuple[PCA, np.ndarray]:
+def fit_pca(X: np.ndarray, n_components: int | None = None) -> tuple[PCA, np.ndarray, str | None]:
     """
-    Fit PCA on X and return (fitted_pca, X_reduced).
+    Fit PCA on X and return (fitted_pca, X_reduced, warning).
 
     n_components defaults to MODAL_BO_PCA_DIMS (see bo_pipeline.config).
     Capped at min(n_components, n_samples, n_features) so it never fails on
     small inputs.
+
+    T12 (testing an approach, not yet signed off): warning is a human-readable
+    string when the requested n_components got capped (too few samples/features
+    to fit the requested dimensionality), else None. Callers should surface it
+    the same way they already surface run_bo's Modal-fallback warning.
     """
-    n_components = n_components if n_components is not None else MODAL_BO_PCA_DIMS
+    if n_components is None:
+        n_components = int(os.getenv("MODAL_BO_PCA_DIMS", str(MODAL_BO_PCA_DIMS)))
+    requested = n_components
     n_components = min(n_components, X.shape[0], X.shape[1])
     pca = PCA(n_components=n_components, random_state=42)
     X_reduced = pca.fit_transform(X).astype(np.float32)
@@ -63,7 +77,14 @@ def fit_pca(X: np.ndarray, n_components: int | None = None) -> tuple[PCA, np.nda
         "fit_pca: %d→%d dims | explained variance: %.3f",
         X.shape[1], n_components, float(pca.explained_variance_ratio_.sum()),
     )
-    return pca, X_reduced
+    warning = None
+    if n_components < requested:
+        warning = (
+            f"PCA capped to {n_components} dims (requested {requested}) — "
+            f"only {X.shape[0]} samples / {X.shape[1]} features available"
+        )
+        logger.info("fit_pca: %s", warning)
+    return pca, X_reduced, warning
 
 
 def project(pca: PCA, X: np.ndarray) -> np.ndarray:

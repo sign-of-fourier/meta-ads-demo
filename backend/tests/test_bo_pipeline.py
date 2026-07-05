@@ -311,6 +311,42 @@ class TestGPR:
 
 
 # ---------------------------------------------------------------------------
+# TestConfidenceLabel — T12 (testing an approach, not yet signed off)
+# ---------------------------------------------------------------------------
+
+class TestConfidenceLabel:
+    def test_none_when_both_signals_confident(self):
+        from bo_pipeline.gpr import confidence_label
+        nearest = [{"cosine_distance": 0.05}, {"cosine_distance": 0.2}]
+        assert confidence_label(0.1, nearest) is None
+
+    def test_low_when_gpr_std_high(self):
+        from bo_pipeline.gpr import confidence_label
+        nearest = [{"cosine_distance": 0.05}]
+        assert confidence_label(0.95, nearest) == "low"
+
+    def test_low_when_nearest_known_far(self):
+        from bo_pipeline.gpr import confidence_label
+        nearest = [{"cosine_distance": 0.5}, {"cosine_distance": 0.6}]
+        assert confidence_label(0.1, nearest) == "low"
+
+    def test_low_when_no_nearest_known_and_std_high(self):
+        from bo_pipeline.gpr import confidence_label
+        assert confidence_label(0.9, []) == "low"
+
+    def test_none_when_gpr_std_none_and_no_nearest_known(self):
+        """Random-fallback picks have neither signal — no confidence claim to make."""
+        from bo_pipeline.gpr import confidence_label
+        assert confidence_label(None, None) is None
+
+    def test_uses_min_distance_among_multiple_neighbors(self):
+        from bo_pipeline.gpr import confidence_label
+        # One close neighbor (0.05) among far ones — should NOT be flagged low.
+        nearest = [{"cosine_distance": 0.6}, {"cosine_distance": 0.05}, {"cosine_distance": 0.55}]
+        assert confidence_label(0.1, nearest) is None
+
+
+# ---------------------------------------------------------------------------
 # TestSelector — DB layer, pre-seeded, no API calls
 # ---------------------------------------------------------------------------
 
@@ -427,6 +463,12 @@ class TestBOPipeline:
                 # Modal path: no per-pick GPR decomposition
                 assert pick["gpr_mean"] is None
                 assert pick["gpr_std"] is None
+
+    def test_picks_have_confidence_field(self, bo_result):
+        """T12 (testing an approach, not yet signed off): confidence is 'low' or None."""
+        for pick in bo_result:
+            assert "confidence" in pick
+            assert pick["confidence"] in (None, "low")
 
     def test_picks_are_from_candidate_pool(self, test_db, bo_result):
         from bo_pipeline.selector import get_candidate_combinations, get_scored_combinations

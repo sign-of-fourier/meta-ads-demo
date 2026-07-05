@@ -22,7 +22,10 @@ Single-file FastAPI application. All routes, Pydantic models, DB schema, and bus
 | `_suggestion_from_row()` | Converts DB row → `SuggestionResponse` Pydantic model |
 | `_resolve_generator(generator_id, user_id)` | Returns `(all_member_ad_ids, dynamic_member_ad_ids)` for a generator; used by BO run endpoints |
 | `_google_creds(user_id)` | Reads `google_connections`, refreshes token, returns `(access_token, customer_id, login_customer_id)` |
-| `GET /me` | Returns user's email and tier (`free`/`premium`) |
+| `require_write_access()` | FastAPI dependency; 403s with `{"error": "upgrade_required", ...}` unless the caller's tier is in `permissions.WRITE_TIERS`. Gates every route that pushes/launches/pauses ads on Meta or Google — see `permissions.py` |
+| `require_admin_key()` | FastAPI dependency; checks `X-Admin-Key` against `ADMIN_API_KEY` (constant-time compare). Gates the admin tier-set route only |
+| `GET /me` | Returns user's email and tier (`free`/`trial`/`beta`/`basic`/`premium`/`enterprise`) |
+| `POST /api/admin/users/{user_id}/tier` | Admin-only (`X-Admin-Key` header); sets any user's tier directly, bypassing Stripe — the escape hatch for beta testers and comped/sales-assisted deals. Sets `tier_source='admin'` |
 | `POST /api/ingest/structure/{campaign_id}` | Meta: writes creative structures; fires clone detection, convergence check, embeddings |
 | `POST /api/push` | Pushes all completed generation jobs (no `meta_ad_id` yet) to Meta as PAUSED static ads |
 | `POST /api/push/pick` | Unified per-pick push (Meta + Google); records in `pushed_ad_combos` with `clone_status='clone_paused'` |
@@ -40,6 +43,27 @@ Single-file FastAPI application. All routes, Pydantic models, DB schema, and bus
 Image serving: `main.py` mounts `StaticFiles` at `/images` → `backend/generated_images/` and `/ad-images` → `backend/ad_images/`.
 
 Full route table: `README.md`. Full schema: `SCHEMAS.md`.
+
+## `backend/permissions.py` — tier taxonomy + write-access rules
+
+Single source of truth for which tiers may push/launch/pause ads on a connected platform:
+
+- `READ_ONLY_TIERS = {"free", "trial", "beta", "basic"}` — `free` is the base zero-state; `beta` is what every new signup gets today (no Stripe yet); `trial`/`basic` are placeholders for future Stripe-backed tiers that still won't grant write access
+- `WRITE_TIERS = {"premium", "enterprise"}` — the only tiers that can push/activate/pause ads
+- `tier_can_write(tier)` — used by `require_write_access()` in `main.py`
+- `meta_oauth_scopes(tier)` — read-only tiers request `ads_read,business_management` only (no `ads_management`) at Meta OAuth connect time, so the consent screen itself reflects the account's capability, not just a hidden frontend button. Google Ads has no equivalent narrower scope — the `require_write_access` backend gate is the only enforcement there.
+
+**New signups default to `tier='beta'`** (`signup()`, explicit in the `INSERT`, not just the column default) — wide open (read-only, no expiry) until an admin closes or upgrades the account. There's no Stripe integration yet (see `TECHNICAL_DEBT.md` T11); `users.tier_source` (`'default' | 'admin' | 'stripe'`) tracks who last set `tier` — today it's only ever `'default'` or `'admin'` (via the admin screen). When the Stripe webhook lands, it should treat any subscription event as authoritative and overwrite `tier_source` to `'stripe'` regardless of current value.
+
+`users.tier_expires_at` is **informational only** — nothing reads it to auto-revoke access. It exists so an admin can see when a beta/comped account is meant to end and manually downgrade the tier at that point (`POST /api/admin/users/{id}/tier`), per an explicit decision to keep this manual rather than build auto-expiry.
+
+`users.last_login_at` / `login_count` are updated on every successful `/auth/login` (not on signup) and shown in the admin screen.
+
+Note: upgrading a user's tier does not retroactively widen an already-issued Meta OAuth token's scope — the user must reconnect Meta to get a write-scoped token after an upgrade.
+
+## Admin screen — `frontend/src/pages/AdminPage.jsx`
+
+Internal-only user management UI at `/admin` (not linked from any nav, not nested under the logged-in-user `App` shell — its auth is independent of regular user JWTs). Gated by pasting `ADMIN_API_KEY` into a one-time prompt; the key is kept in `localStorage` (not session-only, so you don't retype a long secret every visit) and sent as `X-Admin-Key` on every call. Lists all users (email, tier, expiry, source, last login, login count, created) via `GET /api/admin/users`, with an inline per-row tier dropdown + expiry date input + Save, backed by `POST /api/admin/users/{id}/tier`.
 
 ## `backend/providers/` — provider layer
 
@@ -65,3 +89,11 @@ Full route table: `README.md`. Full schema: `SCHEMAS.md`.
 - `run_unified_cross_platform_bo(...)` → **2-tuple** `(picks, group_stats)`
 
 When `seed_ad_ids` / `text_source_ids` / `image_ad_ids` are provided (generator run), pools are merged across all member ads. Pass `None` for all three when running single-ad BO (existing behaviour).
+
+### Pick confidence + PCA-cap warning (T12 — drafted, NOT SIGNED OFF)
+
+Testing an approach, not a finished feature — see `TECHNICAL_DEBT.md` T12 and `GP_CONFIDENCE.md` for status and full reasoning.
+
+- `confidence_label(gpr_std, nearest_known)` (`bo_pipeline/gpr.py`) — returns `"low"` or `None`. Thresholds `LOW_CONFIDENCE_GPR_STD` (default 0.85) and `LOW_CONFIDENCE_COSINE_DISTANCE` (default 0.35) live in `bo_pipeline/config.py`, both env-var tunable.
+- `confidence` field on `BOPick` / `CrossPlatformBOPick`, set by both `_make_pick` copies (`pipeline.py`, `cross_platform.py`).
+- `fit_pca` (`bo_pipeline/modal_bo.py`) returns a **3-tuple** `(pca, X_reduced, warning)`, not 2 — `warning` is set when the requested `n_components` got capped. Threads into `run_bo`'s existing `modal_warning` slot (single-platform) and a new `pca_warning` key on `group_stats`/`CrossPlatformBOGroupStat` entries (cross-platform paths).
