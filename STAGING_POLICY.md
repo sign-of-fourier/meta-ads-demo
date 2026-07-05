@@ -205,3 +205,42 @@ At present, the backend already supports a meaningful distinction between safe r
 
 Until that source is implemented in code, this document should be treated as the canonical internal reference.
 
+---
+
+## Legacy Masking Env Vars
+
+These env vars activate the masking layer described above. They live in `backend/.env`.
+
+Rule of thumb: **fake what costs money, keep everything else real.**
+
+Masking activates when `MASK_MODE=selective|full` **or** when any individual `MASK_*` flag is `true`.
+
+### Meta masking
+
+| Variable | Values | Description |
+|---|---|---|
+| `MASK_MODE` | `off` \| `selective` \| `full` | Coarse switch. `full` enables all flags; `selective` leaves them off unless individually set. |
+| `MASK_STATUS` | `true\|false` | Force campaign status → `ACTIVE` |
+| `MASK_BUDGETS` | `true\|false` | Replace `daily_budget` with a deterministic demo value |
+| `MASK_METRICS` | `true\|false` | Synthesize insights for campaigns with impressions < 100; preserve real metrics otherwise |
+| `MASK_PAUSE_RESUME` | `true\|false` | pause/resume → no-op |
+| `MASK_AD_STATUSES` | `true\|false` | Force ad status → `ACTIVE` (also implied by `MASK_STATUS`) |
+| `REAL_ASSET_CREATION` | `true\|false` | Reserved for future use — not consulted by any route yet |
+| `METRIC_PROFILE` | `healthy` \| `stable` \| `weak` | Synthetic metric profile (default `healthy`) |
+
+Synthetic metrics are deterministic per campaign ID. Values are internally consistent (`ctr = clicks/impressions`, `cpm = spend/impressions*1000`, `cpc = spend/clicks`).
+
+Routes that always hit Meta directly (never masked): `/auth/meta/callback`, `/api/explore`, structural ingest (`_fetch_campaign_structure`), static ad creation (`_clone_dynamic_to_static_ad`).
+
+### Google masking
+
+| Variable | Values | Description |
+|---|---|---|
+| `GOOGLE_APP_MODE` | `demo` \| _(unset)_ | Force `GoogleDemoProvider` regardless of `APP_MODE` |
+| `GOOGLE_MASK_MODE` | `off` \| `selective` \| `full` | Coarse switch; same semantics as Meta |
+| `GOOGLE_MASK_STATUS` | `true\|false` | Force campaign status → `ACTIVE` |
+| `GOOGLE_MASK_BUDGETS` | `true\|false` | Replace `daily_budget` with a deterministic synthetic value |
+| `GOOGLE_MASK_METRICS` | `true\|false` | Synthesize insights for campaigns with impressions < 100 |
+| `GOOGLE_MASK_PAUSE_RESUME` | `true\|false` | pause/resume → no-op |
+| `GOOGLE_METRIC_PROFILE` | `healthy` \| `stable` \| `weak` | Synthetic metric profile (default `healthy`) |
+

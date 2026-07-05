@@ -15,7 +15,13 @@ Local auth accounts. Independent of Meta identity.
 | `id` | INTEGER PK | autoincrement |
 | `email` | TEXT UNIQUE | |
 | `pw_hash` | TEXT | bcrypt |
-| `tier` | TEXT | `'free'` \| `'premium'` — added via ALTER TABLE migration; default `'free'` |
+| `tier` | TEXT | `'free'` \| `'trial'` \| `'beta'` \| `'basic'` \| `'premium'` \| `'enterprise'` — added via ALTER TABLE migration; column default `'free'`, but `signup()` explicitly inserts `'beta'` for every new account (no Stripe yet — wide open until an admin closes/upgrades it). `free`/`trial`/`beta`/`basic` are read-only (no ad push/launch/pause); only `premium`/`enterprise` can write. See `backend/permissions.py` |
+| `tier_source` | TEXT | `'default'` \| `'admin'` \| `'stripe'` — who last set `tier`. Added via ALTER TABLE migration; default `'default'`. No Stripe webhook handler exists yet (see `TECHNICAL_DEBT.md`) — today this is either `'default'` or `'admin'` (set via `POST /api/admin/users/{id}/tier`) |
+| `tier_expires_at` | TEXT, nullable | Admin-set reminder date; **not auto-enforced** — nothing reads this to revoke access. An admin is expected to check it and manually downgrade the tier when it's time. Editable from the admin screen (`/admin`) |
+| `stripe_customer_id` | TEXT, nullable | Reserved for future Stripe billing integration; unused until the webhook handler is built |
+| `stripe_subscription_id` | TEXT, nullable | Same |
+| `last_login_at` | TEXT, nullable | Updated on every successful `/auth/login` (not signup) |
+| `login_count` | INTEGER | Default `0`; incremented on every successful `/auth/login` |
 | `created_at` | TEXT | `datetime('now')` |
 
 ---
@@ -78,7 +84,7 @@ Temporary holding table for Google OAuth when multiple accounts are accessible. 
 
 ### `ad_insights`
 
-Metric snapshots. One row per campaign per `POST /api/ingest` call. No date deduplication — rows accumulate over time.
+Metric snapshots. One row per `(user, ad_account, level, object_id, date)` per day — a repeat `POST /api/ingest` call the same day updates that day's row in place (`ON CONFLICT DO UPDATE`) rather than inserting a duplicate.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -97,7 +103,8 @@ Metric snapshots. One row per campaign per `POST /api/ingest` call. No date dedu
 | `platform` | TEXT | `'meta'` \| `'google'` — added via ALTER TABLE migration; default `'meta'` |
 | `data_source` | TEXT | `'real'` \| `'masked'` \| `'demo'` — added via ALTER TABLE migration |
 | `mask_profile` | TEXT nullable | `'healthy'` \| `'stable'` \| `'weak'` — only set when `data_source='masked'` |
-| `created_at` | TEXT | |
+| `created_at` | TEXT | Overwritten to the update time on each re-ingest of the same day's row |
+| UNIQUE | | `(user_id, ad_account_id, level, object_id, date)` — `idx_ad_insights_unique`; drives the upsert. A one-time startup migration deduplicates any pre-existing rows (keeping the highest `id` per key) before the index is created. |
 
 ---
 
@@ -120,6 +127,9 @@ Normalised creative components. One row per `(user, ad, slot, slot_index)`.
 | `value` | TEXT | The component text or image URL / hash |
 | `ingested_at` | TEXT | ISO timestamp of last ingest |
 | `lifecycle_status` | TEXT | `'active'`, `'inactive'`, `'missing'`, or `'generated'` (see below) |
+| `effective_status` | TEXT | Raw platform status: `'ACTIVE'`, `'PAUSED'`, `'ENABLED'`, `'CAMPAIGN_PAUSED'`, etc. — added via ALTER TABLE migration; default `'UNKNOWN'` |
+| `is_pushed_clone` | INTEGER | `1` if this ad was created by the push flow and its `ad_id` matches a `pushed_ad_combos.platform_ad_numeric_id`; else `0` — added via ALTER TABLE migration |
+| `role` | TEXT | `'parent'` (default) \| `'test_clone'` — set at ingest; `test_clone` is set when `is_pushed_clone` is detected. Does not change after first write. — added via ALTER TABLE migration |
 | `data_source` | TEXT | `'real'` \| `'masked'` \| `'demo'` \| `'generated'` — added via ALTER TABLE migration |
 | `mask_profile` | TEXT nullable | `'healthy'` \| `'stable'` \| `'weak'` — only set when `data_source='masked'` |
 | UNIQUE | | `(user_id, ad_id, slot, slot_index)` — drives idempotent upsert |
@@ -208,32 +218,91 @@ Returned by `POST /api/suggestions`, `POST /api/suggestions/{id}/confirm`, and `
 
 ### `AdStructure`
 
-Returned by `GET /api/structure/{campaign_id}` — one item per ad.
+Returned by `GET /api/structure/{campaign_id}` and `GET /api/google/structure/{campaign_id}` — one item per ad.
 
 ```python
 {
   "ad_id":            str,
   "adset_id":         str,
   "campaign_id":      str,
-  "creative_type":    "static" | "dynamic",
+  "creative_type":    "static" | "dynamic" | "rsa" | "display" | "video" | "pmax" | "shopping" | "unknown",
   "lifecycle_status": "active" | "inactive" | "missing" | None,
+  "effective_status": str | None,   # e.g. "ACTIVE", "PAUSED", "ENABLED"; None if UNKNOWN
+  "is_pushed_clone":  bool,         # True if ad was created by the push flow
+  "clone_stats":      dict | None,  # see below
   "components":       { slot: [value, …] }  # dict[str, list[str | None]]
 }
 ```
 
-`components` values are ordered lists: single-element for static ads, multi-element for dynamic variants.
+`components` values are ordered lists: single-element for static ads, multi-element for dynamic variants. Internal slots (prefixed `_`, e.g. `_placements`) are excluded.
+
+**`clone_stats` shape** — present for all ads:
+
+```python
+# Pushed clones (is_pushed_clone=True):
+{
+  "impressions":   int,
+  "days_running":  int,
+  "converged":     bool,
+  "ctr":           float | None,   # convergence_metric; None until clone converges
+  "push_status":   str,            # "paused" | "active" — legacy; prefer clone_status
+  "clone_status":  str,            # lifecycle state: see pushed_ad_combos table
+  "platform_ad_id": str | None,    # platform ad ID for activate calls
+  "combo_id":      int | None,     # pushed_ad_combos.id for retain calls
+}
+
+# Native ads with ingest metrics (is_pushed_clone=False, impressions in native_ad_insights):
+{
+  "impressions": int,
+  "clicks":      int,
+  "ctr":         float,   # decimal fraction (0.045 = 4.5%)
+  "spend":       float,
+  "cpm":         float,
+}
+```
 
 ### `StructureIngestResult`
 
-Returned by `POST /api/ingest/structure/{campaign_id}`.
+Returned by `POST /api/ingest/structure/{campaign_id}` and `POST /api/google/ingest/structure/{campaign_id}`.
 
 ```python
 {
-  "campaign_id":      str,
-  "ads_processed":    int,
-  "components_saved": int
+  "campaign_id":        str,
+  "ads_processed":      int,
+  "components_saved":   int,
+  "parent_should_pause": bool   # True when any clone_paused/clone_active rows exist for this campaign
 }
 ```
+
+### `BOPick`
+
+Returned inside `BORunResponse` by `/api/bo/run`, `/api/google/bo/run`, and results endpoints.
+
+```python
+{
+  "combination_key":    str,
+  "combination":        dict,          # { slot: value } — text slots + optional image_url
+  "selection_type":     str,           # "ei" | "fantasy" | "random" | "modal_q_ei"
+  "ei_score":           float | None,
+  "gpr_mean":           float | None,
+  "gpr_std":            float | None,
+  "nearest_known":      list[dict],    # explainability: cosine-nearest scored ads (pre-PCA space), default []
+  "confidence":         str | None,    # "low" | None — T12, drafted not signed off, see TECHNICAL_DEBT.md
+  "placements":         list[dict],    # Meta placement data; empty for Google
+  # lifecycle fields — populated when already pushed:
+  "ad_name":            str | None,
+  "already_pushed":     bool,
+  "push_status":        str | None,    # "paused" | "active" — legacy
+  "converged":          bool,
+  "platform_ad_id":     str | None,
+  "current_impressions": int,
+  "clone_status":       str | None,    # clone lifecycle state from pushed_ad_combos
+  "combo_id":           int | None,    # pushed_ad_combos.id — used by POST /api/push/retain
+  "matches_existing_ad": dict | None,  # {ad_id, effective_status} if combo matches a native static ad
+}
+```
+
+`CrossPlatformBOPick` (returned by `/api/bo/cross-platform*`) has the same fields plus `platform`, `seed_ad_id`, `text_source_id`, and a `pca_warning: str | None` field on each `group_stats` entry (not on the pick itself) — see `BACKEND.md`.
 
 ### `Campaign`
 
@@ -483,6 +552,27 @@ rows = get_embeddings_for_source("my_ad_001")
 
 ---
 
+### `scored_observations`
+
+Lives in `backend/bo_pipeline/storage.py`, not `main.py`. The central table BO fits on — every GPR/Modal call reads its training set from here, never from `ad_generation_variants` directly. Three writers populate it: the Qwen2-VL image-scoring pipeline, CTR convergence checking (`_write_convergence_observation` in `main.py`), and the synthetic warm-start/seed path (`POST /api/bo/seed-scored-variants`, `warm_start.py`).
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK | |
+| `user_id` | INTEGER | |
+| `seed_ad_id` | TEXT | The ad this observation belongs to (or a `generator_id` for multi-member pools — see `ad_generators`) |
+| `combination_key` | TEXT | `json.dumps(combo, sort_keys=True)` — matches `ad_text_combination_embeddings.combination_key` |
+| `combination` | TEXT | JSON — the slot dict this observation scores |
+| `score` | REAL | Meaning depends on `metric` — never mixed across metric types in one GP fit |
+| `metric` | TEXT | `'ctr'` \| `'cvr'` \| `'roas'` \| `'qwen'` \| `'qwen_warm'` \| `'synthetic'` — resolution order in `bo_pipeline/config.py`'s `METRIC_PREFERENCE` |
+| `source` | TEXT | `'seed_script'` \| provenance of the writer, e.g. which pipeline wrote this row |
+| `text_vector` | BLOB nullable | `float32` bytes |
+| `image_vector` | BLOB nullable | `float32` bytes; `NULL` for text-only ads (Google RSA) — presence, not platform name, decides 1536- vs 3072-dim in `_build_X`/`BOGroup.build_X` |
+| `created_at` | TEXT | |
+| UNIQUE | | `(user_id, seed_ad_id, combination_key, metric)` — a new observation for the same combination+metric supersedes rather than duplicates |
+
+---
+
 ### `dynamic_generation_jobs`
 
 Tracks the status of async `POST /api/generate/dynamic/{campaign_id}` jobs. One row per button click.
@@ -521,9 +611,92 @@ One row per BO-recommended combination per run. Written by `bo_pipeline.save_bo_
 | `gpr_mean` | REAL nullable | GPR posterior mean at the selected point |
 | `gpr_std` | REAL nullable | GPR posterior std at the selected point |
 | `google_ad_resource_name` | TEXT nullable | Set after successful push to Google Ads — added via ALTER TABLE migration |
-| `created_at` | TEXT | `datetime('now')` — groups a run's two picks by timestamp |
+| `run_id` | TEXT nullable | UUID4 hex shared by every pick from one `save_bo_run()` call — added via ALTER TABLE migration; NULL on rows written before this column existed |
+| `created_at` | TEXT | `datetime('now')` |
+| UNIQUE (partial) | | `idx_bo_selections_unpushed` on `(seed_ad_id, text_source_id, combination_key) WHERE google_ad_resource_name IS NULL` |
+
+**Run replacement semantics:** `save_bo_run()` deletes any not-yet-pushed rows (`google_ad_resource_name IS NULL`) for the same `(seed_ad_id, text_source_id)` before inserting the new run's picks, in one transaction (`BEGIN IMMEDIATE`) — a fresh run supersedes the prior recommendation rather than accumulating alongside it. Rows already pushed to Google (`google_ad_resource_name` set) are exempt and persist forever as push history. `get_latest_bo_run()` returns the picks sharing the `run_id` of the highest-`id` row for that `(seed_ad_id, text_source_id)`. The partial unique index is a backstop, not the primary mechanism — it turns a would-be race between two concurrent `save_bo_run()` calls for the same ad into a loud `IntegrityError` rather than silent duplicate rows.
 
 **Variant embedding convention:** when embedding a generated image variant for use in `bo_pipeline`, store it in `ad_embeddings` with `ad_id = f"gen_{job_id}_{variant_id}"`. The selector joins on this convention.
+
+---
+
+### `pushed_ad_combos`
+
+One row per pushed test clone. Written by `POST /api/push/pick`; updated by convergence checkers and activate/retain endpoints.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK | |
+| `user_id` | INTEGER | FK → `users.id` |
+| `platform` | TEXT | `'meta'` \| `'google'` |
+| `seed_ad_id` | TEXT | The parent ad that was optimised |
+| `ad_name` | TEXT | Name given to the pushed clone |
+| `combination_key` | TEXT | JSON key identifying the BO-selected (headline, description, …) combination |
+| `combination` | TEXT | JSON dict of the selected slots |
+| `platform_ad_id` | TEXT nullable | Meta ad ID or Google resource name |
+| `platform_ad_numeric_id` | TEXT nullable | Numeric ad ID (last segment of Google resource name); used for clone detection |
+| `push_status` | TEXT | `'paused'` \| `'active'` — legacy; use `clone_status` going forward |
+| `clone_status` | TEXT | Lifecycle state: `'clone_paused'` → `'clone_active'` → `'clone_converged'` / `'clone_retained'` / `'clone_invalidated'` |
+| `converged` | INTEGER | `1` when CTR thresholds met — kept for backward compat; derivable from `clone_status = 'clone_converged'` |
+| `converged_at` | TEXT nullable | Timestamp when convergence was recorded |
+| `convergence_metric` | REAL nullable | CTR at convergence time |
+| `current_impressions` | INTEGER | Latest impression count from convergence checker |
+| `days_running` | INTEGER | Days since push (updated by convergence checker) |
+| `pushed_at` | TEXT | `datetime('now')` |
+| UNIQUE | | `(user_id, platform, seed_ad_id, combination_key)` |
+
+**`clone_status` lifecycle:**
+
+| Status | Set when |
+|---|---|
+| `clone_paused` | On push; or initial default |
+| `clone_active` | User activates via `/api/activate`; or convergence checker detects `ENABLED` (Google) / `impressions > 0` (Meta) |
+| `clone_converged` | Convergence checker: impressions ≥ threshold AND days ≥ threshold |
+| `clone_retained` | User clicks "Keep Running" → `POST /api/push/retain/{combo_id}` |
+| `clone_invalidated` | Ingest detects creative mismatch between stored combination and current ad values |
+
+---
+
+### `ad_parent_fillers`
+
+Stores the constant filler slots extracted from a Google parent RSA at first ingest. Used when pushing test clones so all 5 RSA slots are pinned and CTR measures exactly one (headline, description) pair.
+
+| Column | Type | Notes |
+|---|---|---|
+| `parent_ad_id` | TEXT PK | `ad_creative_structures.ad_id` of the parent RSA |
+| `filler_headline_1` | TEXT | 2nd headline from the parent RSA (slot_index=1); fallback `"Learn More"` |
+| `filler_headline_2` | TEXT | 3rd headline from the parent RSA (slot_index=2); fallback `"Get Started"` |
+| `filler_description_1` | TEXT | 2nd description from the parent RSA (slot_index=1); fallback `"Find out more today."` |
+| `created_at` | TIMESTAMP | `CURRENT_TIMESTAMP` |
+
+---
+
+### `ad_generators`
+
+Named groups of ads whose candidate pools are merged for BO. Created via `POST /api/generators`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | TEXT PK | UUID |
+| `user_id` | INTEGER | FK → `users.id` |
+| `name` | TEXT | User-visible label; auto-generated as `"Auto <platform> YYYY-MM-DD"` when created via BatchPanel |
+| `created_at` | TEXT | `datetime('now')` |
+
+---
+
+### `ad_generator_members`
+
+Members of an ad generator. Each row links one ad to one generator.
+
+| Column | Type | Notes |
+|---|---|---|
+| `generator_id` | TEXT | FK → `ad_generators.id` |
+| `ad_id` | TEXT | `ad_creative_structures.ad_id` of the member ad |
+| `contribution_mode` | TEXT | `'dynamic'` — multi-asset ad (Meta dynamic / Google RSA); its slots form a Cartesian candidate pool. `'static'` — single fixed combination; contributes one candidate as-is. |
+| PRIMARY KEY | | `(generator_id, ad_id)` |
+
+When BO runs with a `generator_id`, all member ads' `ad_text_combination_embeddings` are queried together and `scored_observations` are merged across all member `seed_ad_id` values. The `generator_id` itself becomes the `seed_ad_id` key in `pushed_ad_combos` and `bo_selections` for any picks from that run.
 
 ---
 
@@ -542,3 +715,18 @@ One row per BO-recommended combination per run. Written by `bo_pipeline.save_bo_
 
 ### Source ad fetch for clone (`/{source_ad_id}`)
 `creative{page_id, object_story_spec}` — used to inherit `page_id` and destination `link` URL when creating a static clone.
+
+---
+
+### `manual_campaigns`
+
+Top-level container for Manual platform campaigns. Each row represents one user-created campaign with no external API connection.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | TEXT PK | `man_cmp_{12-char hex}` |
+| `user_id` | INTEGER | FK → `users.id` |
+| `name` | TEXT | User-supplied display name |
+| `created_at` | TEXT | ISO datetime |
+
+Manual ads (dynamic templates and static ads) reuse `ad_creative_structures` with `platform='manual'`, `ad_account_id='manual'`, `adset_id='manual'`, `campaign_id=man_cmp_...`. Dynamic template IDs have prefix `man_dyn_`; static ad IDs have prefix `man_sta_`.

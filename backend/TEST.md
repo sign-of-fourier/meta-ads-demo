@@ -68,8 +68,8 @@ python -m pytest tests/test_bo_pipeline.py -v -k "TestCombineEmbeddings or TestG
 ### `tests/test_modal_bo.py`
 Tests for `bo_pipeline.modal_bo` — PCA helpers, snap logic, and the live Modal GP endpoint.
 
-- `TestModalBOUnit` — `fit_pca` (shape, cap at n_samples/n_features), `project`, `dim_bounds`, `snap_to_pool` (correct indices, dedup, pool exhaustion), env-var reading for `MODAL_BO_API_URL` / `MODAL_BO_PCA_DIMS`. No network calls.
-- `TestModalBOLive` — calls the real Modal GP endpoint with synthetic 256-dim embeddings; verifies response shape, bounds compliance, and end-to-end snap to distinct candidates. Skipped if `MODAL_BO_API_URL` is unset; defaults to the production endpoint if unset but the class is selected directly.
+- `TestModalBOUnit` — `fit_pca` (shape, cap at n_samples/n_features), `project`, `dim_bounds`, env-var reading for `MODAL_BO_API_URL` / `MODAL_BO_PCA_DIMS`; `call_modal_api_multioutput` payload shape (`d`/`d_candidates`/`rho` present and correct, response parsed to index+x). No network calls.
+- `TestModalBOLive` — calls the real Modal GP endpoint; verifies single-output path (response shape, bounds compliance, distinct candidates) and multioutput path (`d`/`d_candidates`/`rho` sent, server branches to `_TorchMultiOutputGP`, returns q candidates in same format). Defaults to the production endpoint when `MODAL_BO_API_URL` is unset.
 
 ```bash
 # Unit tests only (no network)
@@ -277,6 +277,7 @@ Cross-platform Bayesian Optimisation — ECDF normalisation + global EI ranking.
 - `TestBOGroupBuildX` — input matrix construction: Meta uses 3072-dim combined vectors, Google uses 1536-dim text-only, different dims prevent cross-group mixing, `None` image still works, dtype float32
 - `TestCrossPlatformBO` — full end-to-end DB pipeline with both Meta and Google groups seeded: returns list, top-N cap, at least one pick, platform tags, seed_ad_id/text_source_id fields, picks from correct pool, EI scores non-negative, first pick ≥ second by EI, no internal sort keys in result, `top_n=1`/`top_n=4`, random fallback when no scored data, partial fallback when one group has insufficient data, empty pairs returns empty, single Meta pair works, ECDF uses combined score pool
 - `TestCrossPlatformBOEndpoint` — FastAPI route: auth guard, 400 on empty pairs, 200 with mocked pipeline, response shape for picks and group_stats
+- `TestUnifiedBOMultioutput` — `run_unified_cross_platform_bo` with `method="modal_multioutput"`; `call_modal_api_multioutput` patched (no network); covers 2-tuple return, group_stats covers both platforms, required pick fields, picks span Meta and Google, no `_sort_key` leak, `d_train`/`d_cands` contain both platform indices, fallback to shared-PCA on empty response, fallback on exception, `top_n` respected
 
 ```bash
 python -m pytest tests/test_cross_platform_bo.py -v
@@ -379,3 +380,70 @@ python tests/test_finetune_embed.py
 - `tests/test_google_campaigns.py::test_google_campaigns_live_smoke` — 1 test skipped; requires real Google credentials in `.env`.
 
 All other pure tests (no API keys needed) pass cleanly.
+
+---
+
+## Manual / curl tests — Masking layer
+
+For verifying the masking layer behaviour against a live Meta account.
+
+```bash
+export API="http://localhost:8000"
+export TOKEN="<paste JWT here>"   # from POST /auth/login
+```
+
+### Campaigns
+
+```bash
+curl -s "$API/api/campaigns" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+Run twice and diff to verify determinism when masking is on:
+
+```bash
+curl -s "$API/api/campaigns" -H "Authorization: Bearer $TOKEN" | jq > /tmp/c1.json
+curl -s "$API/api/campaigns" -H "Authorization: Bearer $TOKEN" | jq > /tmp/c2.json
+diff /tmp/c1.json /tmp/c2.json   # should be empty
+```
+
+### Sync + ingest
+
+```bash
+curl -s -X POST "$API/api/ingest" -H "Authorization: Bearer $TOKEN" | jq
+
+export CAMPAIGN_ID="<id from /api/campaigns>"
+curl -s -X POST "$API/api/ingest/structure/$CAMPAIGN_ID" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+### Verify embeddings after structural ingest
+
+```bash
+# Seed embedding per ad
+sqlite3 backend/app.db "SELECT ad_id, CASE WHEN text_vector IS NULL THEN 'no' ELSE 'yes' END as has_text, CASE WHEN image_vector IS NULL THEN 'no' ELSE 'yes' END as has_image FROM ad_embeddings;"
+
+# Per-image-slot embeddings
+sqlite3 backend/app.db "SELECT ad_id, slot_index, image_ref, CASE WHEN vector IS NULL THEN 'no' ELSE 'yes' END as embedded FROM ad_image_embeddings;"
+
+# Text combination embeddings — a 4×4×4 dynamic ad produces 64 rows
+sqlite3 backend/app.db "SELECT source_id, COUNT(*) as combinations FROM ad_text_combination_embeddings GROUP BY source_id;"
+```
+
+If `has_image` is `no`, `AZURE_INFERENCE_KEY` is likely missing or wrong. If `has_text` is `no`, check `OPENAI_KEY`. Hit "Reingest" after fixing keys — the backend skips already-complete embeddings.
+
+### Pause / Resume
+
+```bash
+curl -s -X POST "$API/api/campaigns/$CAMPAIGN_ID/pause"  -H "Authorization: Bearer $TOKEN" | jq
+curl -s -X POST "$API/api/campaigns/$CAMPAIGN_ID/resume" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+With `MASK_PAUSE_RESUME=true` both return success without hitting Meta.
+
+### Reference env configs
+
+| Scenario | Env vars |
+|---|---|
+| Real baseline | `APP_MODE=live MASK_MODE=off` |
+| Full selective mask | `MASK_MODE=selective MASK_STATUS=true MASK_BUDGETS=true MASK_METRICS=true MASK_PAUSE_RESUME=true MASK_AD_STATUSES=true METRIC_PROFILE=healthy` |
+| Weak delivery story | `MASK_MODE=selective MASK_STATUS=true MASK_METRICS=true METRIC_PROFILE=weak` |
+| Full demo (no Meta) | `APP_MODE=demo` |

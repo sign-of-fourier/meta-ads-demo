@@ -309,7 +309,7 @@ export default function DocsPage() {
 
           <div id="base-url" style={{ scrollMarginTop: 24, marginBottom: 32 }}>
             <h3 style={{ fontSize: 15, fontWeight: 700, color: C.text, margin: "0 0 8px" }}>Base URL</h3>
-            <CodeBlock code={`http://localhost:8000          # local dev (default)\nhttps://your-ngrok-url.ngrok.io  # public tunnel via start.sh`} />
+            <CodeBlock code={`http://localhost:8000     # local dev (default)\nhttps://adstackers.com    # production, proxied by nginx`} />
             <p style={{ color: C.muted, fontSize: 13, lineHeight: 1.6, margin: "8px 0 0" }}>
               The backend runs on port <code style={{ fontFamily: "monospace", color: C.sky }}>8000</code> by default. Staging mode uses port{" "}
               <code style={{ fontFamily: "monospace", color: C.sky }}>8001</code>.

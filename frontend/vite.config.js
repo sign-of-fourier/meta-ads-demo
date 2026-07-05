@@ -11,7 +11,6 @@ export default defineConfig(({ mode }) => {
     server: {
       host: "0.0.0.0",
       port,
-      allowedHosts: ["unlustred-mattie-intertergal.ngrok-free.dev"],
       proxy: {
         "/api": backendUrl,
         "/auth/signup": backendUrl,
@@ -21,9 +20,6 @@ export default defineConfig(({ mode }) => {
         "/me": backendUrl,
         "/images": backendUrl,
         "/ad-images": backendUrl,
-      },
-      headers: {
-        "ngrok-skip-browser-warning": "true",
       },
     },
   };

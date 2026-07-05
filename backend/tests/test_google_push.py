@@ -58,7 +58,9 @@ def client(tmp_db):
 def user_token(tmp_db):
     db = sqlite3.connect(str(tmp_db))
     cur = db.execute(
-        "INSERT INTO users (email, pw_hash) VALUES (?, ?)", ("test@example.com", "hashed")
+        # tier='premium' — these tests exercise push mechanics, not the write-access
+        # gate (free/trial/beta are read-only; see backend/permissions.py).
+        "INSERT INTO users (email, pw_hash, tier) VALUES (?, ?, 'premium')", ("test@example.com", "hashed")
     )
     user_id = cur.lastrowid
     db.commit()
@@ -303,8 +305,8 @@ def test_google_push_api_error_graceful(client, user_token, tmp_db):
 def test_google_push_only_pushes_own_ads(client, tmp_db):
     # Create two users
     db = sqlite3.connect(str(tmp_db))
-    uid1 = db.execute("INSERT INTO users (email, pw_hash) VALUES (?, ?)", ("u1@x.com", "h")).lastrowid
-    uid2 = db.execute("INSERT INTO users (email, pw_hash) VALUES (?, ?)", ("u2@x.com", "h")).lastrowid
+    uid1 = db.execute("INSERT INTO users (email, pw_hash, tier) VALUES (?, ?, 'premium')", ("u1@x.com", "h")).lastrowid
+    uid2 = db.execute("INSERT INTO users (email, pw_hash, tier) VALUES (?, ?, 'premium')", ("u2@x.com", "h")).lastrowid
     db.commit()
     db.close()
     token1 = create_token(uid1)

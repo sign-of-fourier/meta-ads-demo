@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useSearchParams, useNavigate } from "react-router-dom";
+import { useSearchParams, useNavigate, Link } from "react-router-dom";
 import { getMetaStatus, getMetaLoginUrl, getGoogleStatus, getGoogleLoginUrl, getGooglePendingAccounts, selectGoogleAccount } from "../api.js";
 
 export default function SettingsPage() {
@@ -98,7 +98,7 @@ export default function SettingsPage() {
 
   return (
     <div className="settings-page">
-      <h2>Settings</h2>
+      <h2>Connect Your Accounts</h2>
 
       {justConnectedMeta && (
         <div className="success-banner">Meta account connected successfully.</div>
@@ -115,24 +115,38 @@ export default function SettingsPage() {
 
       <section className="settings-connect-banner">
         <p className="settings-connect-headline">
-          👋 Here, you authenticate and connect your ad accounts.
+          👋 Here, you connect your ad accounts.
         </p>
         <p className="settings-connect-sub">
-          Connect as many accounts as you need, then head to the{" "}
-          <strong>Dashboard</strong> to ingest your campaigns and get
-          AI-powered recommendations.
+          AdStackers links to your Meta and/or Google Ads account (read-only, until you
+          choose to push a change) and lets you pick which of your existing ads to use as
+          the basis for your experiment. Don't have an ad running yet, or want full control
+          over the assets? You can also{" "}
+          <Link to="/app/studio">add ads manually</Link> in the Studio.
         </p>
       </section>
 
-      <section className="card" style={{ background: "#f8f9ff", border: "1px solid #dde3f5" }}>
-        <p style={{ margin: "0 0 0.5rem", fontWeight: 600, color: "#333" }}>How it works</p>
-        <ol style={{ margin: 0, paddingLeft: "1.4rem", lineHeight: 1.9, color: "#444", fontSize: "0.9rem" }}>
-          <li>Connect your Meta and/or Google Ads account below</li>
-          <li>Go to the <strong>Dashboard</strong> in the nav</li>
-          <li>Click <strong>Sync</strong> to load your campaigns</li>
-          <li>Click <strong>Ingest</strong> on any campaign row to read its ads</li>
-          <li>Click <strong>Get Recommendations</strong> — the AI suggests exactly what to test next</li>
+      <section className="card" style={{ background: "#f0f9ff", border: "1px solid #bae6fd" }}>
+        <p style={{ margin: "0 0 0.5rem", fontWeight: 600, color: "#111827" }}>How it works</p>
+        <ol style={{ margin: 0, paddingLeft: "1.4rem", lineHeight: 1.9, color: "#374151", fontSize: "0.875rem" }}>
+          <li>Connect your Meta and/or Google Ads account below.</li>
+          <li>
+            Go to the <Link to="/app/dashboard">Dashboard</Link> and click{" "}
+            <strong>Sync</strong> to load your campaigns, then <strong>Ingest</strong> on a
+            campaign row to read its ads — this is where you pick which ads to experiment on.
+            Prefer to build ads yourself instead of pulling from a live campaign? Use the{" "}
+            <Link to="/app/studio">Studio</Link> to add them manually.
+          </li>
+          <li>Click <strong>Get Recommendations</strong> — the AI suggests exactly what to test next.</li>
         </ol>
+        <p className="pro-tip">
+          <strong>Pro tip:</strong> use a dynamic ad to define the space of possible experiments.
+          Its headlines, images, and text become the template AdStackers recombines to generate
+          candidates — so the richer that dynamic ad, the wider the space it can search. Once
+          you're using it this way, turn the dynamic ad off (pause it) in your campaign so it
+          isn't competing for delivery with the ads AdStackers recommends.{" "}
+          <Link to="/guide#dynamic-ads">Read more →</Link>
+        </p>
       </section>
 
       <section className="card">
@@ -229,6 +243,11 @@ export default function SettingsPage() {
           </>
         )}
       </section>
+
+      <p className="next-step-link">
+        Accounts connected? Head to the <Link to="/app/dashboard">Dashboard</Link> to sync your
+        campaigns and pick which ads to experiment on.
+      </p>
     </div>
   );
 }

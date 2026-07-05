@@ -19,7 +19,7 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
 from sklearn.preprocessing import StandardScaler
 
-MIN_TRAINING_POINTS = 2  # below this, fit() is not called (caller should fallback)
+from bo_pipeline.config import LOW_CONFIDENCE_COSINE_DISTANCE, LOW_CONFIDENCE_GPR_STD, MIN_TRAINING_POINTS  # noqa: E402
 
 
 def transform_y(y: np.ndarray) -> np.ndarray:
@@ -125,3 +125,27 @@ def fantasize(
     X_aug = np.vstack([X_train, X_new])
     y_aug = np.append(y_train, mu[0])
     return fit_gpr(X_aug, y_aug)
+
+
+def confidence_label(gpr_std: float | None, nearest_known: list[dict] | None) -> str | None:
+    """
+    T12 (testing an approach, not yet signed off): derive a coarse confidence
+    label from signals BO already computes per pick.
+
+    Returns "low" if either signal crosses its threshold, else None (no badge
+    shown for the default/normal case — there is deliberately no "high" or
+    "medium" tier yet, see TECHNICAL_DEBT.md T12).
+
+    gpr_std near the marginal variance of the (rank-transformed, ~N(0,1))
+    target means the GP learned little near this point; a large cosine
+    distance to the nearest scored observation means there is no real
+    precedent for this combination even if the posterior otherwise looks
+    confident. Either alone can mislead, so both are checked.
+    """
+    if gpr_std is not None and gpr_std >= LOW_CONFIDENCE_GPR_STD:
+        return "low"
+    if nearest_known:
+        min_dist = min(n["cosine_distance"] for n in nearest_known)
+        if min_dist >= LOW_CONFIDENCE_COSINE_DISTANCE:
+            return "low"
+    return None

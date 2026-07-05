@@ -88,6 +88,91 @@
       "adGroup": {
         "id": "8765432101"
       }
+    },
+    {
+      "adGroupAd": {
+        "resourceName": "customers/1234567890/adGroupAds/721808699",
+        "ad": {
+          "resourceName": "customers/1234567890/adGroupAds/721808699",
+          "id": "721808699",
+          "name": "ProjSync RSA \u2014 AI",
+          "type": "RESPONSIVE_SEARCH_AD",
+          "finalUrls": [
+            "https://projsync.example.com/free-trial"
+          ],
+          "responsiveSearchAd": {
+            "headlines": [
+              {
+                "text": "Manage Projects Online"
+              },
+              {
+                "text": "Remote Team Collaboration"
+              },
+              {
+                "text": "Real-Time Project Updates"
+              },
+              {
+                "text": "Gantt Charts for Planning"
+              },
+              {
+                "text": "Unlimited App Integrations"
+              },
+              {
+                "text": "Simplify Team Workflows"
+              },
+              {
+                "text": "Boost Productivity Today"
+              },
+              {
+                "text": "Try Cloud PM Free"
+              },
+              {
+                "text": "Seamless Remote Management"
+              },
+              {
+                "text": "All-in-One Project Tool"
+              },
+              {
+                "text": "Organize Tasks Effortlessly"
+              },
+              {
+                "text": "Collaborate Anywhere"
+              },
+              {
+                "text": "Streamline Your Projects"
+              },
+              {
+                "text": "Start Your Free Trial Now"
+              },
+              {
+                "text": "Cloud-Based Project Software"
+              }
+            ],
+            "descriptions": [
+              {
+                "text": "Boost remote team productivity with real-time updates and integrations."
+              },
+              {
+                "text": "Manage projects easily with Gantt charts and unlimited integrations."
+              },
+              {
+                "text": "Start your free trial and simplify remote project management today."
+              },
+              {
+                "text": "Collaborate seamlessly from anywhere with our cloud-based platform."
+              }
+            ]
+          }
+        },
+        "status": "PAUSED"
+      },
+      "adGroup": {
+        "id": "8765432100",
+        "resourceName": "customers/1234567890/adGroups/8765432100"
+      },
+      "campaign": {
+        "id": "9876543210"
+      }
     }
   ],
   "9876543211": [

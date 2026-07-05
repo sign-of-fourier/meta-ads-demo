@@ -62,6 +62,9 @@ async def embed_image_url(image_url: str) -> np.ndarray | None:
     if image_url.startswith("/"):
         _port = int(os.getenv("PORT", "8000"))
         image_url = f"http://localhost:{_port}{image_url}"
+    if not image_url.startswith(("http://", "https://")):
+        logger.warning("embed_image_url: skipping non-URL value %r", image_url)
+        return None
     try:
         import base64
         import httpx

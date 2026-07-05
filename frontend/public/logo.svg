@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 112 112">
+  <!-- 5×5 grid, 20px blocks, 3px gaps — all colors pulled from app palette -->
+
+  <!-- Row 0: tip — #f59e0b (app amber) -->
+  <rect x="46" y="0"  width="20" height="20" rx="3" fill="#f59e0b"/>
+
+  <!-- Row 1 — #b45309 -->
+  <rect x="23" y="23" width="20" height="20" rx="3" fill="#b45309"/>
+  <rect x="46" y="23" width="20" height="20" rx="3" fill="#b45309"/>
+  <rect x="69" y="23" width="20" height="20" rx="3" fill="#b45309"/>
+
+  <!-- Row 2: widest — #92400e -->
+  <rect x="0"  y="46" width="20" height="20" rx="3" fill="#92400e"/>
+  <rect x="23" y="46" width="20" height="20" rx="3" fill="#92400e"/>
+  <rect x="46" y="46" width="20" height="20" rx="3" fill="#92400e"/>
+  <rect x="69" y="46" width="20" height="20" rx="3" fill="#92400e"/>
+  <rect x="92" y="46" width="20" height="20" rx="3" fill="#92400e"/>
+
+  <!-- Row 3: stem — #374151 -->
+  <rect x="23" y="69" width="20" height="20" rx="3" fill="#374151"/>
+  <rect x="46" y="69" width="20" height="20" rx="3" fill="#374151"/>
+  <rect x="69" y="69" width="20" height="20" rx="3" fill="#374151"/>
+
+  <!-- Row 4: base — #1f2937 -->
+  <rect x="23" y="92" width="20" height="20" rx="3" fill="#1f2937"/>
+  <rect x="46" y="92" width="20" height="20" rx="3" fill="#1f2937"/>
+  <rect x="69" y="92" width="20" height="20" rx="3" fill="#1f2937"/>
+</svg>

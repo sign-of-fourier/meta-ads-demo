@@ -318,12 +318,9 @@ class TestPCADimsForPlatform:
         assert pca_dims_for_platform("tiktok") == pca_dims_for_platform("meta")
 
     def test_google_env_override(self, monkeypatch):
-        monkeypatch.setenv("GOOGLE_BO_PCA_DIMS", "16")
-        from importlib import reload
-        import bo_pipeline.modal_bo as mb
-        reload(mb)
-        assert mb.pca_dims_for_platform("google") == 16
-        reload(mb)  # restore
+        monkeypatch.setattr("bo_pipeline.config.GOOGLE_BO_PCA_DIMS", 16)
+        from bo_pipeline.modal_bo import pca_dims_for_platform
+        assert pca_dims_for_platform("google") == 16
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -331,7 +328,7 @@ class TestPCADimsForPlatform:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestBOGroupBuildX:
-    """Verify build_X returns the correct input dimension per platform."""
+    """Verify build_X dimension is determined by image_vector presence, not platform."""
 
     def _make_obs(self, with_image: bool = True) -> dict:
         return {
@@ -342,50 +339,42 @@ class TestBOGroupBuildX:
             "combination": {},
         }
 
-    def test_meta_group_returns_combined_dim(self):
+    def test_with_image_returns_combined_dim(self):
         from bo_pipeline.cross_platform import BOGroup
-        group = BOGroup(platform="meta", seed_ad_id="x", text_source_id="x")
-        obs = [self._make_obs(with_image=True) for _ in range(3)]
-        X = group.build_X(obs)
-        assert X.shape == (3, COMBINED_DIM), f"Expected (3, {COMBINED_DIM}), got {X.shape}"
+        for platform in ("meta", "google", "manual"):
+            group = BOGroup(platform=platform, seed_ad_id="x", text_source_id="x")
+            obs = [self._make_obs(with_image=True) for _ in range(3)]
+            X = group.build_X(obs)
+            assert X.shape == (3, COMBINED_DIM), f"[{platform}] Expected (3, {COMBINED_DIM}), got {X.shape}"
 
-    def test_google_group_returns_text_dim(self):
+    def test_without_image_returns_text_dim(self):
         from bo_pipeline.cross_platform import BOGroup
-        group = BOGroup(platform="google", seed_ad_id="x", text_source_id="x")
-        obs = [self._make_obs(with_image=False) for _ in range(3)]
-        X = group.build_X(obs)
-        assert X.shape == (3, TEXT_EMBED_DIM), f"Expected (3, {TEXT_EMBED_DIM}), got {X.shape}"
+        for platform in ("meta", "google", "manual"):
+            group = BOGroup(platform=platform, seed_ad_id="x", text_source_id="x")
+            obs = [self._make_obs(with_image=False) for _ in range(3)]
+            X = group.build_X(obs)
+            assert X.shape == (3, TEXT_EMBED_DIM), f"[{platform}] Expected (3, {TEXT_EMBED_DIM}), got {X.shape}"
 
-    def test_meta_and_google_have_different_input_dims(self):
-        """The key property: different lengths prevent accidental GPR mixing."""
+    def test_image_presence_determines_dim_not_platform(self):
+        """Same observation with image → combined; without image → text-only, regardless of platform."""
         from bo_pipeline.cross_platform import BOGroup
-        meta_group = BOGroup(platform="meta", seed_ad_id="x", text_source_id="x")
-        google_group = BOGroup(platform="google", seed_ad_id="y", text_source_id="y")
-        obs = [self._make_obs(with_image=True)]
+        meta_with = BOGroup(platform="meta", seed_ad_id="x", text_source_id="x")
+        google_with = BOGroup(platform="google", seed_ad_id="y", text_source_id="y")
+        obs_with = [self._make_obs(with_image=True)]
+        assert meta_with.build_X(obs_with).shape[1] == google_with.build_X(obs_with).shape[1] == COMBINED_DIM
 
-        X_meta = meta_group.build_X(obs)
-        X_google = google_group.build_X(obs)
-        assert X_meta.shape[1] != X_google.shape[1], (
-            "Meta and Google must have different feature dimensions"
-        )
-        assert X_meta.shape[1] == COMBINED_DIM
-        assert X_google.shape[1] == TEXT_EMBED_DIM
-
-    def test_meta_with_none_image_still_works(self):
-        """combine() zero-pads when image_vector is None — must not crash."""
-        from bo_pipeline.cross_platform import BOGroup
-        group = BOGroup(platform="meta", seed_ad_id="x", text_source_id="x")
-        obs = [self._make_obs(with_image=False)]
-        X = group.build_X(obs)
-        assert X.shape == (1, COMBINED_DIM)
+        meta_without = BOGroup(platform="meta", seed_ad_id="x", text_source_id="x")
+        google_without = BOGroup(platform="google", seed_ad_id="y", text_source_id="y")
+        obs_without = [self._make_obs(with_image=False)]
+        assert meta_without.build_X(obs_without).shape[1] == google_without.build_X(obs_without).shape[1] == TEXT_EMBED_DIM
 
     def test_output_dtype_is_float32(self):
         from bo_pipeline.cross_platform import BOGroup
-        for platform in ("meta", "google"):
+        for platform, with_image in (("meta", True), ("google", False), ("manual", True), ("manual", False)):
             group = BOGroup(platform=platform, seed_ad_id="x", text_source_id="x")
-            obs = [self._make_obs(with_image=(platform == "meta"))]
+            obs = [self._make_obs(with_image=with_image)]
             X = group.build_X(obs)
-            assert X.dtype == np.float32, f"Expected float32 for {platform}"
+            assert X.dtype == np.float32, f"Expected float32 for {platform} with_image={with_image}"
 
     def test_google_pca_dims_smaller_than_meta(self):
         from bo_pipeline.cross_platform import BOGroup
@@ -657,6 +646,19 @@ class TestCrossPlatformBO:
         t_google_max = transform(np.array([4.4]))[0]
         assert t_meta_high > t_google_max
 
+    def test_pca_warning_surfaced_when_capped(self, cp_db):
+        """
+        T12 (testing an approach, not yet signed off): cp_db has far fewer
+        samples per platform (Meta 4+8=12, Google 3+8=11) than each platform's
+        configured PCA dims, so both groups' PCA gets capped — group_stats
+        should carry pca_warning for each.
+        """
+        from bo_pipeline.cross_platform import run_cross_platform_bo
+        method = os.getenv("BO_TEST_METHOD", "local")
+        _, group_stats = run_cross_platform_bo(_PAIRS, TEST_USER_ID, db_path=cp_db, method=method)
+        for stats in group_stats:
+            assert stats.get("pca_warning"), f"expected pca_warning for {stats['platform']}"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TestCrossPlatformBOEndpoint — FastAPI route (mocked pipeline)
@@ -805,3 +807,220 @@ class TestCrossPlatformBOEndpoint:
             assert "candidate_count" in stat
             assert stat["scored_count"] == 2
             assert stat["candidate_count"] == 5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestUnifiedBOMultioutput — separate-PCA path, call_modal_api_multioutput mocked
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestUnifiedBOMultioutput:
+    """
+    run_unified_cross_platform_bo with method="modal_multioutput".
+
+    call_modal_api_multioutput is patched — no network.  The cp_db fixture
+    seeds 8 text combos per platform.  The test seeder writes scored
+    observations using plain combo keys while get_candidate_combinations
+    produces compound {"combo":..., "image_slot":...} keys, so exclude_keys
+    never matches and all 8 candidates per platform are returned.
+
+    cand_entries_ordered is Meta-first (ordered by seen_platforms, which
+    follows _PAIRS):  indices 0-7 = Meta, indices 8-15 = Google.
+
+    Fake suggestions use index=0 (first Meta candidate) and index=8 (first
+    Google candidate) so tests can assert cross-platform pick tagging.
+    """
+
+    _PAIRS = [
+        {"platform": "meta",   "seed_ad_id": META_SEED_AD_ID,   "text_source_id": META_TEXT_SOURCE_ID},
+        {"platform": "google", "seed_ad_id": GOOGLE_SEED_AD_ID, "text_source_id": GOOGLE_TEXT_SOURCE_ID},
+    ]
+
+    # index=0 → Meta candidate; index=8 → first Google candidate (after 8 Meta)
+    _FAKE_SUGGESTIONS = [
+        {"index": 0, "x": np.zeros(64, dtype=np.float32), "mu": None, "sigma": None},
+        {"index": 8, "x": np.zeros(64, dtype=np.float32), "mu": None, "sigma": None},
+    ]
+
+    @pytest.fixture(autouse=True)
+    def _modal_env(self, monkeypatch):
+        monkeypatch.setenv("MODAL_BO_API_URL", "https://fake.modal.run")
+
+    def _run(self, cp_db, mock_return=None, **kwargs):
+        from unittest.mock import patch
+        from bo_pipeline.cross_platform import run_unified_cross_platform_bo
+        suggestions = self._FAKE_SUGGESTIONS if mock_return is None else mock_return
+        with patch("bo_pipeline.modal_bo.call_modal_api_multioutput", return_value=suggestions):
+            return run_unified_cross_platform_bo(
+                self._PAIRS, TEST_USER_ID, db_path=cp_db,
+                method="modal_multioutput", **kwargs,
+            )
+
+    def test_returns_2_tuple(self, cp_db):
+        result = self._run(cp_db)
+        assert isinstance(result, tuple) and len(result) == 2
+        picks, group_stats = result
+        assert isinstance(picks, list)
+        assert isinstance(group_stats, list)
+
+    def test_group_stats_covers_both_platforms(self, cp_db):
+        _, group_stats = self._run(cp_db)
+        platforms = {s["platform"] for s in group_stats}
+        assert platforms == {"meta", "google"}
+
+    def test_picks_have_required_fields(self, cp_db):
+        picks, _ = self._run(cp_db)
+        required = {"combination_key", "combination", "selection_type", "platform", "seed_ad_id"}
+        for pick in picks:
+            assert required <= pick.keys(), f"Missing fields: {pick.keys()}"
+
+    def test_picks_span_both_platforms(self, cp_db):
+        """index=0 → Meta pick, index=4 → Google pick."""
+        picks, _ = self._run(cp_db)
+        platforms = {p["platform"] for p in picks}
+        assert "meta" in platforms
+        assert "google" in platforms
+
+    def test_no_sort_key_leak(self, cp_db):
+        picks, _ = self._run(cp_db)
+        for pick in picks:
+            assert "_sort_key" not in pick
+
+    def test_d_arrays_sent_with_both_platform_indices(self, cp_db):
+        """d_train and d_cands must contain both 0 (Meta) and 1 (Google)."""
+        from unittest.mock import patch, MagicMock
+        from bo_pipeline.cross_platform import run_unified_cross_platform_bo
+
+        mock_fn = MagicMock(return_value=self._FAKE_SUGGESTIONS)
+        with patch("bo_pipeline.modal_bo.call_modal_api_multioutput", mock_fn):
+            run_unified_cross_platform_bo(
+                self._PAIRS, TEST_USER_ID, db_path=cp_db, method="modal_multioutput"
+            )
+
+        assert mock_fn.called
+        kw = mock_fn.call_args.kwargs
+        assert "d_train"    in kw
+        assert "d_cands"    in kw
+        assert "rho"        in kw
+        assert set(kw["d_train"].tolist()) == {0, 1}, "Both platforms must appear in d_train"
+        assert set(kw["d_cands"].tolist()) == {0, 1}, "Both platforms must appear in d_cands"
+
+    def test_falls_back_to_shared_pca_on_empty_response(self, cp_db):
+        """Empty multioutput response → shared-PCA fallback → still returns picks."""
+        picks, _ = self._run(cp_db, mock_return=[])
+        assert isinstance(picks, list)
+        assert len(picks) >= 1
+
+    def test_falls_back_on_exception(self, cp_db):
+        """Exception from multioutput call → shared-PCA fallback → still returns picks."""
+        from unittest.mock import patch
+        from bo_pipeline.cross_platform import run_unified_cross_platform_bo
+        with patch("bo_pipeline.modal_bo.call_modal_api_multioutput", side_effect=RuntimeError("mock failure")):
+            picks, _ = run_unified_cross_platform_bo(
+                self._PAIRS, TEST_USER_ID, db_path=cp_db, method="modal_multioutput"
+            )
+        assert isinstance(picks, list)
+        assert len(picks) >= 1
+
+    def test_top_n_respected(self, cp_db):
+        picks, _ = self._run(cp_db, top_n=1)
+        assert len(picks) <= 1
+
+    def test_pca_warning_surfaced_when_capped(self, cp_db):
+        """
+        T12 (testing an approach, not yet signed off): the cp_db fixture has far
+        fewer samples per platform (Meta 4+8=12, Google 3+8=11) than
+        MODAL_BO_PCA_DIMS (64), so PCA is capped for both platforms — this
+        should show up as pca_warning on each platform's group_stats entry.
+        """
+        _, group_stats = self._run(cp_db)
+        for stats in group_stats:
+            assert stats.get("pca_warning"), f"expected pca_warning for {stats['platform']}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestUnifiedBOEndpointWarmStart — enforces Case 2 requirement from
+# FAKE_AD_SERVER.md: "Warm-start (Qwen) fires on the first BO run."
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestUnifiedBOEndpointWarmStart:
+    """
+    The unified cross-platform BO endpoint must call run_warm_start when real
+    platform observations are below MIN_TRAINING_POINTS (COLD_START / Case 2).
+
+    This test class patches run_warm_start and get_real_observation_count so no
+    Modal or Qwen calls are made and no real DB is needed.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path, monkeypatch):
+        import main as m
+        from fastapi.testclient import TestClient
+        from main import app, create_token, init_db
+
+        db_file = tmp_path / "ws_unified_test.db"
+        monkeypatch.setattr(m, "DB_PATH", db_file)
+        init_db()
+
+        self.client = TestClient(app, raise_server_exceptions=True)
+        self.token = create_token(TEST_USER_ID)
+
+    def _payload(self):
+        return {
+            "pairs": [
+                {"platform": "meta",   "seed_ad_id": "ws_meta",   "text_source_id": "ws_meta"},
+                {"platform": "google", "seed_ad_id": "ws_google",  "text_source_id": "ws_google"},
+            ]
+        }
+
+    def _mock_stats(self):
+        return [
+            {"platform": "meta",   "seed_ad_id": "ws_meta",   "scored_count": 0, "candidate_count": 0},
+            {"platform": "google", "seed_ad_id": "ws_google",  "scored_count": 0, "candidate_count": 0},
+        ]
+
+    def test_warm_start_called_for_each_pair_with_no_real_observations(self):
+        """
+        FAKE_AD_SERVER.md Case 2: the unified endpoint must call run_warm_start
+        for every pair when real observations < MIN_TRAINING_POINTS.
+        Before the fix this endpoint was a sync def with no warm-start at all.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        mock_ws = AsyncMock(return_value=[])
+        with patch("warm_start.run_warm_start", mock_ws), \
+             patch("bo_pipeline.selector.get_real_observation_count", return_value=0), \
+             patch("bo_pipeline.cross_platform.run_unified_cross_platform_bo", return_value=([], self._mock_stats())), \
+             patch("bo_pipeline.storage.save_bo_run", return_value=[]):
+            resp = self.client.post(
+                "/api/bo/cross-platform/unified",
+                json=self._payload(),
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+
+        assert resp.status_code == 200
+        assert mock_ws.call_count == 2, (
+            f"Expected run_warm_start called once per pair (2 pairs, 0 obs each), "
+            f"got {mock_ws.call_count}"
+        )
+
+    def test_warm_start_skipped_when_real_observations_present(self):
+        """When each pair has >= MIN_TRAINING_POINTS real observations, warm-start is not called."""
+        from unittest.mock import AsyncMock, patch
+        from bo_pipeline.gpr import MIN_TRAINING_POINTS
+
+        mock_ws = AsyncMock(return_value=[])
+        with patch("warm_start.run_warm_start", mock_ws), \
+             patch("bo_pipeline.selector.get_real_observation_count", return_value=MIN_TRAINING_POINTS), \
+             patch("bo_pipeline.cross_platform.run_unified_cross_platform_bo", return_value=([], self._mock_stats())), \
+             patch("bo_pipeline.storage.save_bo_run", return_value=[]):
+            resp = self.client.post(
+                "/api/bo/cross-platform/unified",
+                json=self._payload(),
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+
+        assert resp.status_code == 200
+        assert mock_ws.call_count == 0, (
+            f"Expected warm-start skipped when real_count >= MIN_TRAINING_POINTS, "
+            f"got {mock_ws.call_count} calls"
+        )

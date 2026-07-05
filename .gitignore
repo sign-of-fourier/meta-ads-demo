@@ -11,8 +11,10 @@ backend/app.db-wal
 backend/adstackr.db
 backend/adstackr.db-shm
 backend/adstackr.db-wal
+backend/ads.db
 backend/embeddings/embedding_cache/
 backend/generated_images/
+backend/ad_images/
 
 # ── Secrets ───────────────────────────────────────────────────────────────────
 backend/.env

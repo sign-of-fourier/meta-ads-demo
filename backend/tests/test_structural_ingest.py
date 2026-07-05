@@ -718,3 +718,74 @@ def test_get_structure_includes_lifecycle_status(client, user_token, tmp_db):
     ads = resp.json()
     assert len(ads) == 1
     assert ads[0]["lifecycle_status"] == "inactive"
+
+
+# ── native_ad_insights: server is the only source of truth ───────────────────
+
+def _seed_native_insights(tmp_db, user_id, ad_id, impressions, clicks=None,
+                           spend=None, ctr=None, cpm=None, platform="meta"):
+    """Write a native_ad_insights row as the ingest background task would."""
+    db = sqlite3.connect(str(tmp_db))
+    db.execute(
+        """INSERT OR REPLACE INTO native_ad_insights
+               (user_id, ad_id, platform, impressions, clicks, spend, ctr, cpm)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (user_id, ad_id, platform, impressions, clicks, spend, ctr, cpm),
+    )
+    db.commit()
+    db.close()
+
+
+def test_structure_stats_are_zero_when_server_returns_empty(client, user_token, tmp_db):
+    """Case 2 (COLD_START): when the server returns no metrics for an ad, the structure
+    endpoint must return impressions=0 — not backend-generated synthetic values.
+
+    Synthetic values seeded from ad_id would always be >1000. A zero in native_ad_insights
+    (what the ingest task writes when /{ad_id}/insights returns empty data=[]) must
+    propagate through unchanged. This test fails if _synthetic_ad_stats() or any other
+    backend data generation is substituted."""
+    user_id, token = user_token
+
+    _seed_structure(tmp_db, user_id, [
+        {"campaign_id": "camp_1", "adset_id": "adset_1", "ad_id": "ad_s1",
+         "creative_type": "static", "slot": "headline", "slot_index": 0, "value": "Buy Now"},
+    ])
+    _seed_native_insights(tmp_db, user_id, "ad_s1", impressions=0)
+
+    resp = client.get("/api/structure/camp_1", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    ads = resp.json()
+    assert len(ads) == 1
+    stats = ads[0]["clone_stats"]
+    assert stats is not None
+    assert stats["impressions"] == 0
+
+
+def test_structure_stats_echo_server_values_exactly(client, user_token, tmp_db):
+    """Case 1 (pre-warmed): the structure endpoint must return exactly the values the
+    server provided — not a different synthetic value seeded from the ad ID.
+
+    We seed native_ad_insights with specific known values (impressions=5000, ctr=0.035).
+    The endpoint must return those exact values. This test fails if _synthetic_ad_stats()
+    or any other backend generation is used (those values would differ from 5000/0.035)."""
+    user_id, token = user_token
+
+    _seed_structure(tmp_db, user_id, [
+        {"campaign_id": "camp_1", "adset_id": "adset_1", "ad_id": "ad_s1",
+         "creative_type": "static", "slot": "headline", "slot_index": 0, "value": "Buy Now"},
+    ])
+    _seed_native_insights(tmp_db, user_id, "ad_s1",
+                          impressions=5000, clicks=175, spend=87.50,
+                          ctr=0.035, cpm=17.50)
+
+    resp = client.get("/api/structure/camp_1", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    ads = resp.json()
+    assert len(ads) == 1
+    stats = ads[0]["clone_stats"]
+    assert stats is not None
+    assert stats["impressions"] == 5000
+    assert stats["clicks"] == 175
+    assert abs(stats["ctr"] - 0.035) < 1e-6
+    assert abs(stats["spend"] - 87.50) < 0.01
+    assert abs(stats["cpm"] - 17.50) < 0.01

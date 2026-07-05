@@ -4,6 +4,7 @@ export default function SyncBar({
   onMetaSync,
   onGoogleSync,
   metaLastSynced,
+  googleLastSynced,
   metaError,
   googleError,
   metaPushNote,
@@ -24,6 +25,9 @@ export default function SyncBar({
           <button className="btn-primary" onClick={onGoogleSync} disabled={googleSyncing}>
             {googleSyncing ? "Syncing Google…" : "Sync Google"}
           </button>
+          {googleLastSynced && (
+            <span className="sync-timestamp">Last: {googleLastSynced}</span>
+          )}
         </div>
       </div>
 

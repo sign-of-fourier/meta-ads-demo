@@ -10,15 +10,15 @@ Both return a URL string suitable for use as an ad image_url.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import sys
+import uuid
 from pathlib import Path
 
 
-def placeholder(concept: str) -> str:
-    """Return a deterministic picsum URL seeded by the concept's MD5 digest."""
-    seed = hashlib.md5(concept.lower().encode()).hexdigest()[:10]
+def placeholder(concept: str = "") -> str:
+    """Return a random picsum URL. concept param kept for backward compat."""
+    seed = uuid.uuid4().hex[:10]
     return f"https://picsum.photos/seed/{seed}/600/315"
 
 

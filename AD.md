@@ -205,18 +205,49 @@ PCA is then applied at BO inference time to reduce to `MODAL_BO_PCA_DIMS` (defau
 
 ---
 
+## Universe and Roles
+
+Every BO run is scoped to **one parent ad** — the `seed_ad_id`. The candidate universe is the Cartesian product of that ad's asset slots. A dynamic Meta ad with 4 headlines × 4 primary texts × 4 descriptions × 4 images = 256 text combinations × 4 images = 1024 candidates. A Google RSA with 10 headlines × 4 descriptions = 40 candidates (no image dimension).
+
+This is a deliberate architectural constraint: `seed_ad_id` and `text_source_id` in `run_bo()` must refer to the same ad. **Merging asset pools from multiple parent ads into one universe is not currently supported.** See `TECHNICAL_DEBT.md`.
+
+### Ad roles
+
+`role` on `ad_creative_structures` describes what kind of ad this is:
+
+| Role | Meaning | BO treatment |
+|---|---|---|
+| `parent` | A multi-asset ad that defines a candidate universe | Eligible as BO seed |
+| `test_clone` | A single-combo clone pushed by our pipeline to measure CTR | Excluded from BO seeds; its CTR flows into `scored_observations` on convergence |
+
+**Known imprecision:** native single-combination static ads (pre-existing in the account, not pushed by us) also receive `role='parent'` by default. They are not universe generators — they have a candidate pool of size 1. This is tracked in `TECHNICAL_DEBT.md`.
+
+### Scored observations
+
+The BO training set reads from the `scored_observations` table. Three writers:
+
+| Source | `source` value | What it writes |
+|---|---|---|
+| CTR convergence checker | `'convergence'` | Real CTR when a pushed clone hits impression + time thresholds |
+| Qwen2-VL image scorer | `'seed_script'` | Synthetic quality scores from the image generation pipeline |
+| Synthetic seed endpoint | `'seed_script'` | Random scores used to bootstrap BO before real CTR data exists |
+
+Native static ads in the account that already test specific combinations are **not** automatically scored — their CTR data does not flow into `scored_observations`. This is the primary reason BO starts cold on any new parent ad. See `TECHNICAL_DEBT.md`.
+
+---
+
 ## How embeddings connect to BO
 
 The BO pipeline (`POST /api/bo/run`) takes a `seed_ad_id` and `text_source_id` (usually the same ad_id) and returns 2 picks.
 
 **Scored observations (training data):**
-Rows in `ad_generation_variants` where `score IS NOT NULL` and `status != 'defunct'`, joined to `ad_embeddings` via the convention `ad_id = f"gen_{job_id}_{variant_id}"`. These are the ad combinations we've already shown to audiences and gotten feedback on.
+Rows in `scored_observations` for this `seed_ad_id`. Written by CTR convergence (real CTR from pushed clones) and seed scripts (synthetic scores to bootstrap). The GP fits on these vectors and their associated scores.
 
 **Candidate pool:**
 Cross-product of:
 - All rows in `ad_text_combination_embeddings` for `text_source_id` (the 64 text combos)
 - All rows in `ad_image_embeddings` for the seed ad (up to 4 image embeddings)
-- Total: 64 × 4 = **256 candidates**
+- Total: 64 × 4 = **256 candidates** (40 × 1 = 40 for Google RSA with zero-padded image)
 
 Each candidate gets a 3072-dim feature vector: `[text_combination_vector_1536 | image_embedding_1536]`.
 
@@ -255,11 +286,11 @@ AI Generation pipeline
               └── embed_all_combinations() → ad_text_combination_embeddings
 
 Both paths feed the same BO pipeline:
-  ad_text_combination_embeddings (64 text combos)
-  × ad_image_embeddings          (4 images)
+  ad_text_combination_embeddings (64 text combos per parent ad)
+  × ad_image_embeddings          (4 images per parent ad; zeros for Google RSA)
   = 256 candidates
-  + ad_generation_variants       (scored observations, training data)
-  → bo_pipeline → 2 picks → bo_selections
+  + scored_observations          (training data — CTR convergence, Qwen2 seed, synthetic seed)
+  → bo_pipeline → 2 picks → bo_selections → push_pick → pushed_ad_combos (clone_status lifecycle)
 ```
 
 ---

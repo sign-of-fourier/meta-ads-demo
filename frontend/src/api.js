@@ -26,7 +26,20 @@ async function request(path, opts = {}) {
       return;
     }
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.detail || `API error ${res.status}`);
+    const detail = body.detail;
+    // Some errors (e.g. the write-access gate) return a structured detail object
+    // instead of a plain string — surface its message, not "[object Object]".
+    const message =
+      typeof detail === "string"
+        ? detail
+        : detail?.message || `API error ${res.status}`;
+    const err = new Error(message);
+    err.status = res.status;
+    if (detail && typeof detail === "object") {
+      err.code = detail.error;
+      err.tier = detail.tier;
+    }
+    throw err;
   }
 
   // 204 No Content or empty body
@@ -242,6 +255,50 @@ export async function activatePick({ platform, platformAdId }) {
   });
 }
 
+export async function pauseAd({ platform, platformAdId }) {
+  return request("/api/pause-ad", {
+    method: "POST",
+    body: JSON.stringify({ platform, platform_ad_id: platformAdId }),
+  });
+}
+
+export async function retainPick(comboId) {
+  return request(`/api/push/retain/${comboId}`, { method: "POST" });
+}
+
+export async function pushMatch({ platform, seedAdId, combinationKey, combination, existingAdId }) {
+  return request("/api/push/match", {
+    method: "POST",
+    body: JSON.stringify({
+      platform,
+      seed_ad_id: seedAdId,
+      combination_key: combinationKey,
+      combination,
+      existing_ad_id: existingAdId,
+    }),
+  });
+}
+
+export async function createGenerator(name, members) {
+  return request("/api/generators", {
+    method: "POST",
+    body: JSON.stringify({ name, members }),
+  });
+}
+
+export async function runBOForGenerator(generatorId, platform, targetMetric) {
+  const endpoint = platform === "google" ? "/api/google/bo/run" : "/api/bo/run";
+  return request(endpoint, {
+    method: "POST",
+    body: JSON.stringify({
+      seed_ad_id: generatorId,
+      text_source_id: generatorId,
+      generator_id: generatorId,
+      ...(targetMetric ? { target_metric: targetMetric } : {}),
+    }),
+  });
+}
+
 export async function startDynamicGeneration(campaignId, seedAdId) {
   const qs = seedAdId ? `?seed_ad_id=${encodeURIComponent(seedAdId)}` : "";
   return request(`/api/generate/dynamic/${campaignId}${qs}`, { method: "POST" });
@@ -277,11 +334,81 @@ export async function runCrossPlatformBO(pairs) {
  * topN: number of recommendations to return (default 4)
  * Returns { picks, group_stats }
  */
-export async function runUnifiedCrossPlatformBO(pairs, topN = 4) {
+export async function runUnifiedCrossPlatformBO(pairs, topN = 4, targetMetric = null) {
   return request("/api/bo/cross-platform/unified", {
     method: "POST",
-    body: JSON.stringify({ pairs, top_n: topN }),
+    body: JSON.stringify({
+      pairs,
+      top_n: topN,
+      ...(targetMetric ? { target_metric: targetMetric } : {}),
+    }),
   });
+}
+
+// ── Manual platform ───────────────────────────────────────────────────────────
+
+export async function createManualCampaign(name) {
+  return request("/api/manual/campaigns", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+}
+
+export async function listManualCampaigns() {
+  return request("/api/manual/campaigns");
+}
+
+export async function renameManualCampaign(id, name) {
+  return request(`/api/manual/campaigns/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name }),
+  });
+}
+
+export async function deleteManualCampaign(id) {
+  return request(`/api/manual/campaigns/${id}`, { method: "DELETE" });
+}
+
+export async function createManualAd(campaignId, data) {
+  return request(`/api/manual/campaigns/${campaignId}/ads`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+}
+
+export async function listManualAds(campaignId) {
+  return request(`/api/manual/campaigns/${campaignId}/ads`);
+}
+
+export async function deleteManualAd(adId) {
+  return request(`/api/manual/ads/${adId}`, { method: "DELETE" });
+}
+
+export async function listManualCombinations(adId) {
+  return request(`/api/manual/ads/${adId}/combinations`);
+}
+
+export async function scoreManualCombination(adId, combinationKey, combination, score, metric) {
+  return request(`/api/manual/ads/${adId}/score`, {
+    method: "POST",
+    body: JSON.stringify({ combination_key: combinationKey, combination, score, metric }),
+  });
+}
+
+export async function uploadManualImage(file) {
+  const formData = new FormData();
+  formData.append("file", file);
+  const token = localStorage.getItem("token");
+  const res = await fetch("/api/manual/upload-image", {
+    method: "POST",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: formData,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail || `Upload error ${res.status}`);
+  }
+  return res.json(); // { url: "/ad-images/..." }
 }
 
 export async function seedScoredVariants(seedAdId, platform, n, textSourceId) {
@@ -293,5 +420,44 @@ export async function seedScoredVariants(seedAdId, platform, n, textSourceId) {
       n,
       text_source_id: textSourceId || null,
     }),
+  });
+}
+
+// ── Admin (internal — separate auth from regular user JWT) ─────────────────
+// Deliberately does not reuse request(): a wrong/missing admin key must not
+// clear the caller's own login token or redirect them out of their session.
+async function adminRequest(path, adminKey, opts = {}) {
+  const res = await fetch(`${API}${path}`, {
+    ...opts,
+    headers: {
+      "Content-Type": "application/json",
+      "X-Admin-Key": adminKey,
+      ...(opts.headers || {}),
+    },
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = body.detail;
+    const message =
+      typeof detail === "string" ? detail : detail?.message || `API error ${res.status}`;
+    const err = new Error(message);
+    err.status = res.status;
+    throw err;
+  }
+  return body;
+}
+
+export async function adminListUsers(adminKey) {
+  const data = await adminRequest("/api/admin/users", adminKey);
+  return data.users;
+}
+
+export async function adminSetUserTier(adminKey, userId, { tier, tierExpiresAt } = {}) {
+  const body = {};
+  if (tier !== undefined) body.tier = tier;
+  if (tierExpiresAt !== undefined) body.tier_expires_at = tierExpiresAt;
+  return adminRequest(`/api/admin/users/${userId}/tier`, adminKey, {
+    method: "POST",
+    body: JSON.stringify(body),
   });
 }
